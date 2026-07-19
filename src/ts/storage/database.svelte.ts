@@ -19,6 +19,11 @@ import { v4 as uuidv4 } from 'uuid';
 import { applyModelPresetDefaults } from '../preset/dbDefaults';
 import type { ApiKeyPoolEntry, ModelBindingFields, ModelBindingSet, ModelPreset, ModelPresetMigrationSummary, RegistryCache } from '../preset/types';
 import { emptyModelBinding } from '../preset/types';
+import { invalidatePluginPrincipal, reconcileProgrammaticPluginRecords } from '../plugins/pluginPrincipal';
+import { retirePluginPrincipals } from '../plugins/pluginRetirement';
+import { withAuthorizedPluginMutationLock } from '../plugins/pluginMutationCoordinator';
+import type { PluginStorageOwnerRecord } from '../plugins/pluginStorageOwnership';
+import { normalizePluginDatabaseState } from '../plugins/pluginDatabaseNormalization';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
@@ -119,6 +124,7 @@ export function setDatabase(data:Database){
     if(checkNullish(data.plugins)){
         data.plugins = []
     }
+    const pluginStateNormalization = normalizePluginDatabaseState(data)
     if(checkNullish(data.zoomsize)){
         data.zoomsize = 100
     }
@@ -734,10 +740,28 @@ export function setDatabase(data:Database){
     applyModelPresetDefaults(data)
     changeLanguage(data.language)
     setDatabaseLite(data)
+    return pluginStateNormalization
 }
 
 export function setDatabaseLite(data:Database){
+    const pluginStateNormalization = normalizePluginDatabaseState(data)
     DBState.db = data
+    return pluginStateNormalization
+}
+
+export async function setDatabaseLive(
+    data: Database,
+    authorize: () => boolean = () => true,
+    markLiveMutationStarted: () => void = () => undefined,
+) {
+    return withAuthorizedPluginMutationLock(authorize, async () => {
+        markLiveMutationStarted()
+        const current = getDatabase({ snapshot: true }).plugins ?? []
+        const next = reconcileProgrammaticPluginRecords(current, data.plugins ?? [])
+        await retirePluginPrincipals(next.invalidatedPrincipalIds, invalidatePluginPrincipal)
+        data.plugins = next.records as RisuPlugin[]
+        setDatabase(data)
+    })
 }
 
 interface getDatabaseOptions{
@@ -1428,7 +1452,8 @@ export interface Database{
     // plugin storage. Additive metadata only — never wraps the value itself, so
     // existing plugins read their keys unchanged. Populated for new V3 writes;
     // legacy/V2 keys stay unrecorded. See pluginStorageMeta.ts.
-    pluginStorageMeta?:{[key:string]:{plugin:string,updatedAt:number}}
+    pluginStorageMeta?:{[key:string]:PluginStorageOwnerRecord | {plugin:string,updatedAt:number}}
+    pluginStorageMetaMigrationV2?: boolean
     longPressToPopupEditor?: boolean
     showInputActionBar?: boolean
     moveInsteadOfCopyOnCMPConvert?:boolean

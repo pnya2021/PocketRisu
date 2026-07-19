@@ -53,8 +53,8 @@ export class SafeLocalPluginStorage {
     // getLocalPluginStorage() API. Used to tag new writes with their origin in
     // the sidecar meta store. Undefined (e.g. when instantiated by the built-in
     // storage viewer) means writes don't touch ownership metadata.
-    private owner?: string;
-    constructor(owner?: string) {
+    private owner?: { principalId: string; displayName: string };
+    constructor(owner?: { principalId: string; displayName: string }) {
         this.owner = owner;
     }
     async getItem<T>(key: string): Promise<T | null> {
@@ -70,9 +70,9 @@ export class SafeLocalPluginStorage {
     }
     async setItem<T>(key: string, value: T): Promise<void> {
         const cacheKey = `safe_plugin_${key}`;
-        pluginStorage.set(cacheKey, value);
+        if (this.owner && !await recordOwner('idb', key, this.owner.principalId, this.owner.displayName)) return;
         await writePersistentJson(makeEncodedStorageKey(pluginStoragePrefix, key), value);
-        if (this.owner) await recordOwner('idb', key, this.owner);
+        pluginStorage.set(cacheKey, value);
     }
     async removeItem(key: string): Promise<void> {
         pluginStorage.delete(`safe_plugin_${key}`);

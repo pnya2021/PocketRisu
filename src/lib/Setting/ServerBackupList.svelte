@@ -8,7 +8,7 @@
     // backup into memory.
     import { language } from "src/lang";
     import { alertConfirm, alertError, alertWait, alertStore, waitAlert, notifySuccess, notifyError } from "src/ts/alert";
-    import { forageStorage, downloadFile } from "src/ts/globalApi.svelte";
+    import { forageStorage, downloadFile, restorePersistedDatabaseWithPluginRuntime } from "src/ts/globalApi.svelte";
     import { RotateCcwIcon, DownloadIcon, TrashIcon } from "@lucide/svelte";
 
     interface Props {
@@ -48,12 +48,14 @@
         if (!(await alertConfirm(language.backupLoadConfirm2))) return;
         alertWait(language.serverBackupRestoring);
         try {
-            const result = await forageStorage.restoreServerBackup(backup.filename, (bytes, totalBytes) => {
-                if (totalBytes > 0) {
-                    const pct = ((bytes / totalBytes) * 100).toFixed(1);
-                    alertWait(`${language.serverBackupRestoring} (${pct}%)`);
-                }
-            });
+            const result = await restorePersistedDatabaseWithPluginRuntime(() =>
+                forageStorage.restoreServerBackup(backup.filename, (bytes, totalBytes) => {
+                    if (totalBytes > 0) {
+                        const pct = ((bytes / totalBytes) * 100).toFixed(1);
+                        alertWait(`${language.serverBackupRestoring} (${pct}%)`);
+                    }
+                })
+            );
             if (result.coldStorageFailed && result.coldStorageFailed > 0) {
                 alertError(`Warning: ${result.coldStorageFailed} character(s) could not be restored from cold storage. The restored save may be incomplete. The app will now reload.`);
                 await waitAlert();

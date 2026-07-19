@@ -1,5 +1,5 @@
 import { alertError, alertStore, alertWait, alertMd, alertConfirm, waitAlert, notifySuccess, notifyInfo, notifyError } from "../alert";
-import { downloadFile, LocalWriter, forageStorage } from "../globalApi.svelte";
+import { downloadFile, LocalWriter, forageStorage, restorePersistedDatabaseWithPluginRuntime } from "../globalApi.svelte";
 import { encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase, type Chat } from "../storage/database.svelte";
 import { fetchChatFromServer } from "../storage/chatStorage";
@@ -232,28 +232,34 @@ export function LoadLocalBackup(){
         input.type = 'file';
         input.accept = '.bin';
         input.onchange = async () => {
-            if (!input.files || input.files.length === 0) {
+            try {
+                if (!input.files || input.files.length === 0) {
+                    input.remove();
+                    return;
+                }
+                const file = input.files[0];
                 input.remove();
-                return;
+                alertWait(`Loading local Backup... (Uploading ${file.name})`);
+                const result = await restorePersistedDatabaseWithPluginRuntime(() =>
+                    forageStorage.importBackup(file, (loaded, total) => {
+                        const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
+                        alertWait(`Loading local Backup... (${progress}%)`)
+                    }))
+                if (result.coldStorageFailed && result.coldStorageFailed > 0) {
+                    alertError(`Warning: ${result.coldStorageFailed} character(s) could not be restored from cold storage. The imported save may be incomplete. The app will now reload.`)
+                    await waitAlert()
+                } else {
+                    alertStore.set({
+                        type: "wait",
+                        msg: "Success, Refreshing your app."
+                    });
+                }
+                location.search = ''
+                location.reload()
+            } catch (error) {
+                console.error(error);
+                alertError(error instanceof Error ? error.message : 'Failed, Is file corrupted?')
             }
-            const file = input.files[0];
-            input.remove();
-            alertWait(`Loading local Backup... (Uploading ${file.name})`);
-            const result = await forageStorage.importBackup(file, (loaded, total) => {
-                const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
-                alertWait(`Loading local Backup... (${progress}%)`)
-            })
-            if (result.coldStorageFailed && result.coldStorageFailed > 0) {
-                alertError(`Warning: ${result.coldStorageFailed} character(s) could not be restored from cold storage. The imported save may be incomplete. The app will now reload.`)
-                await waitAlert()
-            } else {
-                alertStore.set({
-                    type: "wait",
-                    msg: "Success, Refreshing your app."
-                });
-            }
-            location.search = ''
-            location.reload()
         };
 
         input.click();
@@ -269,28 +275,34 @@ export async function ImportFromSaveZip() {
         input.type = 'file'
         input.accept = '.zip'
         input.onchange = async () => {
-            if (!input.files || input.files.length === 0) {
+            try {
+                if (!input.files || input.files.length === 0) {
+                    input.remove()
+                    return
+                }
+                const file = input.files[0]
                 input.remove()
-                return
+
+                if (!(await alertConfirm(language.importSaveFolderConfirmZip(file.name, formatBytes(file.size))))) return
+                if (!(await alertConfirm(language.backupLoadConfirm2))) return
+
+                alertWait(`Uploading ${file.name}...`)
+                const result = await restorePersistedDatabaseWithPluginRuntime(() =>
+                    forageStorage.uploadSaveFolderZip(file, (loaded, total) => {
+                        const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
+                        alertWait(`Uploading ${file.name}... (${progress}%)`)
+                    }))
+
+                alertStore.set({
+                    type: "wait",
+                    msg: `${language.importSaveFolderSuccess} (${result.imported} files). Refreshing...`
+                })
+                location.search = ''
+                location.reload()
+            } catch (error) {
+                console.error(error)
+                alertError(error instanceof Error ? error.message : 'Import failed')
             }
-            const file = input.files[0]
-            input.remove()
-
-            if (!(await alertConfirm(language.importSaveFolderConfirmZip(file.name, formatBytes(file.size))))) return
-            if (!(await alertConfirm(language.backupLoadConfirm2))) return
-
-            alertWait(`Uploading ${file.name}...`)
-            const result = await forageStorage.uploadSaveFolderZip(file, (loaded, total) => {
-                const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
-                alertWait(`Uploading ${file.name}... (${progress}%)`)
-            })
-
-            alertStore.set({
-                type: "wait",
-                msg: `${language.importSaveFolderSuccess} (${result.imported} files). Refreshing...`
-            })
-            location.search = ''
-            location.reload()
         }
 
         input.click()

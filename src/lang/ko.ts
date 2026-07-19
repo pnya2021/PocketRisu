@@ -1759,6 +1759,21 @@ export const languageKorean = {
     "플러그인 {} 이(가) Provider 접근 권한을 요청합니다. 무단 API 호출이 발생할 수 있습니다. 허용하시겠습니까?",
   sendChatConsent:
     "플러그인 {} 이(가) 사용자 대신 채팅 메시지를 전송할 권한을 요청합니다. AI 응답이 트리거됩니다. 허용하시겠습니까?",
+  pluginPermissionConsent: {
+    title: "플러그인 권한 요청", allow: "허용", deny: "거부",
+    contextAssets: "현재 카드, 대화, 활성 에셋 읽기",
+    installedModulesRead: "설치된 모듈의 설명과 에셋 읽기",
+    chatObserve: "현재 대화의 확정된 메시지 관찰",
+    chatObserveAll: "모든 대화의 확정된 메시지 관찰",
+    chatWrite: "현재 대화의 제한적 변경",
+    chatWriteAll: "권한이 있는 다른 대화의 제한적 변경",
+    inlayWrite: "플러그인 소유 Inlay 생성·읽기·삭제",
+    inlayRead: "다른 플러그인 또는 레거시 Inlay 읽기",
+    inlayManage: "다른 Inlay 삭제 또는 참조 분리",
+    secrets: "쓰기 전용 비밀 저장 및 제한된 요청에 사용",
+    localModelInference: "승인된 로컬 이미지 태거 설치 및 실행",
+    pluginJobs: "표시 가능한 백그라운드 작업과 취소 콜백 사용",
+  },
   resetPluginPermission: "권한 응답 초기화",
   resetPluginPermissionConfirm:
     '플러그인 "{}"의 저장된 권한 응답(허용/거부 이력)을 모두 삭제하시겠습니까?\n\n다음에 플러그인이 권한을 요청할 때 다시 묻게 됩니다.',

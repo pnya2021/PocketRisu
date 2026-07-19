@@ -1,5 +1,6 @@
-import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
-import { SandboxHost } from "./factory";
+import { allowedDbKeys, applyProgrammaticDatabaseMutation, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
+import { invokeSandboxCleanupCallback, SandboxHost } from "./factory";
+import { replacePluginV3RuntimeSnapshot } from "../pluginV3Reload";
 import { getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
@@ -12,11 +13,9 @@ import { language } from "src/lang";
 import { checkCharOrder, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { get } from "svelte/store";
-import { registerMCPModule, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
+import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
-import { hasher } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
-import { readPersistentJson, removePersistentKey, writePersistentJson } from "src/ts/storage/persistentKv";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
@@ -34,6 +33,21 @@ import {
     type AfterTTSResult,
     type TTSHookFn,
 } from "src/ts/process/ttsHooks";
+import { getCapabilities } from './illustration/capabilities';
+import {
+    createPluginExecutionContext,
+    isPluginPermissionId,
+    pluginPermissionPersistence,
+    pluginPermissionService,
+    type PluginExecutionContext,
+    type PluginPermissionId,
+} from './illustration/permissions';
+import { pluginDataLifecycle } from '../pluginDataLifecycle';
+import { stripPluginPrincipal } from '../pluginPrincipal';
+import { cleanupOwnedProviderRegistration, InstanceChannelRegistry, InstanceCleanupRegistry, OwnedTimeoutSet, registerInstanceResourceIfActive, removeOwnedArrayEntry, removeOwnedMapEntry, retainOrCleanupInstanceResource } from './pluginInstanceResources';
+import { invokePermissionCheckedProvider } from './providerPermission';
+import { isCurrentPluginRuntimeRecord } from '../pluginRuntimeReplacement';
+import { createOwnedSyncStorageMutations } from '../ownedSyncStorage';
 
 /*
     V3 API for RisuAI Plugins
@@ -54,13 +68,14 @@ import {
         - Note that Class or Callbacks inside arrays or objects are not supported
 */
 
-const pluginChannel = new Map<string, Function>();
+const pluginChannels = new InstanceChannelRegistry();
+const pluginInstanceCleanup = new InstanceCleanupRegistry();
 
 class SafeElement {
     #element: HTMLElement;
     __classType = 'REMOTE_REQUIRED' as const;
 
-    constructor(element: HTMLElement) {
+    constructor(element: HTMLElement, protected readonly instanceId?: string) {
         if(element.getAttribute('freezed')){
             throw new Error("This element cannot be accessed by SafeELement")
         }
@@ -85,7 +100,7 @@ class SafeElement {
 
     public cloneNode(deep: boolean = false): SafeElement {
         const cloned = this.#element.cloneNode(deep);
-        return new SafeElement(cloned as HTMLElement);
+        return new SafeElement(cloned as HTMLElement, this.instanceId);
     }
 
     public prepend(child: SafeElement) {
@@ -162,14 +177,14 @@ class SafeElement {
         const children: SafeElement[] = [];
         this.#element.childNodes.forEach(node => {
             if(node instanceof HTMLElement) {
-                children.push(new SafeElement(node));
+                children.push(new SafeElement(node, this.instanceId));
             }
         });
         return new SafeClassArray<SafeElement>(children);
     }
     public getParent(): SafeElement | null {
         if(this.#element.parentElement) {
-            return new SafeElement(this.#element.parentElement);
+            return new SafeElement(this.#element.parentElement, this.instanceId);
         }
         return null;
     }
@@ -202,7 +217,7 @@ class SafeElement {
         const elements: SafeElement[] = [];
         nodeList.forEach(node => {
             if(node instanceof HTMLElement) {
-                elements.push(new SafeElement(node));
+                elements.push(new SafeElement(node, this.instanceId));
             }
         });
         return new SafeClassArray<SafeElement>(elements);
@@ -210,7 +225,7 @@ class SafeElement {
     public querySelector(selector: string): SafeElement | null {
         const element = this.#element.querySelector(selector);
         if(element instanceof HTMLElement) {
-            return new SafeElement(element);
+            return new SafeElement(element, this.instanceId);
         }
         return null;
     }
@@ -239,6 +254,7 @@ class SafeElement {
         this.#element.scrollIntoView(options);
     }
     #eventIdMap = new Map<string, Function>()
+    #eventCleanupMap = new Map<string, () => void>()
 
     public async addEventListener(type:string, listener: (event: any) => void, options?: boolean | AddEventListenerOptions):Promise<string> {
         const realOptions = typeof options === 'boolean' ? { capture: options } : options || {};
@@ -315,20 +331,37 @@ class SafeElement {
             }
             this.#eventIdMap.set(id, modifiedListener)
             document.addEventListener(type, modifiedListener, realOptions)
+            const cleanup = () => {
+                document.removeEventListener(type, modifiedListener, realOptions)
+                if (this.#eventIdMap.get(id) === modifiedListener) this.#eventIdMap.delete(id)
+                this.#eventCleanupMap.delete(id)
+            }
+            this.#eventCleanupMap.set(id, cleanup)
+            if (this.instanceId) pluginInstanceCleanup.add(this.instanceId, cleanup)
             return id;
         }
         else if(allowedDelayedEventListeners.includes(type)){
+            const pending = new OwnedTimeoutSet()
             const modifiedListener = (event: any) => {
                 let delay = 0;
                 try {
                     delay = (crypto.getRandomValues(new Uint32Array(1))[0] / 100) % 100; //0-99 ms              
                 } catch (error) {}
-                setTimeout(() => {
-                    listener(trimEvent(event));
-                }, delay);
+                const trimmed = trimEvent(event)
+                pending.schedule(() => {
+                    if (this.#eventIdMap.get(id) === modifiedListener) listener(trimmed)
+                }, delay)
             }
             this.#eventIdMap.set(id, modifiedListener)
             document.addEventListener(type, modifiedListener, realOptions);
+            const cleanup = () => {
+                document.removeEventListener(type, modifiedListener, realOptions)
+                pending.clear()
+                if (this.#eventIdMap.get(id) === modifiedListener) this.#eventIdMap.delete(id)
+                this.#eventCleanupMap.delete(id)
+            }
+            this.#eventCleanupMap.set(id, cleanup)
+            if (this.instanceId) pluginInstanceCleanup.add(this.instanceId, cleanup)
             return id;
         }
         else{
@@ -337,6 +370,11 @@ class SafeElement {
     }
 
     public removeEventListener(type:string, id:string, options?: boolean | EventListenerOptions) {
+        const cleanup = this.#eventCleanupMap.get(id)
+        if (cleanup) {
+            cleanup()
+            return
+        }
         const listener = this.#eventIdMap.get(id);
         if(listener){
             const realOptions = typeof options === 'boolean' ? { capture: options } : options || {};
@@ -352,8 +390,8 @@ class SafeElement {
 
 class SafeDocument extends SafeElement {
     __classType = 'REMOTE_REQUIRED' as const;
-    constructor(document: Document) {
-        super(document.documentElement);
+    constructor(document: Document, instanceId: string) {
+        super(document.documentElement, instanceId);
     }
     createElement(tagName: string): SafeElement {
         if(!tagWhitelist.includes(tagName.toLowerCase())) {
@@ -364,7 +402,7 @@ class SafeDocument extends SafeElement {
             console.warn(`<a> can be created but href attribute cannot be set directly for security reasons. Use .createAnchorElement(href: string) to create safe anchor elements.`);
         }
         const element = document.createElement(tagName);
-        return new SafeElement(element);
+        return new SafeElement(element, this.instanceId);
     }
     createAnchorElement(href: string): SafeElement {
         const anchor = document.createElement('a');
@@ -378,7 +416,7 @@ class SafeDocument extends SafeElement {
             console.warn(`Invalid URL provided for anchor element: ${href}. Setting href to '#' instead.`);
             anchor.setAttribute('href', '#');
         }
-        return new SafeElement(anchor);
+        return new SafeElement(anchor, this.instanceId);
     }
 }
 
@@ -431,7 +469,7 @@ type SafeMutationCallback = (mutations: SafeClassArray<SafeMutationRecord>) => v
 class SafeMutationObserver {
     #observer: MutationObserver;
     __classType = 'REMOTE_REQUIRED' as const;
-    constructor(callback: SafeMutationCallback) {
+    constructor(callback: SafeMutationCallback, private readonly instanceId: string) {
         this.#observer = new MutationObserver((mutations) => {
             const safeMutations: SafeMutationRecordObject[] = mutations.map(mutation => {
 
@@ -439,7 +477,7 @@ class SafeMutationObserver {
                     const elements: SafeElement[] = [];
                     nodeList.forEach(node => {
                         if(node instanceof HTMLElement) {
-                            elements.push(new SafeElement(node));
+                            elements.push(new SafeElement(node, this.instanceId));
                         }
                     })
                     return elements;
@@ -447,7 +485,7 @@ class SafeMutationObserver {
 
                 return {
                     type: mutation.type,
-                    target: new SafeElement(mutation.target as HTMLElement),
+                    target: new SafeElement(mutation.target as HTMLElement, this.instanceId),
                     addedNodes: elementMapHelper(mutation.addedNodes),
                     removedNodes: elementMapHelper(mutation.removedNodes)
                     
@@ -476,25 +514,17 @@ class SafeMutationObserver {
         }
     }
 
-}
-
-const pluginUnloadCallbacks: Map<string, Function[]> = new Map();
-
-const addPluginUnloadCallback = (pluginName: string, callback: Function) => {
-    if(!pluginUnloadCallbacks.has(pluginName)){
-        pluginUnloadCallbacks.set(pluginName, []);
+    disconnect() {
+        this.#observer.disconnect()
     }
-    pluginUnloadCallbacks.get(pluginName)?.push(callback);
+
 }
 
-const makeMenuUnloadCallback = (menuId:string, menuStore: MenuDef[]) =>{
-    return () => {
-        const index = menuStore.findIndex(item => item.id === menuId);
-        if(index !== -1){
-            menuStore.splice(index, 1);
-        }
-    }
-}
+const addPluginUnloadCallback = (instanceId: string, callback: () => void | Promise<void>) =>
+    pluginInstanceCleanup.add(instanceId, callback)
+
+const makeMenuUnloadCallback = (menuStore: MenuDef[], expected: MenuDef) =>
+    () => removeOwnedArrayEntry(menuStore, expected)
 
 const removeChatPanel = (id: string) => {
     const index = chatPanelStore.findIndex(item => item.id === id);
@@ -503,37 +533,22 @@ const removeChatPanel = (id: string) => {
     }
 }
 
-const removePluginChatPanels = (pluginName: string) => {
-    for(let i = chatPanelStore.length - 1; i >= 0; i--){
-        if(chatPanelStore[i].pluginName === pluginName){
-            chatPanelStore.splice(i, 1);
-        }
-    }
-}
-
-const unloadV3Plugin = async (pluginName: string) => {
-    const callbacks = pluginUnloadCallbacks.get(pluginName);
-    const instance = v3PluginInstances.find(p => p.name === pluginName);
+export const unloadV3Plugin = async (identifier: string) => {
+    const instance = v3PluginInstances.find(p => p.instanceId === identifier || p.name === identifier);
+    const pluginName = instance?.name ?? identifier
+    const instanceId = instance?.instanceId ?? identifier
+    const callbacks = pluginInstanceCleanup.take(instanceId)
     if(instance){
-        const index = v3PluginInstances.findIndex(p => p.name === pluginName);
+        const index = v3PluginInstances.indexOf(instance);
         if(index !== -1){
             v3PluginInstances.splice(index, 1);
         }
+        instance.unregisterStop()
+        instance.abortController.abort()
     }
-    if(callbacks){
-        pluginUnloadCallbacks.delete(pluginName); 
-        let promises: Promise<void>[] = [];
-        for(const callback of callbacks){
-            const result = callback();
-            if(result instanceof Promise){
-                promises.push(result);
-            }
-        }
-
-        await Promise.any([
-            Promise.all(promises),
-            sleep(1000) //timeout after 1 second
-        ])
+    if(callbacks.length){
+        const cleanup = Promise.allSettled(callbacks.map((callback) => Promise.resolve().then(callback)))
+        await Promise.race([cleanup, sleep(1000)])
     }
     try {
         instance?.host?.terminate();        
@@ -542,90 +557,12 @@ const unloadV3Plugin = async (pluginName: string) => {
     }
 }
 
-type PluginPermissionDesc = 'fetchLogs'|'db'|'mainDom'|'replacer'|'provider'|'sendChat';
-const pluginPermissionDescs: PluginPermissionDesc[] = ['fetchLogs', 'db', 'mainDom', 'replacer', 'provider', 'sendChat'];
-
-// Plugin names are free text (the //@name directive), so `${name}_${desc}` keys
-// can collide — both across permissions and with a legacy name-only entry that
-// happens to read like "name_desc". JSON-encoding the pair makes every key
-// unambiguous: ["foo","db"] can never equal a plain "foo_db" or ["foo_db","x"].
-const permissionKeyOf = (pluginName: string, permissionDesc: string) =>
-    JSON.stringify([pluginName, permissionDesc])
-
-const permissionGivenPlugins: Set<string> = new Set();
-const permissionDeniedPlugins: Set<string> = new Set();
-const permissionCache = new Map<string, boolean | number>();
-const pluginPermissionStateKey = 'cache/plugin-permissions/state.json';
-let pluginPermissionLoadPromise: Promise<void> | null = null;
-
-async function ensurePluginPermissionStateLoaded() {
-    if (!pluginPermissionLoadPromise) {
-        pluginPermissionLoadPromise = (async () => {
-            const payload = await readPersistentJson<{
-                given: string[]
-                denied: string[]
-                cache: [string, boolean | number][]
-            }>(pluginPermissionStateKey)
-            if (!payload) {
-                return
-            }
-            permissionGivenPlugins.clear()
-            permissionDeniedPlugins.clear()
-            permissionCache.clear()
-            for (const pluginName of payload.given ?? []) {
-                permissionGivenPlugins.add(pluginName)
-            }
-            for (const pluginName of payload.denied ?? []) {
-                permissionDeniedPlugins.add(pluginName)
-            }
-            for (const [key, value] of payload.cache ?? []) {
-                permissionCache.set(key, value)
-            }
-        })()
-    }
-    await pluginPermissionLoadPromise
-}
-
 export async function resetAllPluginPermissions() {
-    permissionGivenPlugins.clear()
-    permissionDeniedPlugins.clear()
-    permissionCache.clear()
-    pluginPermissionLoadPromise = Promise.resolve()
-    await removePersistentKey(pluginPermissionStateKey)
+    await pluginPermissionService.resetAll(() => pluginPermissionPersistence.clearAll())
 }
 
-export async function resetPluginPermission(pluginName: string) {
-    await ensurePluginPermissionStateLoaded()
-    // Permission descs are a fixed enum, so we delete the exact key for each
-    // one rather than prefix-matching (which would also wipe another plugin's
-    // keys). `pluginName` alone covers legacy name-only entries from older
-    // versions, which JSON keys never collide with but reset should still clear.
-    const exactKeys = pluginPermissionDescs.map(desc => permissionKeyOf(pluginName, desc))
-    for (const key of [pluginName, ...exactKeys]) {
-        permissionGivenPlugins.delete(key)
-        permissionDeniedPlugins.delete(key)
-    }
-    for (const desc of pluginPermissionDescs) {
-        permissionCache.delete(permissionKeyOf(pluginName, desc) + '_lastGrantTime')
-    }
-    const plugin = DBState.db.plugins?.find(p => p.name === pluginName)
-    if (plugin?.script) {
-        const scriptHashBase = await hasher(new TextEncoder().encode(plugin.script))
-        for (const key of [...permissionCache.keys()]) {
-            if (key.startsWith(scriptHashBase + '_')) {
-                permissionCache.delete(key)
-            }
-        }
-    }
-    await persistPluginPermissionState()
-}
-
-async function persistPluginPermissionState() {
-    await writePersistentJson(pluginPermissionStateKey, {
-        given: [...permissionGivenPlugins],
-        denied: [...permissionDeniedPlugins],
-        cache: [...permissionCache.entries()]
-    })
+export async function resetPluginPermission(principalId: string) {
+    await pluginPermissionService.resetPrincipal(principalId)
 }
 
 type PluginV3ProviderOptions = PluginV2ProviderOptions & {
@@ -634,109 +571,14 @@ type PluginV3ProviderOptions = PluginV2ProviderOptions & {
 
 export const customV3ProviderMetaStore:LLMModel[] = []
 
-// Serializes permission dialogs. Every plugin shares the single global
-// alertStore, so when several plugins request permission at boot they would
-// otherwise overwrite each other's dialog — only the last one stays clickable
-// and a single click resolves all of them. The chain makes each dialog wait
-// for the previous one to finish, showing them one at a time.
-let pluginPermissionDialogChain: Promise<unknown> = Promise.resolve()
-
-const isPermissionResolved = async (
-    pluginName: string,
-    permissionDesc: PluginPermissionDesc,
-    requiresReconfirm: boolean,
-): Promise<{ resolved: boolean; value: boolean; pluginHash: string }> => {
-    const permissionKey = permissionKeyOf(pluginName, permissionDesc);
-    if (!requiresReconfirm && permissionGivenPlugins.has(permissionKey)) {
-        return { resolved: true, value: true, pluginHash: '' }
-    }
-    if (!requiresReconfirm && permissionDeniedPlugins.has(permissionKey)) {
-        return { resolved: true, value: false, pluginHash: '' }
-    }
-
-    const pluginHash = await hasher(
-        new TextEncoder().encode(
-            DBState.db.plugins.find(p => p.name === pluginName)?.script
-        )
-    ) + `_${permissionDesc}`;
-
-    if (!requiresReconfirm && permissionCache.get(pluginHash)) {
-        permissionGivenPlugins.add(permissionKey);
-        return { resolved: true, value: true, pluginHash }
-    }
-
-    return { resolved: false, value: false, pluginHash }
-}
-
-const getPluginPermission = async (pluginName: string, permissionDesc: PluginPermissionDesc, reconfirm: boolean|'periodically' = false) => {
-    await ensurePluginPermissionStateLoaded()
-
-    // Recomputed (not captured) so a periodic reconfirm reflects the latest
-    // lastGrantTime: when several identical requests queue together, an earlier
-    // one may refresh it, making the reconfirm no longer due for the rest.
-    const computeRequiresReconfirm = () => {
-        if(reconfirm === 'periodically'){
-            const lastGrantTime = permissionCache.get(permissionKeyOf(pluginName, permissionDesc) + '_lastGrantTime') as number | undefined;
-            return !lastGrantTime || Date.now() - lastGrantTime > 3 * 24 * 60 * 60 * 1000; //3 days
-        }
-        return reconfirm === true;
-    }
-
-    // Fast path: if the answer is already known, skip the serialization queue
-    // entirely so cached/granted permissions never block on a pending dialog.
-    const early = await isPermissionResolved(pluginName, permissionDesc, computeRequiresReconfirm())
-    if (early.resolved) {
-        return early.value
-    }
-
-    const showDialog = async (): Promise<boolean> => {
-        // Re-check under the lock: an earlier queued dialog for the same plugin
-        // may have already granted/denied (or refreshed a periodic grant) while
-        // we were waiting our turn — recompute reconfirm so we don't re-prompt.
-        const requiresReconfirm = computeRequiresReconfirm()
-        const recheck = await isPermissionResolved(pluginName, permissionDesc, requiresReconfirm)
-        if (recheck.resolved) {
-            return recheck.value
-        }
-        const pluginHash = recheck.pluginHash
-
-        let alertTitle =
-            permissionDesc === 'fetchLogs' ? language.fetchLogConsent.replace("{}", pluginName)
-            : permissionDesc === 'db' ? language.getFullDatabaseConsent.replace("{}", pluginName)
-            : permissionDesc === 'mainDom' ? language.mainDomAccessConsent.replace("{}", pluginName)
-            : permissionDesc === 'replacer' ? language.replacerPermissionConsent.replace("{}", pluginName)
-            : permissionDesc === 'provider' ? language.providerPermissionConsent.replace("{}", pluginName)
-            : permissionDesc === 'sendChat' ? language.sendChatConsent.replace("{}", pluginName)
-            : `Error`
-        if(alertTitle === 'Error'){
-            return false;
-        }
-        const permissionKey = permissionKeyOf(pluginName, permissionDesc);
-        const conf = await alertConfirm(alertTitle)
-        if(conf && pluginHash){
-            permissionGivenPlugins.add(permissionKey);
-            permissionDeniedPlugins.delete(permissionKey);
-            permissionCache.set(pluginHash, true);
-            if(reconfirm === 'periodically'){
-                permissionCache.set(permissionKeyOf(pluginName, permissionDesc) + '_lastGrantTime', Date.now());
-            }
-            await persistPluginPermissionState()
-            return true;
-        }
-        permissionDeniedPlugins.add(permissionKey);
-        await persistPluginPermissionState()
-        return false;
-    }
-
-    // Append to the dialog chain so only one permission dialog is shown at a
-    // time. finally restores the chain even if showDialog throws, so a single
-    // failure never deadlocks every later permission request.
-    const run = pluginPermissionDialogChain
-        .catch(() => {})
-        .then(() => showDialog())
-    pluginPermissionDialogChain = run.catch(() => {})
-    return run
-}
+const getPluginPermission = async (
+    context: PluginExecutionContext,
+    permissionDesc: PluginPermissionId,
+    reconfirm: boolean|'periodically' = false,
+) => pluginPermissionService.request(context, permissionDesc, {
+    reconfirm,
+    locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+})
 
 const urlBlacklist = [
     'risuai.xyz',
@@ -750,9 +592,27 @@ const authorizationHeaders = [
     'proxy-authorization',
 ]
 
-const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
+const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: PluginExecutionContext) => {
 
-    const oldApis = getV2PluginAPIs();
+    const isExecutionCurrent = () => isCurrentPluginRuntimeRecord(
+        plugin, getDatabase().plugins ?? [], (principalId) => pluginDataLifecycle.isRetiring(principalId),
+    )
+    const canRegisterResource = () => !context.signal.aborted && isExecutionCurrent()
+    const oldApis = getV2PluginAPIs(canRegisterResource, isExecutionCurrent);
+    const pluginStorageMutations = createOwnedSyncStorageMutations({
+        storage: oldApis.pluginStorage,
+        canMutate: canRegisterResource,
+        recordOwner: (key) => recordOwner('save', key, context.principalId, context.displayName) === true,
+        removeOwner: (key) => { removeOwner('save', key) },
+        clearOwners: () => { clearOwners('save') },
+    })
+    const safeLocalStorageMutations = createOwnedSyncStorageMutations({
+        storage: oldApis.safeLocalStorage,
+        canMutate: canRegisterResource,
+        recordOwner: (key) => recordOwner('local', key, context.principalId, context.displayName) === true,
+        removeOwner: (key) => { removeOwner('local', key) },
+        clearOwners: () => { clearOwners('local') },
+    })
     return {
 
         //Old APIs from v2.1
@@ -793,18 +653,20 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         setChar: oldApis.setChar,
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV3ProviderOptions) => {
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
-            let provs = get(customProviderStore)
-            provs.push(name)
-            pluginV2.providers.set(name, async (arg, abortSignal) => {
-               await getPluginPermission(plugin.name, 'provider', 'periodically');
-               //mode is overridden to v3, due to vulnerabilities using mode.
-               //Alternative to mode will be added in future
-               arg.mode = 'v3'
-               return await func(arg, abortSignal);
-            }),
-            pluginV2.providerOptions.set(name, options ?? {})
-            customProviderStore.set(provs)
-
+            const providerCallback = async (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => {
+                return invokePermissionCheckedProvider(
+                    () => getPluginPermission(context, 'provider', 'periodically'),
+                    async (authorizedArg, authorizedSignal) => {
+                        // mode is overridden to v3 due to vulnerabilities using mode.
+                        authorizedArg.mode = 'v3'
+                        return func(authorizedArg, authorizedSignal)
+                    },
+                    arg,
+                    abortSignal,
+                    context.signal,
+                )
+            }
+            const providerOptions = options ?? {}
             const modelData:LLMModel = {
                 id: `pluginmodel:::${name}`,
                 name: options?.model?.name ?? name,
@@ -817,39 +679,65 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 parameters: options?.model?.parameters ?? ['temperature', 'top_p', 'frequency_penalty', 'presence_penalty', 'repetition_penalty', 'min_p', 'top_a', 'top_k', 'thinking_tokens'],
                 tokenizer:options?.model?.tokenizer ??  LLMTokenizer.Unknown
             }
-            customV3ProviderMetaStore.push(modelData);
+            if (!registerInstanceResourceIfActive(canRegisterResource, () => {
+                pluginV2.providers.set(name, providerCallback)
+                pluginV2.providerOptions.set(name, providerOptions)
+                customProviderStore.set([...get(customProviderStore).filter((provider) => provider !== name), name])
+                const previousMetaIndex = customV3ProviderMetaStore.findIndex((model) => model.id === modelData.id)
+                if (previousMetaIndex >= 0) customV3ProviderMetaStore[previousMetaIndex] = modelData
+                else customV3ProviderMetaStore.push(modelData)
+            })) return
+            addPluginUnloadCallback(context.instanceId, () => {
+                cleanupOwnedProviderRegistration({
+                    name, provider: providerCallback, options: providerOptions,
+                    providers: pluginV2.providers, providerOptions: pluginV2.providerOptions,
+                    removeName: () => customProviderStore.set(get(customProviderStore).filter((provider) => provider !== name)),
+                    removeModel: () => removeOwnedArrayEntry(customV3ProviderMetaStore, modelData),
+                })
+            })
         },
         addTTSPreprocessor: async (
             func: TTSHookFn<BeforeTTSContext, BeforeTTSResult>,
         ) => {
+            if (!canRegisterResource()) return
             registerTTSPreprocessor(func);
-            addPluginUnloadCallback(plugin.name, () => unregisterTTSPreprocessor(func));
+            addPluginUnloadCallback(context.instanceId, () => unregisterTTSPreprocessor(func));
         },
         addTTSPostprocessor: async (
             func: TTSHookFn<AfterTTSContext, AfterTTSResult>,
         ) => {
+            if (!canRegisterResource()) return
             registerTTSPostprocessor(func);
-            addPluginUnloadCallback(plugin.name, () => unregisterTTSPostprocessor(func));
+            addPluginUnloadCallback(context.instanceId, () => unregisterTTSPostprocessor(func));
         },
-        addRisuScriptHandler: oldApis.addRisuScriptHandler,
+        addRisuScriptHandler: (name: Parameters<typeof oldApis.addRisuScriptHandler>[0], func: Parameters<typeof oldApis.addRisuScriptHandler>[1]) => {
+            if (!canRegisterResource()) return
+            oldApis.addRisuScriptHandler(name, func)
+            addPluginUnloadCallback(context.instanceId, () => oldApis.removeRisuScriptHandler(name, func))
+        },
         removeRisuScriptHandler: oldApis.removeRisuScriptHandler,
         addRisuReplacer: async (name:string,func:Function) => {
             //permission check for replacer
-            const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
+            const conf = await getPluginPermission(context, 'replacer', 'periodically');
             if(!conf){
                 return;
             }
+            if (!canRegisterResource()) return
             oldApis.addRisuReplacer(name, func as any);
+            addPluginUnloadCallback(context.instanceId, () => oldApis.removeRisuReplacer(name, func as any))
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
-        setDatabaseLite: oldApis.setDatabaseLite,
-        setDatabase: oldApis.setDatabase,
-        loadPlugins: oldApis.loadPlugins,
+        setDatabaseLite: (newDb: any) => applyProgrammaticDatabaseMutation(newDb, 'lite', canRegisterResource, isExecutionCurrent),
+        setDatabase: (newDb: any) => applyProgrammaticDatabaseMutation(newDb, 'approved', canRegisterResource, isExecutionCurrent),
+        loadPlugins: async () => {
+            if (!canRegisterResource()) return
+            await oldApis.loadPlugins()
+        },
         readImage: oldApis.readImage,
         saveAsset: oldApis.saveAsset,
         //Same functionality, but new implementation
         getDatabase: async (includeOnly:string[]|'all' = 'all') => {
-            const conf = await getPluginPermission(plugin.name, 'db', 'periodically');
+            const conf = await getPluginPermission(context, 'db', 'periodically');
             if(!conf){
                 return null;
             }
@@ -859,12 +747,19 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 if(includeOnly !== 'all' && !includeOnly.includes(key)){
                     continue;
                 }
-                (liteDB as any)[key] = $state.snapshot((db as any)[key]);
+                const value = key === 'plugins'
+                    ? (db.plugins ?? []).map((installed) => stripPluginPrincipal(installed))
+                    : (db as any)[key]
+                ;(liteDB as any)[key] = $state.snapshot(value);
             }
             return liteDB;
         },
 
-        installPlugin: handlePluginInstallViaPlugin,
+        installPlugin: async (plugins: RisuPlugin[]) => {
+            if (!canRegisterResource()) return []
+            const approved = await handlePluginInstallViaPlugin(plugins, canRegisterResource)
+            return canRegisterResource() ? approved : []
+        },
 
         // --- Color Scheme APIs ---
         changeColorScheme: (name: string) => {
@@ -1047,11 +942,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             iframe.style.display = "none";
         },
         getRootDocument: async () => {
-            const conf = await getPluginPermission(plugin.name, 'mainDom');
-            if(!conf){
+            const conf = await getPluginPermission(context, 'mainDom');
+            if(!conf || !canRegisterResource()){
                 return null;
             }
-            return new SafeDocument(document);
+            return new SafeDocument(document, context.instanceId);
         },
         registerSetting: (
             name:string,
@@ -1060,6 +955,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             iconType:'html'|'img'|'none' = 'none',
             id?:string
         ) => {
+            if (!canRegisterResource()) return null
             if(iconType !== 'html' && iconType !== 'img' && iconType !== 'none'){
                 throw new Error("iconType must be 'html', 'img' or 'none'");
             }
@@ -1078,30 +974,31 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             if(existingIndex !== -1){
                 additionalSettingsMenu[existingIndex] = menuDef
                 addPluginUnloadCallback(
-                    plugin.name,
-                    makeMenuUnloadCallback(menuId, additionalSettingsMenu)
+                    context.instanceId,
+                    makeMenuUnloadCallback(additionalSettingsMenu, menuDef)
                 )
                 return {id: menuId}
             }
             additionalSettingsMenu.push(menuDef)
             addPluginUnloadCallback(
-                plugin.name,
-                makeMenuUnloadCallback(menuId, additionalSettingsMenu)
+                context.instanceId,
+                makeMenuUnloadCallback(additionalSettingsMenu, menuDef)
             )
             return {id: menuId};
         },
         registerBodyIntercepter: async (callback: (body: any, type: string) => any) => {
 
-            if(await getPluginPermission(plugin.name, 'replacer') === false){
+            if(await getPluginPermission(context, 'replacer') === false){
                 return null;
             }
+            if (!canRegisterResource()) return null
             
             const id = v4();
             bodyIntercepterStore.push({
                 id,
                 callback
             })
-            addPluginUnloadCallback(plugin.name, () => {
+            addPluginUnloadCallback(context.instanceId, () => {
                 const index = bodyIntercepterStore.findIndex(item => item.id === id);
                 if(index !== -1){
                     bodyIntercepterStore.splice(index, 1);
@@ -1127,6 +1024,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             },
             callback: () => void
         ) => {
+            if (!canRegisterResource()) return null
             let { name, icon, iconType, location, id: providedId } = arg;
             location = location || 'action';
             if(iconType !== 'html' && iconType !== 'img' && iconType !== 'none'){
@@ -1153,8 +1051,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 if(existingIndex !== -1){
                     store[existingIndex] = menuDef
                     addPluginUnloadCallback(
-                        plugin.name,
-                        makeMenuUnloadCallback(id, store)
+                        context.instanceId,
+                        makeMenuUnloadCallback(store, menuDef)
                     )
                     return {id}
                 }
@@ -1164,24 +1062,24 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 case 'action':{
                     additionalFloatingActionButtons.push(menuDef)
                     addPluginUnloadCallback(
-                        plugin.name,
-                        makeMenuUnloadCallback(menuDef.id, additionalFloatingActionButtons)
+                        context.instanceId,
+                        makeMenuUnloadCallback(additionalFloatingActionButtons, menuDef)
                     )
                     break
                 }
                 case 'hamburger':{
                     additionalHamburgerMenu.push(menuDef)
                     addPluginUnloadCallback(
-                        plugin.name,
-                        makeMenuUnloadCallback(menuDef.id, additionalHamburgerMenu)
+                        context.instanceId,
+                        makeMenuUnloadCallback(additionalHamburgerMenu, menuDef)
                     )
                     break
                 }
                 case 'chat':{
                     additionalChatMenu.push(menuDef)
                     addPluginUnloadCallback(
-                        plugin.name,
-                        makeMenuUnloadCallback(menuDef.id, additionalChatMenu)
+                        context.instanceId,
+                        makeMenuUnloadCallback(additionalChatMenu, menuDef)
                     )
                     break
                 }
@@ -1198,6 +1096,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 className?: string,
             } = {}
         ) => {
+            if (!canRegisterResource()) return null
             const id = options.id || `${plugin.name}:default`;
 
             if(content === null || content === ''){
@@ -1225,10 +1124,21 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             else{
                 chatPanelStore.push(panel);
             }
-            addPluginUnloadCallback(plugin.name, () => removePluginChatPanels(plugin.name));
+            addPluginUnloadCallback(context.instanceId, () => removeOwnedArrayEntry(chatPanelStore, panel));
             return {id};
         },
-        registerMCP: registerMCPModule,
+        registerMCP: async (...args: Parameters<typeof registerMCPModule>) => {
+            if (!canRegisterResource()) return
+            await registerMCPModule(...args)
+            const identifier = args[0].identifier
+            const ownedClient = registeredCustomPluginMCPs.get(identifier)
+            const cleanup = async () => {
+                if (registeredCustomPluginMCPs.get(identifier) === ownedClient) await unregisterMCPModule(identifier)
+            }
+            await retainOrCleanupInstanceResource(context.signal, cleanup, (callback) => {
+                addPluginUnloadCallback(context.instanceId, callback)
+            })
+        },
         unregisterMCP: unregisterMCPModule,
         unregisterUIPart: (id: string) => {
             const removeFromMenuStore = (menuStore: MenuDef[]) => {
@@ -1248,14 +1158,18 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             console.log(`[RisuAI Plugin: ${plugin.name}] ${message}`);
         },
         createMutationObserver(callback: SafeMutationCallback): SafeMutationObserver {
-            return new SafeMutationObserver(callback)
+            if (!canRegisterResource()) throw new Error('Plugin instance is no longer active')
+            const observer = new SafeMutationObserver(callback, context.instanceId)
+            addPluginUnloadCallback(context.instanceId, () => observer.disconnect())
+            return observer
         },
         onUnload: (callback: () => void) => {
-            addPluginUnloadCallback(plugin.name, callback);
+            if (!canRegisterResource()) return
+            addPluginUnloadCallback(context.instanceId, () => invokeSandboxCleanupCallback(callback));
         },
         getFetchLogs: async () => {
             const unsafeFetchLog = getFetchLogs()
-            const conf = await getPluginPermission(plugin.name, 'fetchLogs');
+            const conf = await getPluginPermission(context, 'fetchLogs');
             if(!conf){
                 return null;
             }
@@ -1290,12 +1204,16 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
         },
         getLocalPluginStorage: () => {
-            return new SafeLocalPluginStorage(plugin.name)
+            return new SafeLocalPluginStorage({ principalId: context.principalId, displayName: context.displayName })
         },
         checkCharOrder: checkCharOrder,
         requestPluginPermission: (permission:string) => {
-            return getPluginPermission(plugin.name, permission as any);
+            if (!isPluginPermissionId(permission)) return Promise.resolve(false)
+            return getPluginPermission(context, permission);
         },
+        getCapabilities: (ids?: string[]) => getCapabilities(context, ids, {
+            permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
+        }),
         //Internal use APIs
         _getOldKeys: () => {
             return Object.keys(oldApis)
@@ -1314,32 +1232,26 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         // Wrapped (not aliased) so we can record the originating plugin into the
         // sidecar meta map. The value write is unchanged; reads stay aliased.
         _setPluginStorage: (key: string, value: any) => {
-            oldApis.pluginStorage.setItem(key, value)
-            recordOwner('save', key, plugin.name)
+            pluginStorageMutations.setItem(key, value)
         },
         _removePluginStorage: (key: string) => {
-            oldApis.pluginStorage.removeItem(key)
-            removeOwner('save', key)
+            pluginStorageMutations.removeItem(key)
         },
         _clearPluginStorage: () => {
-            oldApis.pluginStorage.clear()
-            clearOwners('save')
+            pluginStorageMutations.clear()
         },
         _keyPluginStorage: oldApis.pluginStorage.key,
         _keysPluginStorage: oldApis.pluginStorage.keys,
         _lengthPluginStorage: oldApis.pluginStorage.length,
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
         _setSafeLocalStorage: (key: string, value: string) => {
-            oldApis.safeLocalStorage.setItem(key, value)
-            recordOwner('local', key, plugin.name)
+            safeLocalStorageMutations.setItem(key, value)
         },
         _removeSafeLocalStorage: (key: string) => {
-            oldApis.safeLocalStorage.removeItem(key)
-            removeOwner('local', key)
+            safeLocalStorageMutations.removeItem(key)
         },
         _clearSafeLocalStorage: () => {
-            oldApis.safeLocalStorage.clear()
-            clearOwners('local')
+            safeLocalStorageMutations.clear()
         },
         _keySafeLocalStorage: oldApis.safeLocalStorage.key,
         _keysSafeLocalStorage: oldApis.safeLocalStorage.keys,
@@ -1392,7 +1304,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }, options.mode)
         },
         sendChat: async (message: string) => {
-            const conf = await getPluginPermission(plugin.name, 'sendChat');
+            const conf = await getPluginPermission(context, 'sendChat');
             if(!conf){
                 return false;
             }
@@ -1440,7 +1352,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return true;
         },
         addPluginChannelListener: (channelName: string, callback: Function) => {
-            pluginChannel.set(plugin.name + channelName, callback);
+            if (!canRegisterResource()) return
+            pluginChannels.register(plugin.name, channelName, context.instanceId, callback);
+            addPluginUnloadCallback(context.instanceId, () => {
+                pluginChannels.removeOwned(plugin.name, channelName, context.instanceId);
+            })
         },
         postPluginChannelMessage: (pluginName: string, channelName: string, message: any) => {
 
@@ -1463,7 +1379,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
 
 
-            const callback = pluginChannel.get(pluginName + channelName);
+            const callback = pluginChannels.get(pluginName, channelName);
             if(callback){
                 callback(message, {
                     sender: currentPluginName,
@@ -1481,22 +1397,38 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 
 type V3PluginInstance = {
     name: string;
+    principalId: string;
+    instanceId: string;
+    abortController: AbortController;
+    unregisterStop: () => void;
     host: SandboxHost;
 }
 
 const v3PluginInstances: V3PluginInstance[] = [];
 
 export async function loadV3Plugins(plugins:RisuPlugin[]){
-    await Promise.all(v3PluginInstances.map(async (instance) => {
-        await unloadV3Plugin(instance.name);
-    }));
-    const loadPromises = plugins.map(plugin => executePluginV3(plugin));
-    await Promise.all(loadPromises);
+    await replacePluginV3RuntimeSnapshot({
+        liveInstances: v3PluginInstances,
+        plugins,
+        unload: (instance) => unloadV3Plugin(instance.instanceId),
+        load: executePluginV3,
+    })
 }
 
 export async function executePluginV3(plugin:RisuPlugin){
 
-    const alreadyRunning = v3PluginInstances.find(p => p.name === plugin.name);
+    if (!isCurrentPluginRuntimeRecord(
+        plugin, getDatabase().plugins ?? [], (principalId) => pluginDataLifecycle.isRetiring(principalId),
+    )) {
+        console.warn(`[RisuAI Plugin: ${plugin.name}] Skipped stale or retired runtime snapshot.`)
+        return
+    }
+
+    if (!plugin.principalId) {
+        throw new Error(`Plugin ${plugin.name} is missing its Host principal.`)
+    }
+
+    const alreadyRunning = v3PluginInstances.find(p => p.principalId === plugin.principalId);
     if(alreadyRunning){
         console.log(`[RisuAI Plugin: ${plugin.name}] Plugin is already running. Skipping load.`);
         return;
@@ -1505,11 +1437,30 @@ export async function executePluginV3(plugin:RisuPlugin){
     const iframe = document.createElement('iframe');
     iframe.style.display = "none";
     document.body.appendChild(iframe);
-    const host = new SandboxHost(makeRisuaiAPIV3(iframe, plugin));
-    v3PluginInstances.push({
+    const { context, abortController } = createPluginExecutionContext({
+        principalId: plugin.principalId, name: plugin.name, displayName: plugin.displayName,
+    })
+    const authorizeExecution = () => !context.signal.aborted && isCurrentPluginRuntimeRecord(
+        plugin, getDatabase().plugins ?? [], (principalId) => pluginDataLifecycle.isRetiring(principalId),
+    )
+    const host = new SandboxHost(
+        makeRisuaiAPIV3(iframe, plugin, context),
+        authorizeExecution,
+        () => abortController.abort(),
+        authorizeExecution,
+    );
+    const instance: V3PluginInstance = {
         name: plugin.name,
-        host
-    });
+        principalId: plugin.principalId,
+        instanceId: context.instanceId,
+        abortController,
+        unregisterStop: () => undefined,
+        host,
+    }
+    instance.unregisterStop = pluginDataLifecycle.registerInstanceStop(
+        plugin.principalId, context.instanceId, () => unloadV3Plugin(context.instanceId),
+    )
+    v3PluginInstances.push(instance);
     host.run(iframe, plugin.script);
     console.log(`[RisuAI Plugin: ${plugin.name}] Loaded API V3 plugin.`);
 }

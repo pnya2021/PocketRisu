@@ -29,6 +29,7 @@
     import HypaV3Modal from './lib/Others/HypaV3Modal.svelte';
     import HypaV3Progress from './lib/Others/HypaV3Progress.svelte';
     import PluginAlertModal from './lib/Others/PluginAlertModal.svelte';
+    import PluginPermissionConsent from './lib/Others/PluginPermissionConsent.svelte';
     import PopupEditor from './lib/Others/PopupEditor.svelte';
     import UpdatePopup from './lib/Others/UpdatePopup.svelte';
     import BootBackupPrompt from './lib/Others/BootBackupPrompt.svelte';
@@ -239,6 +240,7 @@
         <HypaV3Progress />
     {/if}
     <PluginAlertModal />
+    <PluginPermissionConsent />
     <LoadingOverlay />
     <UpdatePopup />
     <BootBackupPrompt />

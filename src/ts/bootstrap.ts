@@ -10,7 +10,7 @@ import { loadPlugins } from "./plugins/plugins.svelte";
 import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } from "./alert";
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
-import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
+import { decodeRisuSave, encodeRisuSaveLegacy, RisuSaveEncoder } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
@@ -31,6 +31,37 @@ import {
 import { registerModelDynamic } from "./model/modellist";
 import { convertStubsToPlaceholders } from "./storage/chatStorage";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
+import { hydrateColdDatabase, loadPluginsAfterColdDatabaseWriteback, registerColdDatabaseWritebackWriter } from './storage/coldDatabaseHydration';
+import { writeEtagBoundDatabase } from './storage/etagBoundDatabaseWrite';
+import { databasePersistenceCoordinator } from './storage/databasePersistenceCoordinator';
+import { ConflictError } from './storage/nodeStorage';
+
+const persistNormalizedDatabaseBeforePlugins = () => databasePersistenceCoordinator.runExclusiveMutation(async () => {
+    const writeNormalizedSnapshot = async () => {
+        const encoder = new RisuSaveEncoder()
+        await encoder.init(getDatabase({ snapshot: true }), {
+            compression: false,
+            skipRemoteSavingOnCharacters: false,
+        })
+        const encoded = encoder.encode()
+        if (!encoded) throw new Error('Failed to encode normalized plugin principals')
+        await writeEtagBoundDatabase(forageStorage, new Uint8Array(encoded))
+    }
+    try {
+        await writeNormalizedSnapshot()
+    } catch (error) {
+        if (!(error instanceof ConflictError)) throw error
+        // Re-read the winning server snapshot before retrying. Updating only
+        // the cached ETag would overwrite concurrent data with our stale DB.
+        forageStorage.setDbEtag(error.currentEtag ?? null)
+        const latest = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
+        if (!latest?.length) throw error
+        setDatabase(await decodeRisuSave(latest))
+        setPatchSyncBaseline(getDatabase({ snapshot: true }))
+        await writeNormalizedSnapshot()
+    }
+})
+registerColdDatabaseWritebackWriter(persistNormalizedDatabaseBeforePlugins)
 
 /**
  * Loads the application data.
@@ -50,13 +81,18 @@ export async function loadData() {
                 if (checkNullish(gotStorage)) {
                     createdFreshDatabase = true
                     gotStorage = encodeRisuSaveLegacy({})
-                    await forageStorage.setItem('database/database.bin', gotStorage)
+                    await databasePersistenceCoordinator.runExclusiveMutation(
+                        () => forageStorage.setItem('database/database.bin', gotStorage),
+                    )
                 }
                 try {
                     const decoded = await decodeRisuSave(gotStorage)
-                    setPatchSyncBaseline(safeStructuredClone(decoded))
                     console.log(decoded)
-                    setDatabase(decoded)
+                    hydrateColdDatabase(decoded, {
+                        setDatabase,
+                        getSnapshot: () => getDatabase({ snapshot: true }),
+                        setPatchSyncBaseline,
+                    })
                 } catch (error) {
                     console.error(error)
                     const backups = await getDbBackups()
@@ -66,8 +102,11 @@ export async function loadData() {
                             LoadingStatusState.text = `Reading Backup File ${backup}...`
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
                             const backupDecoded = await decodeRisuSave(backupData)
-                            setPatchSyncBaseline(safeStructuredClone(backupDecoded))
-                            setDatabase(backupDecoded)
+                            hydrateColdDatabase(backupDecoded, {
+                                setDatabase,
+                                getSnapshot: () => getDatabase({ snapshot: true }),
+                                setPatchSyncBaseline,
+                            })
                             backupLoaded = true
                             break
                         } catch (error) { }
@@ -110,8 +149,10 @@ export async function loadData() {
             }
             LoadingStatusState.text = "Loading Plugins..."
             try {
-                await loadPlugins()
-            } catch (error) { }
+                await loadPluginsAfterColdDatabaseWriteback(persistNormalizedDatabaseBeforePlugins, loadPlugins)
+            } catch (error) {
+                console.error('[bootstrap] normalized plugin principal writeback failed; plugins remain disabled', error)
+            }
             try {
                 //@ts-expect-error navigator.standalone is iOS Safari non-standard property, not in Navigator interface
                 const isInStandaloneMode = (window.matchMedia('(display-mode: standalone)').matches) || (window.navigator.standalone) || document.referrer.includes('android-app://');

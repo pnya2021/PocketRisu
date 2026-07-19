@@ -3,10 +3,10 @@ import { v4 as uuidv4, v4 } from 'uuid';
 import { tick } from "svelte";
 import { get } from "svelte/store";
 import streamSaver from 'streamsaver';
-import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, nodeOnlyVer, getCurrentCharacter, loadTogglesFromChat } from "./storage/database.svelte";
+import { setDatabaseLive, type Database, defaultSdDataFunc, getDatabase, appVer, nodeOnlyVer, getCurrentCharacter, loadTogglesFromChat } from "./storage/database.svelte";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore, loadingOverlayStore, chatDeselected } from "./stores.svelte";
-import { loadPlugins } from "./plugins/plugins.svelte";
+import { loadPlugins, replaceDatabaseWithPluginRuntime, runSuspendedPluginRuntimeMutation } from "./plugins/plugins.svelte";
 import { alertConfirm, alertError, alertMd, alertNormalWait, alertSelect, alertTOS, waitAlert, notifySuccess, notifyError } from "./alert";
 import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
@@ -27,8 +27,48 @@ import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
+import { attemptColdDatabaseWriteback, requestColdDatabaseWriteback } from './storage/coldDatabaseHydration';
+import { writeEtagBoundDatabase } from './storage/etagBoundDatabaseWrite';
+import { persistRestoredDatabaseAndInvalidateEncoder } from './storage/restoredDatabaseState';
+import { databasePersistenceCoordinator } from './storage/databasePersistenceCoordinator';
+import { commitCoordinatedDatabaseSave } from './storage/coordinatedDatabaseSave';
+import { applyTrackedPluginStateDuringConflict } from './plugins/pluginConflictRebase';
+import { runCoordinatedConflictRebase } from './storage/coordinatedConflictRebase';
 
 export const forageStorage = new AutoStorage()
+
+export async function persistRestoredDatabaseUnderLease(database: Database) {
+    await persistRestoredDatabaseAndInvalidateEncoder(
+        async () => { await writeEtagBoundDatabase(forageStorage, encodeRisuSaveLegacy(database, 'compression')) },
+        requiresFullEncoderReload,
+    )
+    setPatchSyncBaseline(database)
+}
+
+export function persistRestoredDatabase(database: Database) {
+    return databasePersistenceCoordinator.runExclusiveMutation(
+        () => persistRestoredDatabaseUnderLease(database),
+    )
+}
+
+export function replaceAndPersistDatabaseWithPluginRuntime(data: Database) {
+    return replaceDatabaseWithPluginRuntime(data, { persist: persistRestoredDatabase })
+}
+
+export function restorePersistedDatabaseWithPluginRuntime<T>(persistRequest: () => T | Promise<T>) {
+    return runSuspendedPluginRuntimeMutation(async ({ markIrreversibleMutation, replaceLiveDatabase }) =>
+        databasePersistenceCoordinator.runFailClosedExclusiveMutation(async () => {
+            // The server may commit even when its response is lost. Fence old
+            // runtime/save state before issuing this ambiguous request.
+            markIrreversibleMutation()
+            const result = await persistRequest()
+            const data = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
+            if (!data) throw new Error('Restored database is unavailable')
+            await replaceLiveDatabase(await decodeRisuSave(data))
+            await persistRestoredDatabaseUnderLease(getDatabase({ snapshot: true }))
+            return result
+        }))
+}
 
 interface fetchLog {
     body: string
@@ -709,11 +749,22 @@ export async function saveDb() {
         }
     }
 
-    async function rebaseTrackedLocalChangesOnLatestServerDb(conflictEtag: string | null, db: Database, toSave: toSaveType) {
-        forageStorage.setDbEtag(conflictEtag ?? null)
-        const latestData = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
-        if (latestData && latestData.length > 0) {
-            const latestDb = await decodeRisuSave(latestData) as Database
+    async function rebaseTrackedLocalChangesOnLatestServerDb(
+        conflictEtag: string | null,
+        db: Database,
+        toSave: toSaveType,
+        persistenceGeneration: number,
+    ) {
+        const rebase = await runSuspendedPluginRuntimeMutation(({ replaceLiveDatabase }) => runCoordinatedConflictRebase(
+            persistenceGeneration,
+            {
+            readLatest: async () => {
+                forageStorage.setDbEtag(conflictEtag ?? null)
+                const latestData = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
+                if (!latestData || latestData.length === 0) return null
+                return await decodeRisuSave(latestData) as Database
+            },
+            applyLatest: async (latestDb) => {
             const mergedDb = safeStructuredClone(latestDb) as Database
             const localDb = safeStructuredClone(db) as Database
 
@@ -733,6 +784,7 @@ export async function saveDb() {
             if (toSave.modules) {
                 mergedDb.modules = safeStructuredClone(localDb.modules)
             }
+            applyTrackedPluginStateDuringConflict(mergedDb, localDb, toSave)
 
             const trackedCharIds = new Set<string>(toSave.character.filter(Boolean))
             for (const trackedChat of toSave.chat) {
@@ -760,18 +812,23 @@ export async function saveDb() {
                 }
             }
             mergedDb.characters = mergedCharacters
-            const mergedBaseline = safeStructuredClone(mergedDb) as Database
-            setDatabase(mergedDb)
+            await replaceLiveDatabase(mergedDb)
+            await persistRestoredDatabaseUnderLease(getDatabase({ snapshot: true }))
+            const mergedBaseline = getDatabase({ snapshot: true })
 
             encoder = new RisuSaveEncoder()
-            await encoder.init(getDatabase(), {
+            await encoder.init(mergedBaseline, {
                 compression: false
             })
             if (supportsPatchSync) {
                 patcher = new RisuSavePatcher()
                 await patcher.init(mergedBaseline)
             }
-        }
+            requiresFullEncoderReload.state = false
+            },
+            },
+        ))
+        if (!rebase.executed) requiresFullEncoderReload.state = true
         requeueTrackedChanges(toSave)
         changed = true
     }
@@ -792,14 +849,22 @@ export async function saveDb() {
             channel.postMessage(sessionID)
         }
 
-        const db = getDatabase()
+        // Capture the token and immutable save input in one synchronous turn.
+        // A restore that begins afterward must make every resulting write stale.
+        const persistenceGeneration = databasePersistenceCoordinator.captureGeneration()
+        const db = getDatabase({ snapshot: true })
         if (!db.characters) {
             await sleep(1000)
             return 'noop'
         }
 
         // ── Save changed chat content to server ─────────────────────────
-        const failedChats: [string, string][] = []
+        const chatsToPersist: Array<{
+            chaId: string
+            chatId: string
+            chatIndex: number
+            chat: any
+        }> = []
         for (const [chaId, chatId] of collectChatsToPersist(db, toSave)) {
             const char = db.characters.find(c => c.chaId === chaId)
             if (!char) continue
@@ -808,18 +873,14 @@ export async function saveDb() {
             const chat = char.chats[chatIndex]
             // Skip placeholders — they have no real data to save
             if (!chat || chat._placeholder) continue
-            try {
-                await saveChatToServer(chaId, chatIndex, chatId, chat)
-            } catch (e) {
-                console.error(`[Save] Failed to save chat ${chaId}/${chatId}:`, e)
-                failedChats.push([chaId, chatId])
-            }
-        }
-        if (failedChats.length > 0) {
-            throw new Error(`Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}`)
+            chatsToPersist.push({ chaId, chatId, chatIndex, chat })
         }
 
         // ── database.bin: exclude chat payload (stubs only via encoder) ──
+        // Encoding is intentionally done outside the persistence lease. The
+        // captured generation ties the resulting bytes to the backing-store
+        // state they were derived from; a restore that starts meanwhile makes
+        // the write stale and forces a fresh encoder baseline on the retry.
         await encoder.set(db, safeStructuredClone(toSave))
         const encoded = encoder.encode()
         if (!encoded) {
@@ -828,11 +889,10 @@ export async function saveDb() {
         }
         const dbData = new Uint8Array(encoded)
 
-        let saved = false
-        let newEtag: string | undefined
-
+        let patchData: Awaited<ReturnType<RisuSavePatcher['set']>> | undefined
+        let shouldAttemptPatch = false
         if (supportsPatchSync && !options?.forceFullWrite) {
-            const patchData = await patcher.set(db, safeStructuredClone(toSave))
+            patchData = await patcher.set(db, safeStructuredClone(toSave))
             // Refuse to send patches that would corrupt server-side lazy chats.
             // chatToStub strips chats to metadata before diffing, so the only
             // way these ops appear is a baseline desync. Falling through to a
@@ -991,57 +1051,81 @@ export async function saveDb() {
                 console.error('[Save:guard-debug] affected chats (baseline / current / stubReplay):', affectedChats)
                 console.error('[Save:guard-debug] chats[] distribution per affected character:', charsDistribution)
                 }
-                // Leave saved=false so the full-write path below kicks in.
+                // Leave shouldAttemptPatch=false so the full-write path below kicks in.
             } else {
-                const patchResult = await forageStorage.patchItem('database/database.bin', patchData)
-                saved = patchResult.success
-                if (patchResult.etag) {
-                    newEtag = patchResult.etag
-                    forageStorage.setDbEtag(patchResult.etag)
-                }
-                if (patchResult.persistWarning) {
-                    showPersistWarningOnce(patchResult.persistWarning)
-                }
-                // Server's chat-internal-field guard rejected the patch — the
-                // client-side guard above missed this case. Surface to user
-                // and continue to the full-write fallback below.
-                if (patchResult.chatGuardRejected) {
-                    console.error('[Save] Server rejected patch — chat-internal field ops detected server-side')
-                    showChatGuardToastThrottled('server')
-                }
-            }
-        }
-        if (!saved) {
-            if (supportsPatchSync && !options?.forceFullWrite) {
-                console.warn('[Save] Patch conflict, falling through to full write...')
-            }
-            try {
-                const currentEtag = forageStorage.getDbEtag()
-                await forageStorage.setItem('database/database.bin', dbData, currentEtag ?? undefined)
-            } catch (conflictErr) {
-                if (conflictErr instanceof ConflictError) {
-                    console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
-                    await rebaseTrackedLocalChangesOnLatestServerDb(conflictErr.currentEtag ?? null, db, toSave)
-                    await sleep(Math.min(500 * (savetrys + 1), 3000))
-                    return 'retry'
-                }
-                throw conflictErr
-            }
-
-            // Re-init patcher from the data we just wrote so both sides
-            // share the same baseline (including setDatabase defaults).
-            if (supportsPatchSync) {
-                const decodedDb = await decodeRisuSave(dbData)
-                await patcher.init(decodedDb)
+                shouldAttemptPatch = true
             }
         }
 
-        updateKnownChatsAfterSuccessfulSave(db, toSave)
+        try {
+            const coordinatedWrite = await commitCoordinatedDatabaseSave({
+                generation: persistenceGeneration,
+                writeSidecars: async () => {
+                    const failedChats: [string, string][] = []
+                    for (const { chaId, chatId, chatIndex, chat } of chatsToPersist) {
+                        try {
+                            await saveChatToServer(chaId, chatIndex, chatId, chat)
+                        } catch (error) {
+                            console.error(`[Save] Failed to save chat ${chaId}/${chatId}:`, error)
+                            failedChats.push([chaId, chatId])
+                        }
+                    }
+                    if (failedChats.length > 0) {
+                        throw new Error(`Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}`)
+                    }
+                },
+                writeDatabase: async () => {
+                    let savedByPatch = false
+                    if (shouldAttemptPatch && patchData) {
+                        const patchResult = await forageStorage.patchItem('database/database.bin', patchData)
+                        savedByPatch = patchResult.success
+                        if (patchResult.etag) forageStorage.setDbEtag(patchResult.etag)
+                        if (patchResult.persistWarning) showPersistWarningOnce(patchResult.persistWarning)
+                        if (patchResult.chatGuardRejected) {
+                            console.error('[Save] Server rejected patch — chat-internal field ops detected server-side')
+                            showChatGuardToastThrottled('server')
+                        }
+                    }
 
-        if (newEtag) {
-            forageStorage.setDbEtag(newEtag)
+                    if (!savedByPatch) {
+                        if (supportsPatchSync && !options?.forceFullWrite) {
+                            console.warn('[Save] Patch conflict, falling through to full write...')
+                        }
+                        const currentEtag = forageStorage.getDbEtag()
+                        await forageStorage.setItem('database/database.bin', dbData, currentEtag ?? undefined)
+
+                        // A restore cannot install a new baseline and then have
+                        // this stale save replace it after the lease releases.
+                        if (supportsPatchSync) {
+                            const decodedDb = await decodeRisuSave(dbData)
+                            await patcher.init(decodedDb)
+                        }
+                    }
+                    return savedByPatch
+                },
+                finalize: async () => { updateKnownChatsAfterSuccessfulSave(db, toSave) },
+            })
+            if (!coordinatedWrite.executed) {
+                requeueTrackedChanges(toSave)
+                changed = true
+                requiresFullEncoderReload.state = true
+                return 'retry'
+            }
+        } catch (conflictErr) {
+            // The normal lease is released before the exclusive rebase path.
+            if (conflictErr instanceof ConflictError) {
+                console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
+                await rebaseTrackedLocalChangesOnLatestServerDb(
+                    conflictErr.currentEtag ?? null,
+                    db,
+                    toSave,
+                    persistenceGeneration,
+                )
+                await sleep(Math.min(500 * (savetrys + 1), 3000))
+                return 'retry'
+            }
+            throw conflictErr
         }
-
 
         return 'saved'
     }
@@ -1071,6 +1155,7 @@ export async function saveDb() {
                 }
             } catch (error) {
                 requeueTrackedChanges(toSave)
+                if (options?.forceFullWrite) requestColdDatabaseWriteback()
                 savetrys += 1
                 if (savetrys > 4) {
                     alertError(error)
@@ -1100,6 +1185,13 @@ export async function saveDb() {
 
     let savetrys = 0
     while (true) {
+        const coldWriteback = await attemptColdDatabaseWriteback((error) => {
+            console.error('[Save] Cold normalized database writeback failed; retrying', error)
+        })
+        if (coldWriteback !== 'idle') {
+            await sleep(100)
+            continue
+        }
         if (!changed) {
             await sleep(200)
             continue
@@ -2393,7 +2485,7 @@ export async function loadInternalBackup() {
     const data = await forageStorage.getItem(selectedBackup)
 
     const backupDecoded = await decodeRisuSave(Buffer.from(data) as unknown as Uint8Array)
-    setDatabase(backupDecoded)
+    await replaceAndPersistDatabaseWithPluginRuntime(backupDecoded)
 
     notifySuccess('Loaded backup')
 

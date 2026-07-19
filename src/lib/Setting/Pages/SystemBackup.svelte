@@ -21,9 +21,7 @@
         TrashIcon,
     } from '@lucide/svelte'
     import { alertConfirm, alertError, alertWait, notifyError, notifySuccess } from 'src/ts/alert'
-    import { forageStorage } from 'src/ts/globalApi.svelte'
-    import { setDatabase } from 'src/ts/storage/database.svelte'
-    import { decodeRisuSave } from 'src/ts/storage/risuSave'
+    import { forageStorage, restorePersistedDatabaseWithPluginRuntime } from 'src/ts/globalApi.svelte'
     import { language } from 'src/lang'
     import { LoadLocalBackup, SaveLocalBackup, SaveServerBackup } from 'src/ts/drive/backuplocal'
 
@@ -141,14 +139,16 @@
             // invalidates caches, rebuilds chat store. Avoids the race where
             // a client-side setDatabase + reload could lose data because the
             // debounced save hadn't flushed yet.
-            const auth = await forageStorage.createAuth()
-            const res = await fetch('/api/db/snapshots/restore', {
-                method: 'POST',
-                headers: { 'risu-auth': auth, 'content-type': 'application/json' },
-                body: JSON.stringify({ key: snap.key }),
+            await restorePersistedDatabaseWithPluginRuntime(async () => {
+                const auth = await forageStorage.createAuth()
+                const res = await fetch('/api/db/snapshots/restore', {
+                    method: 'POST',
+                    headers: { 'risu-auth': auth, 'content-type': 'application/json' },
+                    body: JSON.stringify({ key: snap.key }),
+                })
+                const json = await res.json().catch(() => ({}))
+                if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
             })
-            const json = await res.json().catch(() => ({}))
-            if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
             notifySuccess('Loaded backup')
             location.search = ''
             location.reload()
