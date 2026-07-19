@@ -16,7 +16,7 @@
 
     import { exportChat, importChat, exportAllChats } from "src/ts/characters";
     import { alertConfirm, alertError, alertSelect, alertStore, notifySuccess, notifyError } from "src/ts/alert";
-    import { findCharacterbyId, sleep, sortableOptions } from "src/ts/util";
+    import { sleep, sortableOptions } from "src/ts/util";
 
     import { bookmarkListOpen, openModuleListStore } from "src/ts/stores.svelte";
     import { language } from "src/lang";
@@ -25,6 +25,7 @@
     import PromptBind from "./PromptBind.svelte";
     import ModelBind from "./ModelBind.svelte";
     import { changeChatTo, createChatCopyName, requestImmediateSave } from "src/ts/globalApi.svelte";
+    import { createGroupGreetingMessages } from "src/ts/process/group";
 
     interface Props {
         chara: character | groupChat;
@@ -156,7 +157,10 @@
         const len = chara.chats.length
         let chats = chara.chats
         const newChat = {
-            message:[] as any[], note:'', name:`New Chat ${len + 1}`, localLore:[] as any[], fmIndex: -1, id: v4(),
+            message: chara.type === 'group'
+                ? createGroupGreetingMessages(chara, DBState.db.characters)
+                : [] as any[],
+            note:'', name:`New Chat ${len + 1}`, localLore:[] as any[], fmIndex: -1, id: v4(),
             ...newChatModelDefaults()
         }
         chats.unshift(newChat)

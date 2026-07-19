@@ -133,6 +133,9 @@ export function createSimpleCharacter(char:character|groupChat){
         virtualscript: char.virtualscript,
         emotionImages: char.emotionImages,
         triggerscript: char.triggerscript,
+        prebuiltAssetCommand: char.prebuiltAssetCommand,
+        prebuiltAssetStyle: char.prebuiltAssetStyle,
+        prebuiltAssetExclude: char.prebuiltAssetExclude,
     }
 
     return simpleChar

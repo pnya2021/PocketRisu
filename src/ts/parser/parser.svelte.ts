@@ -875,6 +875,9 @@ export interface simpleCharacterArgument{
     virtualscript?: string
     emotionImages?: [string, string][]
     triggerscript?: triggerscript[]
+    prebuiltAssetCommand?: boolean
+    prebuiltAssetStyle?: string
+    prebuiltAssetExclude?: string[]
 }
 
 function parseThoughtsAndTools(data:string){
@@ -1726,8 +1729,10 @@ export function risuChatParser(da:string, arg:{
     if(aChara){
         if(typeof aChara !== 'string' && aChara.type === 'group'){
             const lastSaying = aChara.chats[aChara.chatPage]?.message?.at(-1)?.saying
-            const speaker = lastSaying ? findCharacterbyId(lastSaying) : undefined
-            chara = speaker && speaker.type !== 'group' ? speaker : 'bot'
+            const speaker = lastSaying && aChara.characters.includes(lastSaying)
+                ? db.characters.find((record): record is character => record.type === 'character' && record.chaId === lastSaying)
+                : undefined
+            chara = speaker ?? 'bot'
         }
         else{
             chara = aChara

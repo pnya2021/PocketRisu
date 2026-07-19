@@ -7,6 +7,7 @@
     import { chatFoldedStateMessageIndex } from 'src/ts/globalApi.svelte';
     import { get } from 'svelte/store';
     import { scrollWithinContainer } from './scrollWithin';
+    import { resolveGroupMessageSpeaker } from 'src/ts/process/group';
     
     const getCurrentChatRoomId = () => {
         const charId = get(selectedCharID);
@@ -67,9 +68,7 @@
 
         let nextHash = 0;
         let currentHashes: Set<number> = new Set();
-        const charImage = getCharImage(currentCharacter.image, 'css')
         const userImage = getCharImage(userIcon, 'css')
-        const simpleChar = createSimpleCharacter(currentCharacter);
         let loadStart = messages.length - 1
         let loadEnd = messages.length - loadPages
 
@@ -97,15 +96,41 @@
         for(let i=loadStart ; i >= loadEnd; i--){
             if(i < 0) break; // Prevent out of bounds
             const message = messages[i];
-            const messageLargePortrait = message.role === 'user' ? (userIconPortrait ?? false) : (currentCharacter.largePortrait ?? false);
+            const resolvedMember = currentCharacter.type === 'group'
+                ? resolveGroupMessageSpeaker(currentCharacter, DBState.db.characters, message)
+                : undefined
+            const renderCharacter = message.role === 'user'
+                ? null
+                : resolvedMember ?? (currentCharacter.type === 'character' ? currentCharacter : null)
+            const renderName = message.role === 'user'
+                ? currentUsername
+                : renderCharacter?.name ?? currentCharacter.name ?? 'Narrator'
+            const renderImage = message.role === 'user'
+                ? userImage
+                : getCharImage(renderCharacter?.image ?? currentCharacter.image ?? '', 'css')
+            const renderSimpleCharacter = renderCharacter
+                ? createSimpleCharacter(renderCharacter)
+                : message.role === 'user' && currentCharacter.type === 'character'
+                    ? createSimpleCharacter(currentCharacter)
+                    : null
+            const messageLargePortrait = message.role === 'user'
+                ? (userIconPortrait ?? false)
+                : (renderCharacter?.largePortrait ?? false)
+            const renderIdentity = message.role === 'user'
+                ? `persona:${currentUsername}`
+                : renderCharacter
+                    ? `character:${renderCharacter.chaId}`
+                    : `group:${currentCharacter.chaId}`
             const reloadPointer = reloadPointerMap[i] ?? 0;
             const isRerollTarget = i === lastRealCharIdx;
-            let hashd = message.data + (message.chatId ?? '') + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString() + (message.swipeId ?? 0).toString() + (message.swipes?.length ?? 0).toString() + isRerollTarget.toString();
+            let hashd = message.data + (message.chatId ?? '') + (message.saying ?? '') + renderIdentity + renderName + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString() + (message.swipeId ?? 0).toString() + (message.swipes?.length ?? 0).toString() + isRerollTarget.toString();
             const currentHash = hashCode(hashd);
             currentHashes.add(currentHash);
             if(!hashes.has(currentHash)){
                 const b = document.createElement('div');
                 b.setAttribute('x-hashed', currentHash.toString());
+                b.setAttribute('data-message-index', i.toString());
+                b.setAttribute('data-render-identity', renderIdentity);
                 b.classList.add('chat-message-container');
                 const swipes = message.swipes;
                 const swipeId = message.swipeId ?? 0;
@@ -116,17 +141,17 @@
                         isLastMemory: false,
                         idx: i,
                         totalLength: messages.length,
-                        img: message.role === 'user' ? userImage : charImage,
+                        img: renderImage,
                         onReroll: onReroll,
                         onNextSwipe: i === lastRealCharIdx ? onNextSwipe : () => {},
                         unReroll: unReroll,
                         onDeleteSwipe: i === lastRealCharIdx ? onDeleteSwipe : () => {},
                         rerollIcon: i === lastRealCharIdx ? 'force' : false,
-                        character: simpleChar,
-                        largePortrait: message.role === 'user' ? (userIconPortrait ?? false) : (currentCharacter.largePortrait ?? false),
+                        character: renderSimpleCharacter,
+                        largePortrait: messageLargePortrait,
                         messageGenerationInfo: message.generationInfo,
                         role: message.role,
-                        name: message.role === 'user' ? currentUsername : currentCharacter.name,
+                        name: renderName,
                         isComment: message.isComment ?? false,
                         disabled: message.disabled ?? false,
                         ...(i === lastRealCharIdx ? {

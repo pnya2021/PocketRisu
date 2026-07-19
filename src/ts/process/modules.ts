@@ -1,6 +1,6 @@
 import { language } from "src/lang"
 import { alertClear, alertConfirm, alertError, alertModuleSelect, alertNormal, alertStore, alertWait, notifySuccess } from "../alert"
-import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type customscript, type loreBook, type triggerscript } from "../storage/database.svelte"
+import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type Chat, type Database, type RisuPersona, type character, type customscript, type groupChat, type loreBook, type triggerscript } from "../storage/database.svelte"
 import { AppendableBuffer, downloadFile, forageStorage, LocalWriter, readImage, saveAsset, VirtualWriter } from "../globalApi.svelte"
 import { checkPersonaBinded, selectSingleFile, sleep } from "../util"
 import { v4 } from "uuid"
@@ -11,6 +11,7 @@ import { HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } from "../s
 import {get} from "svelte/store"
 import { convertCharacterToModule, convertModuleToCharacter } from "../interchangeability"
 import { exportCharacterCard, importCharacterProcess } from "../characterCards"
+import { resolveGroupMembers } from "./group"
 
 export interface MCPModule{
     url: string
@@ -377,15 +378,6 @@ function getModuleById(id:string){
     return null
 }
 
-function getModuleByIds(ids:string[]){
-    const db = getDatabase()
-    const idSet = new Set(ids)
-    const modules = db.modules.filter(m => 
-        idSet.has(m.id) || (m.namespace && idSet.has(m.namespace))
-    )
-    return deduplicateModuleById(modules)
-}
-
 function deduplicateModuleById(modules:RisuModule[]){
     let ids:string[] = []
     let newModules:RisuModule[] = []
@@ -399,37 +391,59 @@ function deduplicateModuleById(modules:RisuModule[]){
     return newModules
 }
 
-let lastModules = ''
-let lastModuleData:RisuModule[] = []
-export function getModules(){
-    const currentChat = getCurrentChat()
-    const character = getCurrentCharacter()
-    const persona = checkPersonaBinded()
+export interface ModuleResolutionContext {
+    room: character | groupChat
+    chat?: Chat
+    members?: readonly character[]
+    persona?: RisuPersona | null
+}
+
+/** Stable source-ordered module union used by both character and group turns. */
+export function resolveModulesForContext(
+    db: Database,
+    context: ModuleResolutionContext,
+): RisuModule[] {
+    const sources: Array<string | RisuModule> = []
+    const addIds = (ids: readonly string[] | null | undefined) => {
+        for (const id of ids ?? []) {
+            if (typeof id === 'string' && id.trim()) sources.push(id.trim())
+        }
+    }
+
+    addIds(db.enabledModules)
+    addIds(context.chat?.modules)
+    addIds(context.room.modules)
+    for (const member of context.members ?? []) addIds(member.modules)
+    if (context.persona?.embeddedModule) sources.push(context.persona.embeddedModule)
+    addIds(db.moduleIntergration?.split(',').map((id) => id.trim()))
+
+    const result: RisuModule[] = []
+    const seen = new Set<string>()
+    for (const source of sources) {
+        const matches = typeof source === 'string'
+            ? db.modules.filter((candidate) => candidate.id === source || candidate.namespace === source)
+            : [source]
+        for (const module of matches) {
+            if (!module || seen.has(module.id)) continue
+            seen.add(module.id)
+            result.push(module)
+        }
+    }
+    return result
+}
+
+export function getModules(context?: Partial<ModuleResolutionContext>){
     const db = getDatabase()
-    let ids = db.enabledModules ?? []
-    if (currentChat){
-        ids = ids.concat(currentChat.modules ?? [])
-    }
-    if(character && character.modules){
-        ids = ids.concat(character.modules)
-    }
-    if(persona && persona.embeddedModule){
-        ids = ids.concat([persona.embeddedModule?.id])
-    }
-    if(db.moduleIntergration){
-        const intList = db.moduleIntergration.split(',').map((s) => s.trim())
-        ids = ids.concat(intList)
-    }
-    const idsJoined = ids.join('-')
-    if(lastModules === idsJoined){
-        return lastModuleData
-    }
-
-    let modules:RisuModule[] = getModuleByIds(ids)
-    lastModules = idsJoined
-    lastModuleData = modules
-    return modules
-
+    const room = context?.room ?? getCurrentCharacter()
+    if (!room) return []
+    const chat = context?.chat ?? getCurrentChat()
+    const persona = context && Object.hasOwn(context, 'persona')
+        ? context.persona
+        : checkPersonaBinded()
+    const members = context?.members ?? (room.type === 'group'
+        ? resolveGroupMembers(room, db.characters).map((member) => member.card)
+        : [])
+    return resolveModulesForContext(db, { room, chat, members, persona })
 }
 
 
@@ -588,6 +602,6 @@ export function moduleUpdate(){
 }
 
 export function refreshModules(){
-    lastModules = ''
-    lastModuleData = []
+    // Module resolution is intentionally derived on demand so group/member and
+    // chat changes cannot reuse stale cached source lists.
 }

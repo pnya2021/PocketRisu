@@ -1,5 +1,5 @@
 import { get, writable } from "svelte/store";
-import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat } from "../storage/database.svelte";
+import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -7,7 +7,7 @@ import { language } from "../../lang";
 import { alertError, notifyError } from "../alert";
 import { parseChatML } from "../parser/chatML";
 import { loadLoreBookV3Prompt } from "./lorebook.svelte";
-import { findCharacterbyId, getAuthorNoteDefaultText, getPersonaPrompt, getUserName, isLastCharPunctuation, trimUntilPunctuation, parseToggleSyntax, prebuiltAssetCommand } from "../util";
+import { getAuthorNoteDefaultText, getPersonaPrompt, getUserName, isLastCharPunctuation, trimUntilPunctuation, parseToggleSyntax, prebuiltAssetCommand } from "../util";
 import { requestChatData } from "./request/request";
 import { stableDiff } from "./stableDiff";
 import { processScript, processScriptFull, risuChatParser } from "./scripts";
@@ -27,6 +27,7 @@ import { resolveChatModelBinding, resolvePresetMaxOutputTokens } from "./request
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
+import { buildGroupSpeakerInstruction, resolveGroupMembers, resolveGroupMessageSpeaker, runGroupGeneration, type GroupGenerationMode } from "./group";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -59,14 +60,67 @@ export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
 
-export async function sendChat(chatProcessIndex = -1,arg:{
+export interface SendChatArgs {
     chatAdditonalTokens?:number,
     signal?:AbortSignal,
     continue?:boolean,
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
-} = {}):Promise<boolean> {
+    groupMode?:GroupGenerationMode
+    rerollSpeakerId?:string
+    continueMessageIndex?:number
+}
+
+export async function sendChat(chatProcessIndex = -1, arg:SendChatArgs = {}):Promise<boolean> {
+    if (get(doingChat)) return false
+    const selected = get(selectedCharID)
+    const room = DBState.db.characters[selected]
+    if (!room) return false
+    if (room.type !== 'group') {
+        return generateResolvedSpeaker(room, room, chatProcessIndex, arg)
+    }
+
+    const members = resolveGroupMembers(room, DBState.db.characters)
+    if (chatProcessIndex >= 0) {
+        const member = members.find((candidate) => candidate.index === chatProcessIndex)
+        if (!member) return false
+        return generateResolvedSpeaker(room, member.card, member.index, arg)
+    }
+
+    const currentChat = room.chats[room.chatPage]
+    if (!currentChat || currentChat._placeholder) return false
+    const mode = arg.groupMode ?? (arg.continue ? 'continue' : 'send')
+    const groupSignal = arg.signal ?? new AbortController().signal
+    return runGroupGeneration({
+        group: room,
+        records: DBState.db.characters,
+        messages: currentChat.message,
+        mode,
+        rerollSpeakerId: arg.rerollSpeakerId,
+        signal: groupSignal,
+        generate: (speaker, request) => generateResolvedSpeaker(
+            room,
+            speaker,
+            members.find((member) => member.id === speaker.chaId)?.index ?? -1,
+            {
+                ...arg,
+                signal: groupSignal,
+                continue: request.continue,
+                continueMessageIndex: request.targetMessageIndex,
+                groupMode: request.mode,
+            },
+        ),
+    })
+}
+
+/** The one tokenizer/prompt/transport/stream/trigger/Inlay/TTS/commit path. */
+export async function generateResolvedSpeaker(
+    expectedRoom: character | groupChat,
+    resolvedSpeaker: character,
+    chatProcessIndex = -1,
+    arg:SendChatArgs = {},
+):Promise<boolean> {
 
     chatProcessStage.set(0)
     const abortSignal = arg.signal ?? (new AbortController()).signal
@@ -97,7 +151,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             return d
         }
         else{
-            const r = findCharacterbyId(id)
+            const r = DBState.db.characters.find((record) => record.chaId === id && record.type === 'character')
             if(!r || r.type === 'group'){
                 return undefined
             }
@@ -184,11 +238,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
     selectedChar = get(selectedCharID)
     const nowChatroom = DBState.db.characters[selectedChar]
-    if(!nowChatroom){
-        return false
-    }
-    if(nowChatroom.type === 'group'){
-        alertError('Group chat runtime is not available yet.')
+    if(!nowChatroom || nowChatroom !== expectedRoom){
         return false
     }
     doingChat.set(true)
@@ -258,7 +308,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         caculatedChatTokens += 3
     }
 
-    currentChar = nowChatroom
+    currentChar = resolvedSpeaker
 
     let chatAdditonalTokens = arg.chatAdditonalTokens ?? caculatedChatTokens
     const tokenizer = new ChatTokenizer(chatAdditonalTokens, DBState.db.aiModel.startsWith('gpt') ? 'noName' : 'name')
@@ -429,7 +479,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     }
 
-    const lorepmt = await loadLoreBookV3Prompt()
+    const lorepmt = await loadLoreBookV3Prompt({
+        room: nowChatroom,
+        chat: currentChat,
+        speaker: currentChar,
+    })
 
     const positionRegex = /{{position::(.+?)}}/g
     const replaceposition = (text:string):{text:string, replaced:boolean} => {
@@ -494,6 +548,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         unformated.personaPrompt.push({
             role: 'system',
             content: risuChatParser(personaPromptText, {chara: currentChar})
+        })
+    }
+
+    if(nowChatroom.type === 'group'){
+        unformated.postEverything.push({
+            role: 'system',
+            content: buildGroupSpeakerInstruction(currentChar),
         })
     }
     
@@ -774,7 +835,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     let ms:Message[] = makeMs(currentChat)
 
-    if(!msReseted && !currentChat.firstMessageDisabled){
+    if(nowChatroom.type !== 'group' && !msReseted && !currentChat.firstMessageDisabled){
         const firstMsg = currentChat.fmIndex === -1 ? nowChatroom.firstMessage : nowChatroom.alternateGreetings[currentChat.fmIndex]
 
         const chat:OpenAIChat = {
@@ -889,7 +950,24 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         let attr:string[] = []
         let role:'user'|'assistant'|'system' = msg.role === 'user' ? 'user' : 'assistant'
 
-        if(usingPromptTemplate && DBState.db.promptSettings.sendName){
+        const groupMessageSpeaker = nowChatroom.type === 'group'
+            ? resolveGroupMessageSpeaker(nowChatroom, DBState.db.characters, msg)
+            : undefined
+        if(nowChatroom.type === 'group' && msg.role === 'char' && groupMessageSpeaker?.chaId !== currentChar.chaId){
+            const form = DBState.db.groupTemplate || `<{{char}}\'s Message>\n{{slot}}\n</{{char}}\'s Message>`
+            const senderName = groupMessageSpeaker?.name ?? nowChatroom.name ?? 'Narrator'
+            formatedChat = risuChatParser(form, {chara: senderName}).replace('{{slot}}', formatedChat)
+            switch(DBState.db.groupOtherBotRole){
+                case 'user':
+                case 'assistant':
+                case 'system':
+                    role = DBState.db.groupOtherBotRole
+                    break
+                default:
+                    role = 'assistant'
+            }
+        }
+        else if(usingPromptTemplate && DBState.db.promptSettings.sendName){
             const form = DBState.db.groupTemplate || `<{{char}}\'s Message>\n{{slot}}\n</{{char}}\'s Message>`
             formatedChat = risuChatParser(form, {chara: currentChar.name}).replace('{{slot}}', formatedChat)
         }
@@ -965,7 +1043,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         chatProcessStage.set(2)
         stageTimings.stage2Start = Date.now()
         console.log("Current chat's hypaV3 Data: ", currentChat.hypaV3Data)
-        const sp = await hypaMemoryV3(chats, currentTokens, maxContextTokens, currentChat, nowChatroom, tokenizer)
+        const sp = await hypaMemoryV3(chats, currentTokens, maxContextTokens, currentChat, currentChar, tokenizer)
         if(sp.error){
             // Save new summary
             if (sp.memory) {
@@ -1406,7 +1484,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         biasString: biases,
         currentChar: currentChar,
         useStreaming: true,
-        isGroupChat: false,
+        isGroupChat: nowChatroom.type === 'group',
         bias: {},
         continue: arg.continue,
         chatId: generationId,
@@ -1443,7 +1521,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         let msgIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length
         let prefix = ''
         if(arg.continue){
-            msgIndex -= 1
+            msgIndex = arg.continueMessageIndex ?? (msgIndex - 1)
             prefix = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data
         }
         else{
@@ -1542,7 +1620,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             let msgIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length
             let result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
             if(i === 0 && arg.continue){
-                msgIndex -= 1
+                msgIndex = arg.continueMessageIndex ?? (msgIndex - 1)
                 let beforeChat = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
                 result2 = await processScriptFull(nowChatroom, reformatContent(beforeChat.data + mess), 'editoutput', msgIndex)
             }
@@ -1619,11 +1697,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     if(needsAutoContinue){
         doingChat.set(false)
-        return await sendChat(chatProcessIndex, {
+        return await generateResolvedSpeaker(nowChatroom, currentChar, chatProcessIndex, {
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
             signal: abortSignal,
-            usedContinueTokens: resultTokens
+            usedContinueTokens: resultTokens,
+            continueMessageIndex: arg.continueMessageIndex,
+            groupMode: nowChatroom.type === 'group' ? 'continue' : arg.groupMode,
         })
     }
 
@@ -1636,7 +1716,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             bias: {}
         },'emotion', abortSignal)
 
-        DBState.db.characters[selectedChar].chats[selectedChat].message[DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1].data += rq
+        const responseIndex = arg.continueMessageIndex
+            ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
+        DBState.db.characters[selectedChar].chats[selectedChat].message[responseIndex].data += rq
     }
 
     stageTimings.stage3Duration = Date.now() - stageTimings.stage3Start
@@ -1657,13 +1739,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             generationInfo.stageTiming.stage4 = stageTimings.stage4Duration
         }
         
-        const lastMessageIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1
+        const lastMessageIndex = arg.continueMessageIndex
+            ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
         if(lastMessageIndex >= 0 && DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo) {
             DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
         }
         
         doingChat.set(false)
-        return await sendChat(chatProcessIndex, {
+        return await generateResolvedSpeaker(nowChatroom, currentChar, chatProcessIndex, {
             signal: abortSignal
         })
     }
@@ -1917,7 +2000,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         generationInfo.stageTiming.stage4 = stageTimings.stage4Duration
     }
     
-    const lastMessageIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1
+    const lastMessageIndex = arg.continueMessageIndex
+        ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
     if(lastMessageIndex >= 0 && DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo) {
         DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
     }

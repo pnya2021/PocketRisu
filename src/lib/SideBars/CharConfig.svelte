@@ -1,9 +1,9 @@
 <script lang="ts">
     import { language } from "../../lang";
     import { tokenizeAccurate } from "../../ts/tokenizer";
-    import { saveImage as saveAsset, type character, getCurrentCharacter } from "../../ts/storage/database.svelte";
+    import { saveImage as saveAsset, type character, type groupChat, getCurrentCharacter } from "../../ts/storage/database.svelte";
     import { convertCharacterToModule } from "src/ts/interchangeability";
-    import { notifySuccess } from "src/ts/alert";
+    import { alertConfirm, alertError, alertSelectChar, notifySuccess } from "src/ts/alert";
     import { DBState } from 'src/ts/stores.svelte';
     import { CharConfigSubMenu, MobileGUI, selectedCharID, hypaV3ModalOpen } from "../../ts/stores.svelte";
     import { PlusIcon, SmileIcon, TrashIcon, UserIcon, ActivityIcon, BookIcon, Braces, Volume2Icon, DownloadIcon, HardDriveUploadIcon, Share2Icon, ImageIcon, ImageOffIcon, ArrowUp, ArrowDown, TriangleAlertIcon } from '@lucide/svelte'
@@ -32,6 +32,8 @@
     import { exportCharacterPackage, importPackageToCharacter } from "src/ts/characterPackage";
     import { exportRegex, importRegex } from "src/ts/process/scripts";
     import SliderInput from "../UI/GUI/SliderInput.svelte";
+    import GroupConfig from "./GroupConfig.svelte";
+    import { resolveGroupMembers } from "src/ts/process/group";
 
     let iconRemoveMode = $state(false)
     let pkgIncludeCharacter = $state(true)
@@ -227,8 +229,89 @@
         }
     }
 
+    async function addSelectedGroupMember() {
+        const group = DBState.db.characters[$selectedCharID]
+        if (group?.type !== 'group') return
+        const id = await alertSelectChar()
+        if (!id) return
+        const member = DBState.db.characters.find((record) => record.type === 'character' && record.chaId === id)
+        if (!member) {
+            alertError('Only a character card can be added to a group.')
+            return
+        }
+        if (group.characters.includes(id)) {
+            alertError('That character is already in this group.')
+            return
+        }
+        if (await alertConfirm(language.askLoadFirstMsg)) {
+            group.chats[group.chatPage].message.push({
+                role: 'char',
+                data: member.firstMessage ?? '',
+                saying: member.chaId,
+            })
+        }
+        group.characters.push(member.chaId)
+        group.characterTalks.push(2 / 3)
+        group.characterActive.push(true)
+    }
+
+    async function composeSelectedGroupImage() {
+        const group = DBState.db.characters[$selectedCharID]
+        if (group?.type !== 'group') return
+        const members = resolveGroupMembers(group, DBState.db.characters).map((entry) => entry.card)
+        if (members.length === 0) {
+            alertError('This group has no valid character images to compose.')
+            return
+        }
+        const sources = await Promise.all(members.map((member) => getCharImage(member.image ?? '', 'plain')))
+        const images = (await Promise.all(sources.map((source) => new Promise<HTMLImageElement | null>((resolve) => {
+            const image = new Image()
+            image.crossOrigin = 'anonymous'
+            image.onload = () => resolve(image)
+            image.onerror = () => resolve(null)
+            image.src = source
+        })))).filter((image): image is HTMLImageElement => image !== null)
+        if (images.length === 0) {
+            alertError('This group has no readable character images to compose.')
+            return
+        }
+        const canvas = document.createElement('canvas')
+        canvas.width = 512
+        canvas.height = 512
+        const context = canvas.getContext('2d')
+        if (!context) {
+            alertError('Canvas is unavailable on this device.')
+            return
+        }
+        const columns = Math.ceil(Math.sqrt(images.length))
+        const rows = Math.ceil(images.length / columns)
+        const width = canvas.width / columns
+        const height = canvas.height / rows
+        images.forEach((image, index) => {
+            context.drawImage(image, (index % columns) * width, Math.floor(index / columns) * height, width, height)
+        })
+        const encoded = canvas.toDataURL('image/png').split(',')[1] ?? ''
+        const binary = atob(encoded)
+        const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+        group.image = await saveAsset(bytes, '', 'group.png')
+        canvas.remove()
+    }
+
 </script>
 
+{#if DBState.db.characters[$selectedCharID]?.type === 'group'}
+    <GroupConfig
+        group={DBState.db.characters[$selectedCharID] as groupChat}
+        records={DBState.db.characters}
+        onAddMember={addSelectedGroupMember}
+        onChooseImage={() => selectCharImg($selectedCharID)}
+        onComposeImage={composeSelectedGroupImage}
+    />
+    <details class="mt-3 min-w-0 text-textcolor" data-group-lore-settings>
+        <summary class="cursor-pointer font-semibold">{language.loreBook}</summary>
+        <LoreBook />
+    </details>
+{:else}
 {#if licensed !== 'private' && !$MobileGUI}
     <div class="flex mb-2" class:gap-2={iconButtonSize === 24} class:gap-1={iconButtonSize < 24}>
         <button class={$CharConfigSubMenu === 0 ? 'text-textcolor ' : 'text-textcolor2'} onclick={() => {$CharConfigSubMenu = 0}}>
@@ -1213,6 +1296,8 @@
         >
             {language.applyModule}
         </Button>
+
+{/if}
 
 {/if}
 

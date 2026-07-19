@@ -1,10 +1,10 @@
 import { get } from "svelte/store";
 import { getChatVar, setChatVar } from '../parser/chatVar.svelte';
 import {selectedCharID} from '../stores.svelte'
-import { type Message, type loreBook } from "../storage/database.svelte";
+import { type Chat, type Message, type character, type groupChat, type loreBook } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { tokenize } from "../tokenizer";
-import { findCharacterbyId, pickHashRand, selectSingleFile } from "../util";
+import { pickHashRand, selectSingleFile } from "../util";
 import { alertError, notifySuccess } from "../alert";
 import { language } from "../../lang";
 import { downloadFile } from "../globalApi.svelte";
@@ -71,15 +71,43 @@ export function addLorebookFolder(type:number) {
     }
 }
 
-export async function loadLoreBookV3Prompt(){
+export interface LorePromptContext {
+    room: character | groupChat
+    chat: Chat
+    speaker?: character
+    moduleLorebooks?: readonly loreBook[]
+}
+
+/**
+ * Build the complete lore scan input before key activation begins. Member lore
+ * is deliberately inserted here (instead of appended to activated results), so
+ * its keys participate in the same recursive scan as every other source.
+ */
+export function collectLorebooksForPrompt(context: LorePromptContext): loreBook[] {
+    const memberLore = context.room.type === 'group' && context.room.useCharacterLore
+        ? context.speaker?.globalLore ?? []
+        : []
+    return [
+        ...(context.room.globalLore ?? []),
+        ...(context.chat.localLore ?? []),
+        ...memberLore,
+        ...(context.moduleLorebooks ?? []),
+    ]
+}
+
+export async function loadLoreBookV3Prompt(context?: Partial<LorePromptContext>){
     const selectedID = get(selectedCharID)
-    const char = DBState.db.characters[selectedID]
+    const char = context?.room ?? DBState.db.characters[selectedID]
     const page = char.chatPage
-    const characterLore = char.globalLore ?? []
-    const chatLore = char.chats[page].localLore ?? []
-    const moduleLorebook = getModuleLorebooks()
-    const fullLore = safeStructuredClone(characterLore.concat(chatLore).concat(moduleLorebook))
-    const currentChat = char.chats[page].message
+    const chat = context?.chat ?? char.chats[page]
+    const moduleLorebook = context?.moduleLorebooks ?? getModuleLorebooks()
+    const fullLore = safeStructuredClone(collectLorebooksForPrompt({
+        room: char,
+        chat,
+        speaker: context?.speaker,
+        moduleLorebooks: moduleLorebook,
+    }))
+    const currentChat = chat.message
     const loreDepth = char.loreSettings?.scanDepth ?? DBState.db.loreBookDepth
     const loreToken = char.loreSettings?.tokenBudget ?? DBState.db.loreBookToken
     const fullWordMatchingSetting = char.loreSettings?.fullWordMatching ?? false
@@ -113,6 +141,19 @@ export async function loadLoreBookV3Prompt(){
             }
         }
         arg.keys = newKeys
+        const resolveMessageName = (message: Message): string => {
+            if (message.name) return message.name
+            if (message.saying) {
+                const record = DBState.db.characters.find((candidate) =>
+                    candidate.type === 'character' && candidate.chaId === message.saying,
+                )
+                if (record && (char.type !== 'group' || char.characters.includes(record.chaId))) {
+                    return record.name
+                }
+            }
+            return char.name
+        }
+
         let mList:{
             source:string
             prompt:string
@@ -128,7 +169,7 @@ export async function loadLoreBookV3Prompt(){
             else{
                 return {
                     source: `message ${i} by char`,
-                    prompt: `\x01{{${msg.name ?? (msg.saying ? findCharacterbyId(msg.saying)?.name : null) ?? char.name}}}:` + msg.data + '\x01',
+                    prompt: `\x01{{${resolveMessageName(msg)}}}:` + msg.data + '\x01',
                     data: msg.data
                 }
             }

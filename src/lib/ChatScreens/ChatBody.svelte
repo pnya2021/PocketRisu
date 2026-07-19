@@ -7,7 +7,6 @@
     import { addMetadataToElement, getDistance, ParseMarkdown, postTranslationParse, resolveInlayPlaceholders, trimMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
     import { getLLMCache, translateHTML } from "../../ts/translator/translator"
     import { getModuleAssets } from "src/ts/process/modules";
-    import { getCurrentCharacter } from "src/ts/storage/database.svelte";
     import { getFileSrc } from "src/ts/globalApi.svelte";
 
     interface Props {
@@ -171,9 +170,11 @@
         const imgs = bodyRoot.querySelectorAll('img:not([src^="data:"]):not([src^="http:"]):not([src^="https:"]):not([src^="blob:"]):not([src^="file:"]):not([src^="tauri:"]):not([src^="/"]):not([noimage])') as NodeListOf<HTMLImageElement>
         
         if (imgs.length > 0) {
-            const currentCharacter = getCurrentCharacter()
-            const styl = currentCharacter.prebuiltAssetStyle
-            const assets = getModuleAssets().concat(currentCharacter.additionalAssets ?? [])
+            const renderCharacter = typeof character === 'object' && character?.type === 'simple'
+                ? character
+                : null
+            const styl = renderCharacter?.prebuiltAssetStyle
+            const assets = getModuleAssets().concat(renderCharacter?.additionalAssets ?? [])
             const normalizedAssets = assets.map((asset) => {
                 return {
                     name: asset[0].toLocaleLowerCase(),

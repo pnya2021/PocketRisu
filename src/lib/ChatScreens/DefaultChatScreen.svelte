@@ -14,6 +14,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
+    import { resolveGroupMessageSpeaker, type GroupGenerationMode } from "../../ts/process/group";
     import { ensureCurrentChatReady } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
@@ -466,18 +467,30 @@ import { isMobile } from 'src/ts/platform'
         }
 
         if(cha.length === 0) return
+        const room = DBState.db.characters[$selectedCharID]
         const saying = cha[cha.length - 1].saying
-        let sayingQu = 2
-        while(cha[cha.length - 1].role !== 'user'){
-            if(cha[cha.length - 1].saying === saying){
-                sayingQu -= 1
-                if(sayingQu === 0) break
+        let groupMode: GroupGenerationMode | undefined
+        let rerollSpeakerId: string | undefined
+        if(room.type === 'group'){
+            const speaker = resolveGroupMessageSpeaker(room, DBState.db.characters, cha[cha.length - 1])
+            if(!speaker) return
+            cha.pop()
+            groupMode = 'reroll'
+            rerollSpeakerId = speaker.chaId
+        }
+        else{
+            let sayingQu = 2
+            while(cha[cha.length - 1].role !== 'user'){
+                if(cha[cha.length - 1].saying === saying){
+                    sayingQu -= 1
+                    if(sayingQu === 0) break
+                }
+                let msg = cha.pop()
+                if(!msg) return
             }
-            let msg = cha.pop()
-            if(!msg) return
         }
         DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = cha
-        const generated = await sendChatMain()
+        const generated = await sendChatMain(false, groupMode, rerollSpeakerId)
 
         const currentMsgs = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message
 
@@ -541,7 +554,11 @@ import { isMobile } from 'src/ts/platform'
 
     let abortController:null|AbortController = null
 
-    async function sendChatMain(continued:boolean = false) {
+    async function sendChatMain(
+        continued:boolean = false,
+        groupMode?:GroupGenerationMode,
+        rerollSpeakerId?:string,
+    ) {
 
         messageInput = ''
         abortController = new AbortController()
@@ -549,7 +566,9 @@ import { isMobile } from 'src/ts/platform'
         try {
             generated = await sendChat(-1, {
                 signal:abortController.signal,
-                continue:continued
+                continue:continued,
+                groupMode,
+                rerollSpeakerId,
             })
         } catch (error) {
             console.error(error)
@@ -995,7 +1014,7 @@ import { isMobile } from 'src/ts/platform'
                     </div>
                 {/if}
 
-                {#if DBState.db.useChatSticker}
+                {#if currentCharacter.type === 'character' && DBState.db.useChatSticker}
                     <div onclick={()=>{toggleStickers = !toggleStickers}}
                          class={"shrink-0 flex justify-center items-center w-9 h-9 rounded-full hover:bg-primary/20 transition-colors cursor-pointer "+(toggleStickers ? 'text-green-500':'text-textcolor')}>
                         <Laugh size={20}/>
@@ -1160,7 +1179,7 @@ import { isMobile } from 'src/ts/platform'
 
             {/if}
 
-            {#if toggleStickers}
+            {#if currentCharacter.type === 'character' && toggleStickers}
                 <div class="ml-4 flex flex-wrap">
                     <AssetInput currentCharacter={currentCharacter} onSelect={(additionalAsset)=>{
                         let fileType = 'img'
@@ -1251,7 +1270,7 @@ import { isMobile } from 'src/ts/platform'
                 bind:hasNewUnreadMessage={showNewMessageButton}
             />
 
-            {#if currentChat.length <= loadPages}
+            {#if currentCharacter.type === 'character' && currentChat.length <= loadPages}
                 <Chat
                     character={createSimpleCharacter(DBState.db.characters[$selectedCharID])}
                     name={DBState.db.characters[$selectedCharID].name}
