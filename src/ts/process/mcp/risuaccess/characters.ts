@@ -4,7 +4,12 @@ import { type character, type loreBook } from 'src/ts/storage/database.svelte'
 import { DBState } from 'src/ts/stores.svelte'
 import { pickHashRand } from 'src/ts/util'
 import { type MCPTool, MCPToolHandler, type RPCToolCallContent } from '../mcplib'
-import { getCharacter } from './utils'
+import { getCharacter as getCharacterRecord } from './utils'
+
+function getCharacter(id: string): character | undefined {
+  const record = getCharacterRecord(id)
+  return record?.type === 'group' ? undefined : record
+}
 
 export class CharacterHandler extends MCPToolHandler {
   private promptAccess(tool: string, action: string) {

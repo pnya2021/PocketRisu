@@ -16,6 +16,7 @@ import { createSeedBackup } from './helpers/seed.js'
 import { normalizeBackup, fingerprintAssets } from './helpers/normalize.js'
 import { encodeBackup } from './helpers/encode.js'
 import { decodeBackup } from './helpers/decode.js'
+import { buildGroupPackage, importGroupPackageAtomic } from '../../src/ts/groupPackage'
 
 // Track servers so we can clean them all up even if a test fails.
 const servers: ServerHandle[] = []
@@ -130,6 +131,207 @@ describe('backup round-trip', () => {
         expect(count).toBe(5)
       }
     }
+  })
+
+  test('round-trip preserves complete group records and member attribution', async () => {
+    const records = [
+      {
+        type: 'character', chaId: 'member-a', name: 'A', desc: 'member A', firstMessage: 'A',
+        chats: [], chatPage: 0, chatFolders: [], globalLore: [], customscript: [],
+      },
+      {
+        type: 'character', chaId: 'member-b', name: 'B', desc: 'member B', firstMessage: 'B',
+        chats: [], chatPage: 0, chatFolders: [], globalLore: [], customscript: [],
+      },
+      {
+        type: 'group', chaId: 'group-main', name: 'A and B', image: 'assets/group.png',
+        firstMessage: 'Together', characters: ['member-a', 'member-b'],
+        characterTalks: [2, 1], characterActive: [true, true],
+        chats: [{
+          id: 'group-chat', name: 'Main', note: 'group note',
+          localLore: [{ key: 'group-only', content: 'club lore' }],
+          modules: ['chat-module'], scriptstate: { phase: 2 },
+          pluginState: { owner: 'plugin' }, unknownChatField: ['kept'],
+          message: [
+            { role: 'char', data: 'from A', saying: 'member-a', chatId: 'message-a' },
+            { role: 'char', data: 'from B', saying: 'member-b', chatId: 'message-b' },
+          ],
+        }],
+        chatPage: 0, chatFolders: [], viewScreen: 'multiple',
+        globalLore: [{ key: 'parent-lore', content: 'group parent only' }],
+        autoMode: false, useCharacterLore: true, emotionImages: [], customscript: [],
+        modules: ['group-module'], unknownGroupField: { nested: ['kept'] },
+      },
+    ]
+    const seed = createSeedBackup({
+      databaseCharacters: records,
+      characterOrder: ['member-a', 'member-b', 'group-main'],
+      databaseAssets: [
+        { name: 'group.png', data: Buffer.from('group-image-payload') },
+        { name: 'smile.png', data: Buffer.from('group-emotion-payload') },
+      ],
+    })
+
+    const srvA = await spawnServer()
+    servers.push(srvA)
+    const clientA = await createClient(srvA.port, srvA.password)
+    expect((await clientA.importBackup(seed)).ok).toBe(true)
+    const exportA = await clientA.exportBackup()
+
+    const srvB = await spawnServer()
+    servers.push(srvB)
+    const clientB = await createClient(srvB.port, srvB.password)
+    expect((await clientB.importBackup(exportA)).ok).toBe(true)
+    const exportB = await clientB.exportBackup()
+
+    const rawA = normalizeBackup(exportA).raw as any
+    const rawB = normalizeBackup(exportB).raw as any
+    const groupA = rawA.characters.find((record: any) => record.chaId === 'group-main')
+    const groupB = rawB.characters.find((record: any) => record.chaId === 'group-main')
+
+    expect(rawB.characterOrder).toEqual(['member-a', 'member-b', 'group-main'])
+    expect(groupB).toEqual(groupA)
+    expect(groupB).toMatchObject({
+      type: 'group',
+      characters: ['member-a', 'member-b'],
+      globalLore: [{ key: 'parent-lore', content: 'group parent only' }],
+      modules: ['group-module'],
+      unknownGroupField: { nested: ['kept'] },
+      chats: [{
+        localLore: [{ key: 'group-only', content: 'club lore' }],
+        modules: ['chat-module'],
+        scriptstate: { phase: 2 },
+        pluginState: { owner: 'plugin' },
+        unknownChatField: ['kept'],
+        message: [
+          { data: 'from A', saying: 'member-a', chatId: 'message-a' },
+          { data: 'from B', saying: 'member-b', chatId: 'message-b' },
+        ],
+      }],
+    })
+    const exportedAssets = new Map(decodeBackup(exportB).map(entry => [entry.name, entry.data]))
+    expect(exportedAssets.get('group.png')).toEqual(Buffer.from('group-image-payload'))
+    expect(exportedAssets.get('smile.png')).toEqual(Buffer.from('group-emotion-payload'))
+  })
+
+  test('repairs duplicate character/group ids before server chat indexing', async () => {
+    const records = [
+      {
+        type: 'character', chaId: 'duplicate-id', name: 'Member', firstMessage: 'Member',
+        chats: [{
+          id: 'member-chat', name: 'Member chat', note: '', localLore: [],
+          message: [{ role: 'char', data: 'member payload', chatId: 'member-message' }],
+        }],
+        chatPage: 0, chatFolders: [], globalLore: [], customscript: [],
+      },
+      {
+        type: 'group', chaId: 'duplicate-id', name: 'Group', firstMessage: 'Group',
+        characters: ['duplicate-id'], characterTalks: [1], characterActive: [true],
+        chats: [{
+          id: 'group-chat', name: 'Group chat', note: 'group note', localLore: [],
+          message: [{
+            role: 'char', data: 'group payload', saying: 'duplicate-id', chatId: 'group-message',
+          }],
+          pluginState: { collisionFixture: true },
+        }],
+        chatPage: 0, chatFolders: [], globalLore: [], customscript: [],
+        unknownGroupField: { collisionFixture: true },
+      },
+    ]
+    const seed = createSeedBackup({ databaseCharacters: records })
+
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    expect((await client.importBackup(seed)).ok).toBe(true)
+
+    const raw = normalizeBackup(await client.exportBackup()).raw as any
+    expect(raw.characters).toHaveLength(2)
+    expect(new Set(raw.characters.map((record: any) => record.chaId)).size).toBe(2)
+
+    const member = raw.characters.find((record: any) => record.type === 'character')
+    const group = raw.characters.find((record: any) => record.type === 'group')
+    expect(member).toMatchObject({
+      chaId: 'duplicate-id',
+      chats: [{ id: 'member-chat', message: [{ data: 'member payload', chatId: 'member-message' }] }],
+    })
+    expect(group.chaId).not.toBe('duplicate-id')
+    expect(group).toMatchObject({
+      characters: ['duplicate-id'],
+      unknownGroupField: { collisionFixture: true },
+      chats: [{
+        id: 'group-chat',
+        pluginState: { collisionFixture: true },
+        message: [{ data: 'group payload', saying: 'duplicate-id', chatId: 'group-message' }],
+      }],
+    })
+  })
+
+  test('a normally imported group package preserves every distinct chat through real persistence', async () => {
+    const makeMember = (id: string, label: string) => ({
+      type: 'character', chaId: id, name: label, desc: label, firstMessage: label,
+      chats: [
+        {
+          id: `${id}-chat-1`, name: 'First', note: '', localLore: [],
+          message: [{ role: 'char', data: `${label}-one`, saying: id, chatId: `${id}-message-1` }],
+        },
+        {
+          id: `${id}-chat-2`, name: 'Second', note: '', localLore: [],
+          message: [{ role: 'char', data: `${label}-two`, saying: id, chatId: `${id}-message-2` }],
+        },
+      ],
+      chatPage: 0, chatFolders: [], globalLore: [], customscript: [],
+    })
+    const sourceGroup = {
+      type: 'group', chaId: 'source-group', name: 'Imported group', firstMessage: 'Together',
+      characters: ['source-a', 'source-b'], characterTalks: [1, 1], characterActive: [true, true],
+      chats: [
+        {
+          id: 'source-group-chat-1', name: 'First', note: '', localLore: [],
+          message: [{ role: 'char', data: 'group-one', saying: 'source-a', chatId: 'group-message-1' }],
+        },
+        {
+          id: 'source-group-chat-2', name: 'Second', note: '', localLore: [],
+          message: [{ role: 'char', data: 'group-two', saying: 'source-b', chatId: 'group-message-2' }],
+        },
+      ],
+      chatPage: 0, chatFolders: [], viewScreen: 'multiple', globalLore: [], autoMode: false,
+      useCharacterLore: true, emotionImages: [], customscript: [],
+    }
+    const source: any = {
+      characters: [makeMember('source-a', 'A'), makeMember('source-b', 'B'), sourceGroup],
+    }
+    const pkg = buildGroupPackage(source, 'source-group', () => '2026-07-19T00:00:00.000Z')
+    const imported: any = { characters: [], characterOrder: [] }
+    const generated = ['persisted-a', 'persisted-b', 'persisted-group']
+    importGroupPackageAtomic(imported, pkg, { createId: () => generated.shift()! })
+
+    const seed = createSeedBackup({
+      databaseCharacters: imported.characters,
+      characterOrder: imported.characterOrder,
+    })
+    const srvA = await spawnServer()
+    servers.push(srvA)
+    const clientA = await createClient(srvA.port, srvA.password)
+    expect((await clientA.importBackup(seed)).ok).toBe(true)
+    const exportA = await clientA.exportBackup()
+
+    const srvB = await spawnServer()
+    servers.push(srvB)
+    const clientB = await createClient(srvB.port, srvB.password)
+    expect((await clientB.importBackup(exportA)).ok).toBe(true)
+    const raw = normalizeBackup(await clientB.exportBackup()).raw as any
+
+    const persisted = new Map(raw.characters.map((record: any) => [record.chaId, record]))
+    expect(raw.characterOrder).toEqual(['persisted-a', 'persisted-b', 'persisted-group'])
+    expect(persisted.get('persisted-a').chats.map((chat: any) => chat.message[0].data))
+      .toEqual(['A-one', 'A-two'])
+    expect(persisted.get('persisted-b').chats.map((chat: any) => chat.message[0].data))
+      .toEqual(['B-one', 'B-two'])
+    expect(persisted.get('persisted-group').chats.map((chat: any) => chat.message[0].data))
+      .toEqual(['group-one', 'group-two'])
+    expect(persisted.get('persisted-group').chats.map((chat: any) => chat.message[0].saying))
+      .toEqual(['persisted-a', 'persisted-b'])
   })
 })
 

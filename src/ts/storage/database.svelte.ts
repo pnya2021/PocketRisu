@@ -24,6 +24,10 @@ import { retirePluginPrincipals } from '../plugins/pluginRetirement';
 import { withAuthorizedPluginMutationLock } from '../plugins/pluginMutationCoordinator';
 import type { PluginStorageOwnerRecord } from '../plugins/pluginStorageOwnership';
 import { normalizePluginDatabaseState } from '../plugins/pluginDatabaseNormalization';
+import {
+    normalizeGroupChatDatabase,
+    type QuarantinedGroupChat,
+} from './groupChatCompatibility';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
@@ -43,6 +47,7 @@ export function setDatabase(data:Database){
     if(checkNullish(data.characters)){
         data.characters = []
     }
+    const groupStateNormalization = normalizeGroupChatDatabase(data)
     if(checkNullish(data.apiType)){
         data.apiType = 'gemini-3-flash-preview'
     }
@@ -740,13 +745,18 @@ export function setDatabase(data:Database){
     applyModelPresetDefaults(data)
     changeLanguage(data.language)
     setDatabaseLite(data)
-    return pluginStateNormalization
+    return {
+        pluginStateChanged: pluginStateNormalization.pluginStateChanged || groupStateNormalization.changed,
+    }
 }
 
 export function setDatabaseLite(data:Database){
+    const groupStateNormalization = normalizeGroupChatDatabase(data)
     const pluginStateNormalization = normalizePluginDatabaseState(data)
     DBState.db = data
-    return pluginStateNormalization
+    return {
+        pluginStateChanged: pluginStateNormalization.pluginStateChanged || groupStateNormalization.changed,
+    }
 }
 
 export async function setDatabaseLive(
@@ -775,7 +785,7 @@ export function getDatabase(options:getDatabaseOptions = {}):Database{
     return DBState.db as Database
 }
 
-export function getCurrentCharacter(options:getDatabaseOptions = {}):character{
+export function getCurrentCharacter(options:getDatabaseOptions = {}):character|groupChat{
     const db = getDatabase(options)
     if(!db.characters){
         db.characters = []
@@ -784,14 +794,14 @@ export function getCurrentCharacter(options:getDatabaseOptions = {}):character{
     return char
 }
 
-export function setCurrentCharacter(char:character){
+export function setCurrentCharacter(char:character|groupChat){
     if(!DBState.db.characters){
         DBState.db.characters = []
     }
     DBState.db.characters[get(selectedCharID)] = char
 }
 
-export function getCharacterByIndex(index:number,options:getDatabaseOptions = {}):character{
+export function getCharacterByIndex(index:number,options:getDatabaseOptions = {}):character|groupChat{
     const db = getDatabase(options)
     if(!db.characters){
         db.characters = []
@@ -800,7 +810,7 @@ export function getCharacterByIndex(index:number,options:getDatabaseOptions = {}
     return char
 }
 
-export function setCharacterByIndex(index:number,char:character){
+export function setCharacterByIndex(index:number,char:character|groupChat){
     if(!DBState.db.characters){
         DBState.db.characters = []
     }
@@ -859,7 +869,7 @@ function parseToggleKeysFromTemplate(template:string){
     return Array.from(keys)
 }
 
-function getEnabledModuleDefinitions(db:Database, char:character, chat:Chat){
+function getEnabledModuleDefinitions(db:Database, char:character|groupChat, chat:Chat){
     const ids = [
         ...(db.enabledModules ?? []),
         ...(char.modules ?? []),
@@ -896,7 +906,7 @@ export interface TogglePreset {
     promptPresetName?: string        // name of the prompt preset active when saved
 }
 
-export function getToggleKeys(db:Database = getDatabase(), char:character = getCurrentCharacter(), chat:Chat = getCurrentChat()):string[]{
+export function getToggleKeys(db:Database = getDatabase(), char:character|groupChat = getCurrentCharacter(), chat:Chat = getCurrentChat()):string[]{
     const moduleToggleTemplate = getEnabledModuleDefinitions(db, char, chat)
         .map((module) => module.customModuleToggle ?? '')
         .filter(Boolean)
@@ -981,7 +991,8 @@ export interface RisuPersona {
 }
 
 export interface Database{
-    characters: character[],
+    characters: (character|groupChat)[],
+    quarantinedGroupChats?: QuarantinedGroupChat[]
     apiType: string
     openAIKey: string
     proxyKey:string
@@ -1722,28 +1733,88 @@ export interface loreSettings{
     fullWordMatching?: boolean
 }
 
+export interface groupChat {
+    type: 'group'
+    image?:string
+    firstMessage:string
+    chats:Chat[]
+    chatFolders:ChatFolder[]
+    chatPage:number
+    name:string
+    viewScreen:'single'|'multiple'|'none'|'emp'
+    characters:string[]
+    characterTalks:number[]
+    characterActive:boolean[]
+    globalLore:loreBook[]
+    autoMode:boolean
+    useCharacterLore:boolean
+    emotionImages:[string, string][]
+    customscript:customscript[]
+    chaId:string
+    alternateGreetings?:string[]
+    creatorNotes?:string
+    removedQuotes?:boolean
+    firstMsgIndex?:number
+    loreSettings?:loreSettings
+    supaMemory?:boolean
+    ttsMode?:string
+    suggestMessages?:string[]
+    orderByOrder?:boolean
+    backgroundHTML?:string
+    reloadKeys?:number
+    backgroundCSS?:string
+    oneAtTime?:boolean
+    virtualscript?:string
+    lorePlus?:boolean
+    trashTime?:number
+    nickname?:string
+    defaultVariables?:string
+    lowLevelAccess?:boolean
+    hideChatIcon?:boolean
+    lastInteraction?:number
+    translatorNote?:string
+    additionalData?:character['additionalData']
+    depth_prompt?:{ depth:number, prompt:string }
+    additionalAssets?:[string, string, string][]
+    utilityBot?:boolean
+    license?:string
+    realmId?:string
+    prebuiltAssetCommand?:boolean
+    prebuiltAssetStyle?:string
+    prebuiltAssetExclude?:string[]
+    modules?:string[]
+    coldstorage?:string
+    coldStoragedChats?:string[]
+    voicevoxConfig?:character['voicevoxConfig']
+    ttsSpeech?:string
+    naittsConfig?:character['naittsConfig']
+    oaiVoice?:string
+    oaiTTSConfig?:character['oaiTTSConfig']
+    hfTTS?:character['hfTTS']
+    vits?:OnnxModelFiles
+    gptSoVitsConfig?:character['gptSoVitsConfig']
+    fishSpeechConfig?:character['fishSpeechConfig']
+    ttsReadOnlyQuoted?:boolean
+    exampleMessage?:string
+    systemPrompt?:string
+    replaceGlobalNote?:string
+    additionalText?:string
+    personality?:string
+    scenario?:string
+    sdData?:[string, string][]
+    newGenData?:character['newGenData']
+    customModuleToggle?:string
+    ccAssets?:character['ccAssets']
+    extentions?:character['extentions']
+    largePortrait?:boolean
+}
 
+/**
+ * Compatibility alias retained for callers that still invoke the former purge.
+ * Groups are normalized or quarantined; valid records are never deleted.
+ */
 export function purgeUnsupportedGroupChats(db: Database): number {
-    const before = db.characters.length
-    db.characters = db.characters.filter((char): char is character => (char as any)?.type !== 'group')
-    if (db.characterOrder?.length) {
-        const validIds = new Set(db.characters.map((char) => char.chaId))
-        const nextOrder: (string | folder)[] = []
-        for (const entry of db.characterOrder) {
-            if (typeof entry === 'string') {
-                if (validIds.has(entry)) {
-                    nextOrder.push(entry)
-                }
-                continue
-            }
-            const data = entry.data.filter((id) => validIds.has(id))
-            if (data.length > 0) {
-                nextOrder.push({ ...entry, data })
-            }
-        }
-        db.characterOrder = nextOrder
-    }
-    return before - db.characters.length
+    return normalizeGroupChatDatabase(db).quarantinedCount
 }
 export interface botPreset{
     id?: string

@@ -37,6 +37,12 @@ export interface SeedOptions {
   includeAssets?: boolean
   /** Cold storage character stubs to include in the backup. */
   coldStorageCharacters?: ColdStorageCharacterSpec[]
+  /** Exact character/group records to seed instead of generated characters. */
+  databaseCharacters?: Array<Record<string, unknown>>
+  /** Exact persisted character ordering for custom character/group records. */
+  characterOrder?: unknown[]
+  /** Exact asset backup entries referenced by custom character/group records. */
+  databaseAssets?: Array<{ name: string, data: Uint8Array }>
 }
 
 export function createSeedBackup(opts: SeedOptions = {}): Buffer {
@@ -46,9 +52,12 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
     messagesPerChat = 2,
     includeAssets = false,
     coldStorageCharacters = [],
+    databaseCharacters,
+    characterOrder,
+    databaseAssets = [],
   } = opts
 
-  const characters = Array.from({ length: characterCount }, (_, ci) => {
+  const generatedCharacters: Array<Record<string, unknown>> = Array.from({ length: characterCount }, (_, ci) => {
     const chaId = `test-char-${ci}`
     const chats = Array.from({ length: chatsPerCharacter }, (_, chatIdx) => ({
       id: `chat-${ci}-${chatIdx}`,
@@ -74,6 +83,9 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
       type: 'character',
     }
   })
+  const characters: Array<Record<string, unknown>> = databaseCharacters
+    ? structuredClone(databaseCharacters)
+    : generatedCharacters
 
   const database: Record<string, unknown> = {
     characters,
@@ -91,6 +103,7 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
     botPresetsId: 0,
     moduleIntergration: [],
     selectedCharacter: 0,
+    ...(characterOrder ? { characterOrder: structuredClone(characterOrder) } : {}),
   }
 
   // Add cold storage character stubs to the database
@@ -129,6 +142,10 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
       const hexKey = Buffer.from(`test-asset-${i}`).toString('hex')
       entries.push({ name: hexKey, data: Buffer.from(`fake-png-data-${i}`) })
     }
+  }
+
+  for (const asset of databaseAssets) {
+    entries.push({ name: asset.name, data: Buffer.from(asset.data) })
   }
 
   return encodeBackup(entries)

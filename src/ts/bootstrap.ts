@@ -30,7 +30,7 @@ import {
 } from "./globalApi.svelte";
 import { registerModelDynamic } from "./model/modellist";
 import { convertStubsToPlaceholders } from "./storage/chatStorage";
-import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
+import { isChatStub } from "./storage/database.svelte";
 import { hydrateColdDatabase, loadPluginsAfterColdDatabaseWriteback, registerColdDatabaseWritebackWriter } from './storage/coldDatabaseHydration';
 import { writeEtagBoundDatabase } from './storage/etagBoundDatabaseWrite';
 import { databasePersistenceCoordinator } from './storage/databasePersistenceCoordinator';
@@ -376,11 +376,6 @@ async function checkNewFormat(): Promise<void> {
     }).filter((v) => {
         return v !== null;
     });
-
-    const removedGroupChats = purgeUnsupportedGroupChats(db)
-    if (removedGroupChats > 0) {
-        console.warn(`[bootstrap] Removed ${removedGroupChats} unsupported group chat entr${removedGroupChats === 1 ? 'y' : 'ies'} from database`)
-    }
 
     db.modules = await Promise.all((db.modules ?? []).map(async (v) => {
         if (v?.lorebook) {

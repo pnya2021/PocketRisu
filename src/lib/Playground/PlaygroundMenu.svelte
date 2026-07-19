@@ -8,7 +8,6 @@
     import PlaygroundSyntax from "./PlaygroundSyntax.svelte";
     import { findCharacterIndexbyId } from "src/ts/util";
     import { characterFormatUpdate, createBlankChar } from "src/ts/characters";
-    import { type character } from "src/ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import PlaygroundImageGen from "./PlaygroundImageGen.svelte";
     import PlaygroundParser from "./PlaygroundParser.svelte";
@@ -29,7 +28,10 @@
 
         if (charIndex !== -1) {
 
-            const char = DBState.db.characters[charIndex] as character
+            const char = DBState.db.characters[charIndex]
+            if(char.type === 'group'){
+                return
+            }
             char.utilityBot = true
             char.name = 'assistant'
             char.firstMessage = '{{none}}'

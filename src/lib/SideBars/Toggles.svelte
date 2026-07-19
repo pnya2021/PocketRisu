@@ -4,7 +4,7 @@
     import { parseToggleSyntax, type sidebarToggle, type sidebarToggleGroup } from "src/ts/util";
     import { language } from "src/lang";
     import type { PromptItem } from "src/ts/process/prompt";
-    import type { character } from "src/ts/storage/database.svelte";
+    import type { character, groupChat } from "src/ts/storage/database.svelte";
     import { getCurrentChat, snapshotToggleValues, saveTogglesToChat } from "src/ts/storage/database.svelte";
     import { alertConfirm, alertTogglePresets, notifySuccess } from "src/ts/alert";
     import { tooltip } from "src/ts/gui/tooltip";
@@ -19,7 +19,7 @@
     import TextInput from "../UI/GUI/TextInput.svelte";
 
     interface Props {
-        chara?: character
+        chara?: character|groupChat
         noContainer?: boolean
     }
 
@@ -121,7 +121,7 @@
         const ungrouped = parseToggleSyntax(
             DBState.db.customPromptTemplateToggle + '\n' +
             getModuleToggles() + '\n' +
-            ((DBState.db?.characters?.[$selectedCharID] as character)?.customModuleToggle ?? '')
+            (DBState.db?.characters?.[$selectedCharID]?.customModuleToggle ?? '')
         )
 
         let groupOpen = false

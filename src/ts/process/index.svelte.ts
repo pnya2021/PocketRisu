@@ -98,6 +98,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         else{
             const r = findCharacterbyId(id)
+            if(!r || r.type === 'group'){
+                return undefined
+            }
             findCharCache[id] = r
             return r
         }
@@ -179,6 +182,15 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             return false
         }
     }
+    selectedChar = get(selectedCharID)
+    const nowChatroom = DBState.db.characters[selectedChar]
+    if(!nowChatroom){
+        return false
+    }
+    if(nowChatroom.type === 'group'){
+        alertError('Group chat runtime is not available yet.')
+        return false
+    }
     doingChat.set(true)
 
     if(chatProcessIndex === -1 && DBState.db.presetChain){
@@ -199,8 +211,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     DBState.db.statics.messages += 1
-    selectedChar = get(selectedCharID)
-    const nowChatroom = DBState.db.characters[selectedChar]
     nowChatroom.lastInteraction = Date.now()
     selectedChat = nowChatroom.chatPage
     // Block send if chat is still a placeholder (hydration not complete)
@@ -804,7 +814,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         let name = ''
         if(msg.role === 'char'){
             if(msg.saying){
-                name = `${findCharacterbyIdwithCache(msg.saying).name}`
+                name = `${findCharacterbyIdwithCache(msg.saying)?.name ?? currentChar.name}`
             }
             else{
                 name = `${currentChar.name}`

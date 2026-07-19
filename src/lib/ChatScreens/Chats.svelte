@@ -1,5 +1,5 @@
 <script lang="ts">
-    import type { character, Message } from 'src/ts/storage/database.svelte';
+    import type { character, groupChat, Message } from 'src/ts/storage/database.svelte';
     import { mount, onDestroy, unmount } from 'svelte';
     import Chat from './Chat.svelte';
     import { getCharImage } from 'src/ts/characters';
@@ -30,7 +30,7 @@
         hasNewUnreadMessage = $bindable(false)
     }:{
         messages: Message[]
-        currentCharacter: character
+        currentCharacter: character|groupChat
         onReroll: () => void
         onNextSwipe?: () => void
         unReroll: () => void
@@ -97,7 +97,7 @@
         for(let i=loadStart ; i >= loadEnd; i--){
             if(i < 0) break; // Prevent out of bounds
             const message = messages[i];
-            const messageLargePortrait = message.role === 'user' ? (userIconPortrait ?? false) : ((currentCharacter as character).largePortrait ?? false);
+            const messageLargePortrait = message.role === 'user' ? (userIconPortrait ?? false) : (currentCharacter.largePortrait ?? false);
             const reloadPointer = reloadPointerMap[i] ?? 0;
             const isRerollTarget = i === lastRealCharIdx;
             let hashd = message.data + (message.chatId ?? '') + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString() + (message.swipeId ?? 0).toString() + (message.swipes?.length ?? 0).toString() + isRerollTarget.toString();
@@ -123,7 +123,7 @@
                         onDeleteSwipe: i === lastRealCharIdx ? onDeleteSwipe : () => {},
                         rerollIcon: i === lastRealCharIdx ? 'force' : false,
                         character: simpleChar,
-                        largePortrait: message.role === 'user' ? (userIconPortrait ?? false) : ((currentCharacter as character).largePortrait ?? false),
+                        largePortrait: message.role === 'user' ? (userIconPortrait ?? false) : (currentCharacter.largePortrait ?? false),
                         messageGenerationInfo: message.generationInfo,
                         role: message.role,
                         name: message.role === 'user' ? currentUsername : currentCharacter.name,

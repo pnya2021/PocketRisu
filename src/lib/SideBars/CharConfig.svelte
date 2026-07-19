@@ -70,7 +70,8 @@
     const firstMsgTok = { t: null as ReturnType<typeof setTimeout> | null, seq: 0 }
     const localNoteTok = { t: null as ReturnType<typeof setTimeout> | null, seq: 0 }
     $effect.pre(() => {
-        tokenizeField(() => (DBState.db.characters[$selectedCharID] as character).desc ?? '', n => tokens.desc = n, descTok)
+        const record = DBState.db.characters[$selectedCharID]
+        tokenizeField(() => record?.type === 'character' ? (record.desc ?? '') : '', n => tokens.desc = n, descTok)
     });
     $effect.pre(() => {
         tokenizeField(() => DBState.db.characters[$selectedCharID].firstMessage ?? '', n => tokens.firstMsg = n, firstMsgTok)
@@ -110,8 +111,9 @@
         licensed = (DBState.db.characters[$selectedCharID].type === 'character') ? (DBState.db.characters[$selectedCharID] as character).license : ''
     });
     $effect.pre(() => {
-        if (DBState.db.characters[$selectedCharID].ttsMode === 'novelai' && (DBState.db.characters[$selectedCharID] as character).naittsConfig === undefined) {
-            (DBState.db.characters[$selectedCharID] as character).naittsConfig = {
+        const record = DBState.db.characters[$selectedCharID]
+        if (record.type === 'character' && record.ttsMode === 'novelai' && record.naittsConfig === undefined) {
+            record.naittsConfig = {
                 customvoice: false,
                 voice: 'Aini',
                 version: 'v2'
@@ -119,8 +121,9 @@
         }
     });
     $effect.pre(() => {
-        if (DBState.db.characters[$selectedCharID].ttsMode === 'gptsovits' && (DBState.db.characters[$selectedCharID] as character).gptSoVitsConfig === undefined) {
-            (DBState.db.characters[$selectedCharID] as character).gptSoVitsConfig = {
+        const record = DBState.db.characters[$selectedCharID]
+        if (record.type === 'character' && record.ttsMode === 'gptsovits' && record.gptSoVitsConfig === undefined) {
+            record.gptSoVitsConfig = {
                 url: '',
                 use_auto_path: false,
                 ref_audio_path: '',
@@ -150,8 +153,9 @@
     }[] = $state([])
 
     $effect.pre(() => {
-        if (DBState.db.characters[$selectedCharID].ttsMode === 'openai' && (DBState.db.characters[$selectedCharID] as character).oaiTTSConfig === undefined) {
-            (DBState.db.characters[$selectedCharID] as character).oaiTTSConfig = {
+        const record = DBState.db.characters[$selectedCharID]
+        if (record.type === 'character' && record.ttsMode === 'openai' && record.oaiTTSConfig === undefined) {
+            record.oaiTTSConfig = {
                 enabled: false,
                 format: 'mp3',
             };
@@ -159,8 +163,9 @@
     });
 
     $effect.pre(() => {
-        if (DBState.db.characters[$selectedCharID].ttsMode === 'fishspeech' && (DBState.db.characters[$selectedCharID] as character).fishSpeechConfig === undefined) {
-            (DBState.db.characters[$selectedCharID] as character).fishSpeechConfig = {
+        const record = DBState.db.characters[$selectedCharID]
+        if (record.type === 'character' && record.ttsMode === 'fishspeech' && record.fishSpeechConfig === undefined) {
+            record.fishSpeechConfig = {
                 model: {
                     _id: '',
                     title: '',
@@ -243,14 +248,14 @@
                 <Braces size={iconButtonSize} />
             </button>
         {/if}
-        <button class={$CharConfigSubMenu === 2 ? 'text-textcolor' : 'text-textcolor2'} onclick={() => {$CharConfigSubMenu = 2}}>
-            <ActivityIcon size={iconButtonSize} />
-        </button>
         {#if DBState.db.characters[$selectedCharID].type === 'character'}
-            <button class={$CharConfigSubMenu === 6 ? 'text-textcolor' : 'text-textcolor2'} onclick={() => {$CharConfigSubMenu = 6}}>
-                <Share2Icon size={iconButtonSize} />
+            <button class={$CharConfigSubMenu === 2 ? 'text-textcolor' : 'text-textcolor2'} onclick={() => {$CharConfigSubMenu = 2}}>
+                <ActivityIcon size={iconButtonSize} />
             </button>
         {/if}
+        <button class={$CharConfigSubMenu === 6 ? 'text-textcolor' : 'text-textcolor2'} onclick={() => {$CharConfigSubMenu = 6}}>
+            <Share2Icon size={iconButtonSize} />
+        </button>
     </div>
 {/if}
 
@@ -260,9 +265,11 @@
         <h2 class="mb-2 text-2xl font-bold mt-2">{language.characterInfo}</h2>
         <span class="text-textcolor">{language.characterName}</span>
         <ShInput className="mt-2 mb-4" autocomplete="off" placeholder={language.characterName} bind:value={DBState.db.characters[$selectedCharID].name} />
-        <span class="text-textcolor">{language.description} <Help key="charDesc"/></span>
-        <TextAreaInput highlight margin="both" autocomplete="off" bind:value={(DBState.db.characters[$selectedCharID] as character).desc}></TextAreaInput>
-        <span class="text-textcolor2 mb-6 text-sm">{tokens.desc} {language.tokens}</span>
+        {#if DBState.db.characters[$selectedCharID].type === 'character'}
+            <span class="text-textcolor">{language.description} <Help key="charDesc"/></span>
+            <TextAreaInput highlight margin="both" autocomplete="off" bind:value={DBState.db.characters[$selectedCharID].desc}></TextAreaInput>
+            <span class="text-textcolor2 mb-6 text-sm">{tokens.desc} {language.tokens}</span>
+        {/if}
         <span class="text-textcolor">{language.firstMessage} <Help key="charFirstMessage"/></span>
         <TextAreaInput highlight margin="both" autocomplete="off" bind:value={DBState.db.characters[$selectedCharID].firstMessage}></TextAreaInput>
         <span class="text-textcolor2 mb-6 text-sm">{tokens.firstMsg} {language.tokens}</span>
@@ -389,11 +396,21 @@
         <!-- svelte-ignore block_empty -->
 
             <SelectInput className="mb-2" bind:value={DBState.db.characters[$selectedCharID].viewScreen} onchange={() => {
-                DBState.db.characters[$selectedCharID] = updateInlayScreen((DBState.db.characters[$selectedCharID] as character))
+                const record = DBState.db.characters[$selectedCharID]
+                if(record.type === 'character'){
+                    DBState.db.characters[$selectedCharID] = updateInlayScreen(record)
+                }
             }}>
-                <OptionInput value="none">{language.none}</OptionInput>
-                <OptionInput value="emotion">{language.emotionImage}</OptionInput>
-                <OptionInput value="imggen">{language.imageGeneration}</OptionInput>
+                {#if DBState.db.characters[$selectedCharID].type === 'character'}
+                    <OptionInput value="none">{language.none}</OptionInput>
+                    <OptionInput value="emotion">{language.emotionImage}</OptionInput>
+                    <OptionInput value="imggen">{language.imageGeneration}</OptionInput>
+                {:else}
+                    <OptionInput value="none">{language.none}</OptionInput>
+                    <OptionInput value="single">Single</OptionInput>
+                    <OptionInput value="multiple">Multiple</OptionInput>
+                    <OptionInput value="emp">EMP</OptionInput>
+                {/if}
             </SelectInput>
 
         {#if DBState.db.characters[$selectedCharID].viewScreen === 'emotion'}
@@ -643,12 +660,25 @@
 
     {#if !licenseRestricted}
         <Button size="md" onclick={async () => {
-            const res = await exportChar($selectedCharID)
+            if(DBState.db.characters[$selectedCharID].type === 'group'){
+                await exportCharacterPackage($selectedCharID, {
+                    includeCharacter: true,
+                    includeChats: true,
+                    includePersona: false,
+                    includeInlays: false,
+                })
+            }
+            else{
+                await exportChar($selectedCharID)
+            }
         }} className="mt-2">{language.exportCharacter}</Button>
     {/if}
 
     <Button size="md" className="mt-2" onclick={async () => {
         const char = getCurrentCharacter()
+        if(!char || char.type === 'group'){
+            return
+        }
         const m = convertCharacterToModule(char)
         DBState.db.modules.push(m)
         notifySuccess(language.successfullyConverted)
@@ -996,7 +1026,7 @@
             </div>
         {/if}
     {/if}
-{:else if $CharConfigSubMenu === 2}
+{:else if $CharConfigSubMenu === 2 && DBState.db.characters[$selectedCharID].type === 'character'}
     {#if !$MobileGUI}
         <h2 class="mb-2 text-2xl font-bold mt-2">{language.advancedSettings}</h2>
     {/if}

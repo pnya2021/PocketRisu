@@ -528,6 +528,9 @@ export async function applyModule() {
     if (!currentChar) {
         return
     }
+    if(currentChar.type === 'group'){
+        return
+    }
     if (module.lorebook) {
         for (const lore of module.lorebook) {
             currentChar.globalLore.push(lore)

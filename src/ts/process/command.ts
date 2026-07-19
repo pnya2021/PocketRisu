@@ -91,7 +91,7 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
             return false
         }
         case 'speak': {
-            if(currentChar){
+            if(currentChar && currentChar.type !== 'group'){
                 await sayTTS(currentChar, arg)
             }
             return pipe
@@ -219,6 +219,9 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
         }
         case 'trigger':{
             const currentChar = getCurrentCharacter()
+            if(!currentChar || currentChar.type === 'group'){
+                return
+            }
             const triggerResult = await runTrigger(currentChar, 'manual', {
                 chat: getCurrentChat(),
                 manualName: arg

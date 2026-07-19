@@ -1,6 +1,6 @@
 import { get } from "svelte/store"
 import { parseChatML } from "../parser/chatML";
-import { getDatabase, type character, type customscript } from "../storage/database.svelte"
+import { getDatabase, type character, type customscript, type groupChat } from "../storage/database.svelte"
 import {
     defaultTranslatorPrompt,
     getCurrentTranslatorPresetFromState,
@@ -271,7 +271,7 @@ export function isExpTranslator(){
 }
 
 export async function translateHTML(html: string, reverse:boolean, charArg:simpleCharacterArgument|string = '', chatID:number, regenerate = false): Promise<string> {
-    let alwaysExistChar: character | simpleCharacterArgument;
+    let alwaysExistChar: character | groupChat | simpleCharacterArgument;
     if(charArg !== ''){
         if(typeof(charArg) === 'string'){
             const db = getDatabase()
@@ -667,7 +667,7 @@ export async function importLLMCacheFromJSON(data:Record<string, string>):Promis
 function applyEdittransRegex(
       text: string, 
       charArg: simpleCharacterArgument | string, 
-      alwaysExistChar: character | simpleCharacterArgument
+      alwaysExistChar: character | groupChat | simpleCharacterArgument
   ): string {
       if (charArg === '') return text
 

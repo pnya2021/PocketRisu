@@ -4,14 +4,17 @@ import { describe, test, expect, vi } from 'vitest'
 // unrelated $effect chains that fail in a stripped-down test environment.
 // Mirror the production isChatStub semantics including the hybrid guard so
 // the chat-data-loss tests below exercise the real intent.
-vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
+const fetchChatContent = vi.hoisted(() => vi.fn())
+vi.mock('../globalApi.svelte', () => ({
+    forageStorage: { realStorage: { fetchChatContent, saveChatContent: vi.fn() } },
+}))
 vi.mock('./database.svelte', () => ({
     isChatStub: (chat: any) => chat
         && chat._stub === true
         && !Array.isArray(chat.message),
 }))
 
-const { chatToStub, stubToPlaceholder, convertStubsToPlaceholders, classifyChat } = await import('./chatStorage')
+const { chatToStub, stubToPlaceholder, convertStubsToPlaceholders, classifyChat, ensureChatHydrated } = await import('./chatStorage')
 type Chat = any
 type ChatStub = any
 
@@ -213,5 +216,38 @@ describe('hybrid corruption (chat with _stub:true + message)', () => {
         expect('note' in stub).toBe(false)
         // Once stripped, the chat-data guard would see no chat-internal field
         // ops in a baseline-vs-current diff between two of these stubs.
+    })
+})
+
+describe('group chat lazy hydration', () => {
+    test('restores saying, lore, modules, script/plugin state, and unknown fields into the original slot', async () => {
+        const stub: ChatStub = {
+            id: 'group-chat', name: 'Group main', _stub: true, modules: ['module-stub'],
+        }
+        const chats = [stubToPlaceholder(stub)]
+        const full = {
+            id: 'group-chat', name: 'Group main', note: 'note',
+            localLore: [{ key: 'group', content: 'lore' }],
+            modules: ['module-full'], scriptstate: { phase: 2 },
+            pluginState: { owner: 'plugin' }, unknownChatField: ['kept'],
+            message: [{ role: 'char', data: 'hello', saying: 'member-a', chatId: 'message-a' }],
+        }
+        fetchChatContent.mockResolvedValueOnce(full)
+
+        const hydrated = await ensureChatHydrated(chats, 0, 'group-parent')
+
+        expect(fetchChatContent).toHaveBeenCalledWith('group-parent', 0, 'group-chat')
+        expect(hydrated).toBe(full)
+        expect(chats[0]).toBe(full)
+        expect(chats[0]).toMatchObject({
+            localLore: [{ key: 'group', content: 'lore' }],
+            modules: ['module-full'],
+            scriptstate: { phase: 2 },
+            pluginState: { owner: 'plugin' },
+            unknownChatField: ['kept'],
+            message: [{ saying: 'member-a', chatId: 'message-a' }],
+        })
+        expect((chats[0] as any)._stub).toBeUndefined()
+        expect((chats[0] as any)._placeholder).toBeUndefined()
     })
 })

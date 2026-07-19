@@ -1,6 +1,6 @@
 import DOMPurify from 'dompurify';
 import markdownit from 'markdown-it'
-import { appVer, getCurrentCharacter, getDatabase, type Database, type character, type customscript, type triggerscript } from '../storage/database.svelte';
+import { appVer, getCurrentCharacter, getDatabase, type Database, type character, type groupChat, type customscript, type triggerscript } from '../storage/database.svelte';
 import { DBState, selIdState } from '../stores.svelte';
 import { aiWatermarkingLawApplies, getFileSrc } from '../globalApi.svelte';
 import { isNodeServer } from "src/ts/platform"
@@ -902,7 +902,7 @@ function parseThoughtsAndTools(data:string){
 
 export async function ParseMarkdown(
     data:string,
-    charArg:(character|simpleCharacterArgument | string) = null,
+    charArg:(character|simpleCharacterArgument|groupChat|string) = null,
     mode:'normal'|'back'|'pretranslate'|'notrim' = 'normal',
     chatID=-1,
     cbsConditions:CbsConditions = {}
@@ -911,7 +911,7 @@ export async function ParseMarkdown(
     const additionalAssetMode = (mode === 'back') ? 'back' : 'normal'
     let char = (typeof(charArg) === 'string') ? (findCharacterbyId(charArg)) : (charArg)
 
-    if(char){
+    if(char && char.type !== 'group'){
         data = await parseAdditionalAssets(data, char, additionalAssetMode, {
             ch: chatID
         })
@@ -922,7 +922,7 @@ export async function ParseMarkdown(
         data = (await processScriptFull(char, data, 'editdisplay', chatID, cbsConditions)).data
     }
 
-    if(firstParsed !== data && char){
+    if(firstParsed !== data && char && char.type !== 'group'){
         data = await parseAdditionalAssets(data, char, additionalAssetMode, {
             ch: chatID
         })
@@ -1705,7 +1705,7 @@ function blockEndMatcher(p1:string,type:{type:blockMatch,type2?:string,mode?:str
 export function risuChatParser(da:string, arg:{
     chatID?:number
     db?:Database
-    chara?:string|character
+    chara?:string|character|groupChat
     rmVar?:boolean,
     var?:{[key:string]:string}
     tokenizeAccurate?:boolean
@@ -1724,7 +1724,14 @@ export function risuChatParser(da:string, arg:{
     let chara:character|string = null
 
     if(aChara){
-        chara = aChara
+        if(typeof aChara !== 'string' && aChara.type === 'group'){
+            const lastSaying = aChara.chats[aChara.chatPage]?.message?.at(-1)?.saying
+            const speaker = lastSaying ? findCharacterbyId(lastSaying) : undefined
+            chara = speaker && speaker.type !== 'group' ? speaker : 'bot'
+        }
+        else{
+            chara = aChara
+        }
     }
     if(arg.tokenizeAccurate){
         const db = arg.db ?? DBState.db

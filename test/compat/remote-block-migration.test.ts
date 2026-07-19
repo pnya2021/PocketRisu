@@ -220,9 +220,24 @@ describe('boot-time remote-block migration', () => {
         servers.push(srv)
         const client = await createClient(srv.port, srv.password)
 
-        // Build database.bin with two REMOTE-pointer characters
+        // Build database.bin with two REMOTE-pointer characters and their group.
         const charA = buildCharacter('cha-A', 'Alpha', 'hello from alpha')
         const charB = buildCharacter('cha-B', 'Beta', 'hello from beta')
+        const group = {
+            type: 'group', chaId: 'group-AB', name: 'Alpha and Beta', firstMessage: 'together',
+            characters: ['cha-A', 'cha-B'], characterTalks: [2 / 3, 2 / 3], characterActive: [true, true],
+            chats: [{
+                id: 'group-chat', name: 'Group chat', note: 'remote group', localLore: [],
+                modules: ['remote-module'], scriptstate: { remote: true },
+                pluginState: { retained: true }, unknownChatField: { retained: true },
+                message: [
+                    { role: 'char', data: 'alpha in group', saying: 'cha-A', chatId: 'remote-a' },
+                    { role: 'char', data: 'beta in group', saying: 'cha-B', chatId: 'remote-b' },
+                ],
+            }],
+            chatPage: 0, chatFolders: [], viewScreen: 'none', globalLore: [], autoMode: false,
+            useCharacterLore: true, emotionImages: [], customscript: [], unknownGroupField: ['retained'],
+        }
         const dbBin = encodeRisuSaveWithRemoteBlocks({
             rootData: {
                 apiType: 'openai',
@@ -233,13 +248,14 @@ describe('boot-time remote-block migration', () => {
                 personas: [{ name: 'Default', icon: '', personaPrompt: '' }],
                 selectedCharacter: 0,
             },
-            remoteCharacterIds: ['cha-A', 'cha-B'],
+            remoteCharacterIds: ['cha-A', 'cha-B', 'group-AB'],
         })
 
         const zip = buildSaveFolderZip({
             'database/database.bin': dbBin,
             'remotes/cha-A.local.bin': Buffer.from(JSON.stringify(charA), 'utf-8'),
             'remotes/cha-B.local.bin': Buffer.from(JSON.stringify(charB), 'utf-8'),
+            'remotes/group-AB.local.bin': Buffer.from(JSON.stringify(group), 'utf-8'),
         })
 
         // Upload via save-folder/upload endpoint
@@ -263,10 +279,11 @@ describe('boot-time remote-block migration', () => {
 
         // Export and verify both REMOTE characters are present with chats
         const exported = await client.exportBackup()
-        const { normalized } = normalizeBackup(exported)
+        const { normalized, raw } = normalizeBackup(exported)
         const ids = new Set(normalized.characters.map(c => c.chaId))
         expect(ids.has('cha-A')).toBe(true)
         expect(ids.has('cha-B')).toBe(true)
+        expect(ids.has('group-AB')).toBe(true)
 
         const a = normalized.characters.find(c => c.chaId === 'cha-A')!
         const b = normalized.characters.find(c => c.chaId === 'cha-B')!
@@ -274,6 +291,21 @@ describe('boot-time remote-block migration', () => {
         expect(b.firstMessages).toEqual(['hello from beta'])
         expect(a.messageCounts[0]).toBeGreaterThan(0)
         expect(b.messageCounts[0]).toBeGreaterThan(0)
+        expect((raw as any).characters.find((record: any) => record.chaId === 'group-AB')).toMatchObject({
+            type: 'group',
+            characters: ['cha-A', 'cha-B'],
+            unknownGroupField: ['retained'],
+            chats: [{
+                modules: ['remote-module'],
+                scriptstate: { remote: true },
+                pluginState: { retained: true },
+                unknownChatField: { retained: true },
+                message: [
+                    { data: 'alpha in group', saying: 'cha-A', chatId: 'remote-a' },
+                    { data: 'beta in group', saying: 'cha-B', chatId: 'remote-b' },
+                ],
+            }],
+        })
     })
 
     test('migrated database.bin no longer carries a RisuSave magic header', async () => {

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { requestChatData } from "src/ts/process/request/request";
     import { doingChat, type OpenAIChat } from "../../ts/process/index.svelte";
-    import { setDatabase, type character, type Message, type Database } from "../../ts/storage/database.svelte";
+    import { setDatabase, type character, type groupChat, type Message, type Database } from "../../ts/storage/database.svelte";
 	import { DBState } from 'src/ts/stores.svelte';
     import { selectedCharID } from "../../ts/stores.svelte";
     import { translate } from "src/ts/translator/translator";
@@ -46,7 +46,10 @@
             suggestMessages = []
         }
         if(!v && $selectedCharID > -1 && (!suggestMessages || suggestMessages.length === 0) && !progress){
-            let currentChar:character = DBState.db.characters[$selectedCharID];
+            let currentChar:character|groupChat = DBState.db.characters[$selectedCharID];
+            if(!currentChar || currentChar.type === 'group'){
+                return
+            }
             let messages:Message[] = []
             
             messages = [...messages, ...currentChar.chats[currentChar.chatPage].message];
@@ -84,7 +87,7 @@
             requestChatData({
                 formated: promptbody,
                 bias: {},
-                currentChar : currentChar as character
+                currentChar
             }, 'submodel', abortController.signal).then(rq2=>{
                 if(rq2.type !== 'fail' && rq2.type !== 'streaming' && rq2.type !== 'multiline' && progress){
                     var suggestMessagesNew = rq2.result.split('\n').filter(msg => msg.startsWith('-')).map(msg => msg.replace('-','').trim())

@@ -4,7 +4,7 @@
     import Sortable from 'sortablejs/modular/sortable.core.esm.js';
     import { DownloadIcon, PencilIcon, HardDriveUploadIcon, MenuIcon, TrashIcon, SplitIcon, FolderPlusIcon, BookmarkCheckIcon, PackageIcon, CopyIcon } from "@lucide/svelte";
 
-    import type { Chat, ChatFolder, character } from "src/ts/storage/database.svelte";
+    import type { Chat, ChatFolder, character, groupChat } from "src/ts/storage/database.svelte";
     import { newChatModelDefaults } from "src/ts/storage/database.svelte";
     import { ensureChatHydrated } from "src/ts/storage/chatStorage";
     import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte';
@@ -27,7 +27,7 @@
     import { changeChatTo, createChatCopyName, requestImmediateSave } from "src/ts/globalApi.svelte";
 
     interface Props {
-        chara: character;
+        chara: character | groupChat;
     }
 
     let { chara = $bindable() }: Props = $props();
@@ -275,7 +275,7 @@
                                 if(!confirmed) return
                                 const chatIdx = chara.chats.indexOf(chat)
                                 if(chara.chats[chatIdx]?._placeholder){
-                                    await ensureChatHydrated(chara.chats, chatIdx, (chara as character).chaId)
+                                    await ensureChatHydrated(chara.chats, chatIdx, chara.chaId)
                                 }
                                 if(chara.chats[chatIdx]?._placeholder){
                                     alertError('Failed to load chat data.')
@@ -367,7 +367,7 @@
                         const confirmed = await alertConfirm(`${language.copyChatConfirm}${chat.name}`)
                         if(!confirmed) return
                         if(chara.chats[i]?._placeholder){
-                            await ensureChatHydrated(chara.chats, i, (chara as character).chaId)
+                            await ensureChatHydrated(chara.chats, i, chara.chaId)
                         }
                         if(chara.chats[i]?._placeholder){
                             alertError('Failed to load chat data.')

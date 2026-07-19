@@ -4,7 +4,7 @@ import { alertConfirm, alertError, alertStore, alertWait, notifySuccess } from '
 import { exportCharacterCard, importCharacterProcess } from './characterCards'
 import { LocalWriter, readImage, VirtualWriter } from './globalApi.svelte'
 import { language } from 'src/lang'
-import { type character, getDatabase, setDatabase, saveImage, normalizeChat } from './storage/database.svelte'
+import { type character, type groupChat, getDatabase, setDatabase, saveImage, normalizeChat } from './storage/database.svelte'
 import type { Chat } from './storage/database.svelte'
 import { fetchChatFromServer } from './storage/chatStorage'
 import { selectSingleFile } from './util'
@@ -15,6 +15,13 @@ import { getInlayAsset, setInlayAsset, getInlayInfosBatch, type InlayAsset } fro
 import { getInlayMeta, setInlayMeta, type InlayAssetMeta } from './process/files/inlayMeta'
 import { PngChunk } from './pngChunk'
 import { reencodeImage } from './process/files/inlays'
+import {
+    applyImportedGroupPackageAssetMap,
+    buildGroupPackage,
+    importGroupPackageAtomic,
+    validateGroupPackage,
+    type GroupPackageV1,
+} from './groupPackage'
 
 // ── Types ──
 
@@ -45,6 +52,8 @@ interface PackageManifest {
         files: string[]
     }
 }
+
+type SupportedPackageManifest = PackageManifest | GroupPackageV1
 
 interface InlayMetaEntry {
     name: string
@@ -138,7 +147,7 @@ function base64ToUint8Array(base64: string): Uint8Array {
 
 // ── Shared import logic ──
 
-async function parseAndValidatePackage(file: { name: string, data: Uint8Array }): Promise<{ unzipped: fflate.Unzipped, manifest: PackageManifest } | null> {
+async function parseAndValidatePackage(file: { name: string, data: Uint8Array }): Promise<{ unzipped: fflate.Unzipped, manifest: SupportedPackageManifest } | null> {
     alertWait(language.characterPackageProgressReading)
 
     const unzipped = await new Promise<fflate.Unzipped>((resolve, reject) => {
@@ -153,10 +162,21 @@ async function parseAndValidatePackage(file: { name: string, data: Uint8Array })
         alertError(language.characterPackageInvalidZip)
         return null
     }
-    const manifest: PackageManifest = JSON.parse(new TextDecoder().decode(manifestBytes))
-    if (manifest.type !== 'risuCharacterPackage' || manifest.version !== 1) {
+    const manifest: SupportedPackageManifest = JSON.parse(new TextDecoder().decode(manifestBytes))
+    if ((manifest.type !== 'risuCharacterPackage' && manifest.type !== 'risuGroupPackage') || manifest.version !== 1) {
         alertError(language.characterPackageInvalidZip)
         return null
+    }
+    if (manifest.type === 'risuGroupPackage') {
+        try {
+            validateGroupPackage(manifest)
+            if (manifest.assets.some(asset => !unzipped[asset.file])) {
+                throw new Error('Group package asset file is missing')
+            }
+        } catch {
+            alertError(language.characterPackageInvalidZip)
+            return null
+        }
     }
 
     return { unzipped, manifest }
@@ -389,6 +409,53 @@ async function importInlays(
 
 // ── Export ──
 
+async function hydrateRecordChatsForPackage(record: character | groupChat): Promise<void> {
+    for (let index = 0; index < record.chats.length; index++) {
+        const chat = record.chats[index]
+        const isRawStub = !!chat && '_stub' in chat && chat._stub === true
+        if ((!chat?._placeholder && !isRawStub) || !chat.id) continue
+        const full = await fetchChatFromServer(record.chaId, index, chat.id)
+        if (!full) {
+            throw new Error(`Chat data missing for "${record.name}" / "${chat.name}". Export aborted to prevent data loss.`)
+        }
+        record.chats[index] = full
+    }
+}
+
+async function exportGroupPackageArchive(database: ReturnType<typeof getDatabase>, groupIndex: number): Promise<void> {
+    const group = database.characters[groupIndex]
+    if (!group || group.type !== 'group') throw new Error('Group not found')
+
+    const memberRecords = group.characters.map((id) => {
+        const matches = database.characters.filter((record) => record.chaId === id)
+        if (matches.length !== 1 || matches[0].type === 'group') {
+            throw new Error(`Group member ${id} is missing or ambiguous`)
+        }
+        return matches[0]
+    })
+    await hydrateRecordChatsForPackage(group)
+    for (const member of memberRecords) await hydrateRecordChatsForPackage(member)
+
+    const summary = `${language.characterPackage}\n\n• Group: ${group.name}\n• Members: ${memberRecords.map(member => member.name).join(', ')}\n• Chats: ${group.chats.length}${language.characterPackageChatCount}`
+    if (!await alertConfirm(summary)) return
+
+    alertWait(language.characterPackageProgressFinalizing)
+    const localWriter = new LocalWriter()
+    await localWriter.init(`${sanitizeFilename(group.name || 'group')}_group_package`, ['zip'])
+    const zipWriter = new CharXWriter(localWriter)
+    const packageManifest = buildGroupPackage(database, group.chaId)
+    for (const asset of packageManifest.assets) {
+        const bytes = await readImage(asset.originalUri)
+        if (!(bytes instanceof Uint8Array)) {
+            throw new Error(`Group asset is missing: ${asset.originalUri}`)
+        }
+        await zipWriter.write(asset.file, bytes)
+    }
+    await zipWriter.write('manifest.json', JSON.stringify(packageManifest, null, 2), 6)
+    await zipWriter.end()
+    notifySuccess(language.characterPackageExportSuccess)
+}
+
 export async function exportCharacterPackage(
     charIndex: number,
     options: {
@@ -400,11 +467,16 @@ export async function exportCharacterPackage(
 ): Promise<void> {
     try {
         const db = getDatabase({ snapshot: true })
-        const char = safeStructuredClone(db.characters[charIndex]) as character
-        if (!char) {
+        const selected = db.characters[charIndex]
+        if (!selected) {
             alertError('Character not found')
             return
         }
+        if (selected.type === 'group') {
+            await exportGroupPackageArchive(db, charIndex)
+            return
+        }
+        const char = safeStructuredClone(selected)
 
         const charName = sanitizeFilename(char.name || 'character')
 
@@ -477,7 +549,7 @@ export async function exportCharacterPackage(
         if (options.includeCharacter) {
             progress(language.characterPackageProgressCharacter)
             const virtualWriter = new VirtualWriter()
-            const charClone = safeStructuredClone(char) as character
+            const charClone = safeStructuredClone(char)
             charClone.image = charClone.image || ''
             if (!charClone.image) {
                 const res = await fetch('/none.webp')
@@ -622,6 +694,28 @@ export async function importCharacterPackage(): Promise<void> {
         if (!parsed) return
         const { unzipped, manifest } = parsed
 
+        if (manifest.type === 'risuGroupPackage') {
+            const summary = `${language.characterPackageImportSummary}\n\n• Group: ${manifest.group.record.name}\n• Members: ${manifest.members.map(member => member.record.name).join(', ')}`
+            if (!await alertConfirm(summary)) return
+            const staged = safeStructuredClone(getDatabase({ snapshot: true }))
+            const identityAssetMap = Object.create(null) as Record<string, string>
+            for (const asset of manifest.assets) identityAssetMap[asset.originalUri] = asset.originalUri
+            const importResult = importGroupPackageAtomic(staged, manifest, { assetUriMap: identityAssetMap })
+
+            const assetUriMap = Object.create(null) as Record<string, string>
+            for (const asset of manifest.assets) {
+                const bytes = unzipped[asset.file]
+                if (!bytes) throw new Error(`Group package asset file is missing: ${asset.file}`)
+                const fileName = asset.originalUri.split('/').pop() || 'asset.bin'
+                assetUriMap[asset.originalUri] = await saveImage(bytes, '', fileName)
+            }
+            applyImportedGroupPackageAssetMap(staged, manifest, importResult, assetUriMap)
+            setDatabase(staged)
+            checkCharOrder()
+            notifySuccess(language.characterPackageImportSuccess)
+            return
+        }
+
         // Warn if character is empty
         let summary = buildImportSummary(manifest)
         if (manifest.character.isEmpty) {
@@ -678,7 +772,10 @@ export async function importCharacterPackage(): Promise<void> {
         let db = getDatabase()
 
         try {
-            const newChar = db.characters[newCharIndex] as character
+            const newChar = db.characters[newCharIndex]
+            if (!newChar || newChar.type === 'group') {
+                throw new Error('Imported package did not create a character')
+            }
 
             const personaIdMap = await importPersonas(manifest, unzipped, importProgress)
             importChatsToCharacter(manifest, unzipped, newChar, personaIdMap, importProgress)
@@ -708,9 +805,14 @@ export async function importPackageToCharacter(charIndex: number): Promise<void>
         if (!parsed) return
         const { unzipped, manifest } = parsed
 
+        if (manifest.type === 'risuGroupPackage') {
+            alertError('Group packages must be imported as a new group')
+            return
+        }
+
         const db = getDatabase()
-        const targetChar = db.characters[charIndex] as character
-        if (!targetChar) {
+        const targetChar = db.characters[charIndex]
+        if (!targetChar || targetChar.type === 'group') {
             alertError('Character not found')
             return
         }

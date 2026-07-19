@@ -1,6 +1,6 @@
 import { writable, type Writable } from "svelte/store"
 import { alertCardExport, alertConfirm, alertError, alertInput, alertStore, alertTOS, alertWait, notifySuccess, notifyError } from "./alert"
-import { defaultSdDataFunc, type character, setDatabase, type customscript, type loreSettings, type loreBook, type triggerscript, importPreset, getDatabase, setDatabaseLite, appVer, newChatModelDefaults } from "./storage/database.svelte"
+import { defaultSdDataFunc, type character, type groupChat, setDatabase, type customscript, type loreSettings, type loreBook, type triggerscript, importPreset, getDatabase, setDatabaseLite, appVer, newChatModelDefaults } from "./storage/database.svelte"
 import { checkNullish, decryptBuffer, isKnownUri, selectFileByDom, sleep } from "./util"
 import { language } from "src/lang"
 import { v4 as uuidv4, v4 } from 'uuid';
@@ -611,6 +611,10 @@ function convertOffSpecCards(charaData:OldTavernChar|CharacterCardV2Risu, imgp:s
 export async function exportChar(charaID:number):Promise<string> {
     const db = getDatabase({snapshot: true})
     let char = safeStructuredClone(db.characters[charaID])
+
+    if(!char || char.type === 'group'){
+        return ''
+    }
 
     if(!char.image){
         const res = await fetch('/none.webp')
@@ -1706,7 +1710,10 @@ export async function getHubResources(id:string) {
     return Buffer.from(await (res).arrayBuffer())
 }
 
-export function isCharacterHasAssets(char:character){
+export function isCharacterHasAssets(char:character|groupChat){
+    if(char.type === 'group'){
+        return false
+    }
     if(char.additionalAssets && char.additionalAssets.length > 0){
         return true
     }

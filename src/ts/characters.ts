@@ -106,8 +106,8 @@ export async function selectCharImg(charIndex:number) {
 
 export function dumpCharImage(charIndex:number) {
     let db = getDatabase()
-    const char = db.characters[charIndex] as character
-    if(!char.image || char.image === ''){
+    const char = db.characters[charIndex]
+    if(!char || !char.image || char.image === ''){
         return
     }
     char.ccAssets ??= []
@@ -123,9 +123,13 @@ export function dumpCharImage(charIndex:number) {
 
 export function changeCharImage(charIndex:number,changeIndex:number) {
     let db = getDatabase()
-    const char = db.characters[charIndex] as character
-    const image = char.ccAssets[changeIndex].uri
-    char.ccAssets.splice(changeIndex, 1)
+    const char = db.characters[charIndex]
+    const assets = char?.ccAssets
+    const image = assets?.[changeIndex]?.uri
+    if(!char || !assets || !image){
+        return
+    }
+    assets.splice(changeIndex, 1)
     dumpCharImage(charIndex)
     char.image = image
     db.characters[charIndex] = char
@@ -525,7 +529,11 @@ function formatTavernChat(chat:string, charName:string){
 export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
     updateInteraction?:boolean,
 } = {}){
-    let cha = typeof(indexOrCharacter) === 'number' ? getCharacterByIndex(indexOrCharacter) : indexOrCharacter
+    const record = typeof(indexOrCharacter) === 'number' ? getCharacterByIndex(indexOrCharacter) : indexOrCharacter
+    if(!record || record.type === 'group'){
+        return null
+    }
+    let cha = record
     if(cha.chats.length === 0){
         cha.chats = [{
             message: [],
@@ -765,11 +773,16 @@ export function changeChar(index: number, arg:{
       return
     }
     const char = getDatabase().characters[index]
+    if(!char){
+      return
+    }
     reseter();
     chatDeselected.set(false)
-    characterFormatUpdate(index, {
-      updateInteraction: true,
-    });
+    if(char.type !== 'group'){
+      characterFormatUpdate(index, {
+        updateInteraction: true,
+      });
+    }
     selectedCharID.set(index);
     const chat = getCurrentChat()
     if(chat){
