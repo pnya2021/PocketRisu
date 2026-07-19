@@ -28,6 +28,7 @@ import {
     normalizeGroupChatDatabase,
     type QuarantinedGroupChat,
 } from './groupChatCompatibility';
+import { normalizeContextRecordIds } from './contextRecordIds';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
@@ -48,6 +49,7 @@ export function setDatabase(data:Database){
         data.characters = []
     }
     const groupStateNormalization = normalizeGroupChatDatabase(data)
+    const contextIdNormalization = normalizeContextRecordIds(data)
     if(checkNullish(data.apiType)){
         data.apiType = 'gemini-3-flash-preview'
     }
@@ -747,15 +749,18 @@ export function setDatabase(data:Database){
     setDatabaseLite(data)
     return {
         pluginStateChanged: pluginStateNormalization.pluginStateChanged || groupStateNormalization.changed,
+        contextIdsChanged: contextIdNormalization.contextIdsChanged,
     }
 }
 
 export function setDatabaseLite(data:Database){
     const groupStateNormalization = normalizeGroupChatDatabase(data)
+    const contextIdNormalization = normalizeContextRecordIds(data)
     const pluginStateNormalization = normalizePluginDatabaseState(data)
     DBState.db = data
     return {
         pluginStateChanged: pluginStateNormalization.pluginStateChanged || groupStateNormalization.changed,
+        contextIdsChanged: contextIdNormalization.contextIdsChanged,
     }
 }
 

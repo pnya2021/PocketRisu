@@ -32,7 +32,7 @@ const {
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
-const { repairDuplicateCharacterIds } = require('./groupPersistence.cjs');
+const { repairDuplicateCharacterIds, repairChatIdsBeforeIndexing } = require('./groupPersistence.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -301,8 +301,11 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         logger.warn(`[ChatStore] Repaired ${duplicateIdRepair.remapped.length} duplicate chaId entr${duplicateIdRepair.remapped.length === 1 ? 'y' : 'ies'} before chat indexing.`);
     }
 
-    const hadMissingIds = assignMissingChatIds(dbObj);
-    if (hadMissingIds) needsPersist = true;
+    const chatIdRepair = repairChatIdsBeforeIndexing(dbObj);
+    if (chatIdRepair.changed) {
+        needsPersist = true;
+        logger.warn(`[ChatStore] Repaired ${chatIdRepair.remapped.length} missing or duplicate chat ID(s) before chat indexing.`);
+    }
 
     const hadOrphanFolderIds = normalizeOrphanFolderIds(dbObj);
     if (hadOrphanFolderIds) needsPersist = true;

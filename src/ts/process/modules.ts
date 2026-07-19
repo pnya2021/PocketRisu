@@ -12,6 +12,7 @@ import {get} from "svelte/store"
 import { convertCharacterToModule, convertModuleToCharacter } from "../interchangeability"
 import { exportCharacterCard, importCharacterProcess } from "../characterCards"
 import { resolveGroupMembers } from "./group"
+import { resolveModuleActivations, type ModuleActivationReason } from "../plugins/apiV3/illustration/moduleActivation"
 
 export interface MCPModule{
     url: string
@@ -398,6 +399,30 @@ export interface ModuleResolutionContext {
     persona?: RisuPersona | null
 }
 
+/** Host-facing activation metadata; preserves runtime module semantics without exposing executable fields. */
+export function resolveModulesWithReasonsForContext(
+    db: Database,
+    context: ModuleResolutionContext,
+): Array<{ module: RisuModule; activatedBy: ModuleActivationReason[] }> {
+    const characterModules: string[] = []
+    const addCharacterModules = (value: unknown) => {
+        if (!Array.isArray(value)) return
+        for (const id of value) {
+            if (typeof id === 'string' && id.trim()) characterModules.push(id.trim())
+        }
+    }
+    addCharacterModules((context.room as character & { modules?: string[] }).modules)
+    for (const member of context.members ?? []) addCharacterModules(member.modules)
+
+    return resolveModuleActivations(db.modules ?? [], {
+        global: db.enabledModules ?? [],
+        chat: context.chat?.modules ?? [],
+        character: characterModules,
+        personaModule: context.persona?.embeddedModule ?? null,
+        integration: db.moduleIntergration?.split(',').map((id) => id.trim()).filter(Boolean) ?? [],
+    })
+}
+
 /** Stable source-ordered module union used by both character and group turns. */
 export function resolveModulesForContext(
     db: Database,
@@ -444,6 +469,20 @@ export function getModules(context?: Partial<ModuleResolutionContext>){
         ? resolveGroupMembers(room, db.characters).map((member) => member.card)
         : [])
     return resolveModulesForContext(db, { room, chat, members, persona })
+}
+
+export function getActiveModulesWithReasons(context?: Partial<ModuleResolutionContext>) {
+    const db = getDatabase()
+    const room = context?.room ?? getCurrentCharacter()
+    if (!room) return []
+    const chat = context?.chat ?? getCurrentChat()
+    const persona = context && Object.hasOwn(context, 'persona')
+        ? context.persona
+        : checkPersonaBinded()
+    const members = context?.members ?? (room.type === 'group'
+        ? resolveGroupMembers(room, db.characters).map((member) => member.card)
+        : [])
+    return resolveModulesWithReasonsForContext(db, { room, chat, members, persona })
 }
 
 

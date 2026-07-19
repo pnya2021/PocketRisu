@@ -2,11 +2,15 @@ import { createRequire } from 'node:module'
 import { describe, expect, test } from 'vitest'
 
 const require = createRequire(import.meta.url)
-const { repairDuplicateCharacterIds } = require('./groupPersistence.cjs') as {
+const { repairDuplicateCharacterIds, repairChatIdsBeforeIndexing } = require('./groupPersistence.cjs') as {
   repairDuplicateCharacterIds: (
     database: Record<string, any>,
     createId?: () => string,
   ) => { changed: boolean; remapped: Array<{ index: number; originalId: string; newId: string }> }
+  repairChatIdsBeforeIndexing: (
+    database: Record<string, any>,
+    createId?: () => string,
+  ) => { changed: boolean; remapped: Array<{ characterIndex: number; chatIndex: number; originalId: unknown; newId: string }> }
 }
 
 describe('repairDuplicateCharacterIds', () => {
@@ -68,5 +72,27 @@ describe('repairDuplicateCharacterIds', () => {
     expect(repairDuplicateCharacterIds(db, () => generated.shift()!)).toMatchObject({ changed: true })
     expect(db.characters.map(record => record.chaId)).toEqual(['same', 'generated-2', 'generated-1'])
     expect(repairDuplicateCharacterIds(db)).toEqual({ changed: false, remapped: [] })
+  })
+})
+
+describe('repairChatIdsBeforeIndexing', () => {
+  test('repairs duplicates only within one character before building the lazy chat store', () => {
+    const db = {
+      characters: [
+        { chaId: 'a', chats: [{ id: 'shared', message: ['a1'] }, { id: 'shared', message: ['a2'] }] },
+        { chaId: 'b', chats: [{ id: 'shared', message: ['b1'] }, { id: '', message: ['b2'] }] },
+      ],
+    }
+    const generated = ['shared', 'a-second', 'b-missing']
+
+    expect(repairChatIdsBeforeIndexing(db, () => generated.shift()!)).toEqual({
+      changed: true,
+      remapped: [
+        { characterIndex: 0, chatIndex: 1, originalId: 'shared', newId: 'a-second' },
+        { characterIndex: 1, chatIndex: 1, originalId: '', newId: 'b-missing' },
+      ],
+    })
+    expect(db.characters.map(character => character.chats.map(chat => chat.id)))
+      .toEqual([['shared', 'a-second'], ['shared', 'b-missing']])
   })
 })

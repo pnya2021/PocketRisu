@@ -6,7 +6,7 @@ import {
     runGroupGeneration,
 } from './group'
 import { collectLorebooksForPrompt } from './lorebook.svelte'
-import { resolveModulesForContext, type RisuModule } from './modules'
+import { resolveModulesForContext, resolveModulesWithReasonsForContext, type RisuModule } from './modules'
 
 const card = (id: string, name: string): character => ({
     type: 'character',
@@ -233,5 +233,39 @@ describe('group lore and module context', () => {
         expect(resolveModulesForContext(db, { room: group, chat, members: [a, b], persona })
             .map((module) => module.id))
             .toEqual(['global', 'chat', 'group', 'alice', 'bob', 'persona-module', 'integration', 'namespaced', 'namespaced-2'])
+    })
+
+    it('reports deterministic activation reasons for group, member, persona, and integration modules', () => {
+        const mod = (id: string, namespace?: string): RisuModule => ({ id, namespace, name: id, description: '' })
+        const modules = [
+            mod('global'), mod('chat'), mod('group'), mod('alice'), mod('bob'),
+            mod('integration'), mod('namespaced', 'alias'), mod('namespaced-2', 'alias'),
+        ]
+        const group = room({ modules: ['group', 'global'] } as Partial<groupChat>)
+        const chat = { modules: ['chat', 'group'] } as Chat
+        const a = { ...alice, modules: ['alice', 'global'] } as character
+        const b = { ...bob, modules: ['bob', 'alice'] } as character
+        const personaModule = mod('persona-module')
+        const persona = { id: 'persona', embeddedModule: personaModule } as RisuPersona
+        const db = {
+            characters: [group, a, b],
+            modules,
+            enabledModules: ['global'],
+            moduleIntergration: 'integration, alias',
+        } as Database
+
+        expect(resolveModulesWithReasonsForContext(db, { room: group, chat, members: [a, b], persona })
+            .map(({ module, activatedBy }) => ({ id: module.id, activatedBy })))
+            .toEqual([
+                { id: 'global', activatedBy: ['global', 'character'] },
+                { id: 'chat', activatedBy: ['chat'] },
+                { id: 'group', activatedBy: ['chat', 'character'] },
+                { id: 'alice', activatedBy: ['character'] },
+                { id: 'bob', activatedBy: ['character'] },
+                { id: 'integration', activatedBy: ['integration'] },
+                { id: 'namespaced', activatedBy: ['integration'] },
+                { id: 'namespaced-2', activatedBy: ['integration'] },
+                { id: 'persona-module', activatedBy: ['persona'] },
+            ])
     })
 })

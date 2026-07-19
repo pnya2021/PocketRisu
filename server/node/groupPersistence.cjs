@@ -44,4 +44,41 @@ function repairDuplicateCharacterIds(database, createId = randomId) {
     return { changed: remapped.length > 0, remapped };
 }
 
-module.exports = { repairDuplicateCharacterIds };
+/** Repair chat IDs within each owning character before fullChatStore is indexed. */
+function repairChatIdsBeforeIndexing(database, createId = randomId) {
+    const records = Array.isArray(database?.characters) ? database.characters : [];
+    const remapped = [];
+    for (let characterIndex = 0; characterIndex < records.length; characterIndex++) {
+        const chats = Array.isArray(records[characterIndex]?.chats) ? records[characterIndex].chats : [];
+        const reserved = new Set(chats
+            .map(chat => chat?.id)
+            .filter(id => typeof id === 'string' && id.length > 0));
+        const seen = new Set();
+        for (let chatIndex = 0; chatIndex < chats.length; chatIndex++) {
+            const chat = chats[chatIndex];
+            if (!chat || typeof chat !== 'object') continue;
+            const originalId = chat.id;
+            if (typeof originalId === 'string' && originalId.length > 0 && !seen.has(originalId)) {
+                seen.add(originalId);
+                continue;
+            }
+            let newId = '';
+            for (let attempt = 0; attempt < 1024; attempt++) {
+                const candidate = createId();
+                if (typeof candidate === 'string' && candidate.length > 0
+                    && !reserved.has(candidate) && !seen.has(candidate)) {
+                    newId = candidate;
+                    break;
+                }
+            }
+            if (!newId) throw new Error(`Unable to repair chat id at ${characterIndex}/${chatIndex}`);
+            chat.id = newId;
+            reserved.add(newId);
+            seen.add(newId);
+            remapped.push({ characterIndex, chatIndex, originalId, newId });
+        }
+    }
+    return { changed: remapped.length > 0, remapped };
+}
+
+module.exports = { repairDuplicateCharacterIds, repairChatIdsBeforeIndexing };
