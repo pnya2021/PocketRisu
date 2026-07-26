@@ -256,6 +256,70 @@ describe('PixAI install lifecycle', () => {
         })
     })
 
+    it('reserves and aborts cancellation before Host DELETE settles', async () => {
+        const { backend, lifecycle, queue } = setup()
+        let downloadSignal!: AbortSignal
+        let resolveDownload!: () => void
+        let resolveCancel!: () => void
+        backend.downloadImpl = async (_principal, signal) => {
+            downloadSignal = signal
+            return new Promise((resolve) => {
+                resolveDownload = () => resolve({
+                    state: 'verified', bytes: PIXAI_PROFILE.totalBytes,
+                })
+            })
+        }
+        backend.cancel.mockImplementationOnce(() => new Promise((resolve) => {
+            resolveCancel = () => resolve({ cancelled: true })
+        }))
+        const owner = context().context
+        const started = await approvedInstall(lifecycle, queue, owner)
+        await vi.waitFor(() => expect(backend.download).toHaveBeenCalledTimes(1))
+
+        const cancellation = lifecycle.cancelLocalModelOperation(owner, started.operationId)
+        expect(downloadSignal.aborted).toBe(true)
+        resolveDownload()
+        await expect(settle(lifecycle, owner, started.operationId)).resolves.toMatchObject({
+            state: 'cancelled', error: { code: 'ABORTED' },
+        })
+        await expect(lifecycle.installLocalModel(owner, PIXAI_PROFILE.id))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(queue.current()).toBeNull()
+
+        resolveCancel()
+        await expect(cancellation).resolves.toBeUndefined()
+        await expect(lifecycle.getLocalModelStatus(owner, PIXAI_PROFILE.id))
+            .resolves.toEqual({ state: 'absent' })
+
+        const retry = lifecycle.installLocalModel(owner, PIXAI_PROFILE.id)
+        await queue.whenPresented()
+        decide(queue, false)
+        await expect(retry).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+    })
+
+    it('keeps local cancellation terminal and redacts a failed Host DELETE', async () => {
+        const { backend, lifecycle, queue } = setup()
+        backend.downloadImpl = async (_principal, signal) => new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(new PluginApiError('ABORTED', 'stopped')), { once: true })
+        })
+        backend.cancel.mockRejectedValueOnce(new Error('private Host cancel stack'))
+        const owner = context().context
+        const started = await approvedInstall(lifecycle, queue, owner)
+        await vi.waitFor(() => expect(backend.download).toHaveBeenCalledTimes(1))
+
+        await expect(lifecycle.cancelLocalModelOperation(owner, started.operationId))
+            .rejects.toSatisfy((error: unknown) => {
+                expect(error).toMatchObject({ code: 'INTERNAL' })
+                expect(String((error as Error).message)).not.toContain('private')
+                return true
+            })
+        await expect(lifecycle.getLocalModelOperation(owner, started.operationId)).resolves.toMatchObject({
+            state: 'cancelled', error: { code: 'ABORTED' },
+        })
+        await expect(lifecycle.getLocalModelStatus(owner, PIXAI_PROFILE.id))
+            .resolves.toEqual({ state: 'absent' })
+    })
+
     it('retains shared ownership, forwards includePartial on the last plugin owner, and reports evicted state', async () => {
         const { backend, lifecycle, queue } = setup()
         const a = context(OWNER_A).context
@@ -283,6 +347,40 @@ describe('PixAI install lifecycle', () => {
         })
         expect(backend.remove).toHaveBeenCalledWith(OWNER_B, false)
         await expect(lifecycle.getLocalModelStatus(b, PIXAI_PROFILE.id)).resolves.toMatchObject({ state: 'absent' })
+    })
+
+    it('preserves final and device ownership when Host removal fails', async () => {
+        const pluginCase = setup()
+        const pluginOwner = context(OWNER_A, 'plugin-retry').context
+        const installed = await approvedInstall(pluginCase.lifecycle, pluginCase.queue, pluginOwner)
+        await settle(pluginCase.lifecycle, pluginOwner, installed.operationId)
+        pluginCase.backend.remove.mockRejectedValueOnce(
+            new PluginApiError('NETWORK', 'Local model transport failed', { retryable: true }),
+        )
+        await expect(pluginCase.lifecycle.removeLocalModel(pluginOwner, PIXAI_PROFILE.id))
+            .rejects.toMatchObject({ code: 'NETWORK', retryable: true })
+        await expect(pluginCase.lifecycle.removeLocalModel(pluginOwner, PIXAI_PROFILE.id))
+            .resolves.toMatchObject({ releasedPluginReference: true })
+
+        const deviceCase = setup()
+        const a = context(OWNER_A, 'device-a').context
+        const b = context(OWNER_B, 'device-b').context
+        const aInstall = await approvedInstall(deviceCase.lifecycle, deviceCase.queue, a)
+        await settle(deviceCase.lifecycle, a, aInstall.operationId)
+        const bInstall = await approvedInstall(deviceCase.lifecycle, deviceCase.queue, b)
+        await settle(deviceCase.lifecycle, b, bInstall.operationId)
+        deviceCase.backend.remove.mockRejectedValueOnce(
+            new PluginApiError('NETWORK', 'Local model transport failed', { retryable: true }),
+        )
+        const failedPurge = deviceCase.lifecycle.removeLocalModel(a, PIXAI_PROFILE.id, { scope: 'device' })
+        await deviceCase.queue.whenPresented()
+        decide(deviceCase.queue, true)
+        await expect(failedPurge).rejects.toMatchObject({ code: 'NETWORK' })
+
+        const retryPurge = deviceCase.lifecycle.removeLocalModel(a, PIXAI_PROFILE.id, { scope: 'device' })
+        await deviceCase.queue.whenPresented()
+        decide(deviceCase.queue, true)
+        await expect(retryPurge).resolves.toMatchObject({ releasedPluginReference: true })
     })
 
     it('confirms device purge, preserves bytes on denial, and blocks purge during active work', async () => {

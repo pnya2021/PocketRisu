@@ -87,6 +87,8 @@ interface LocalModelOperation {
     error?: PluginApiErrorShape
     terminalAt?: number
     task?: Promise<void>
+    cancellationRequested?: boolean
+    cancelTask?: Promise<void>
 }
 
 const allowedModelErrorCodes = new Set([
@@ -314,6 +316,9 @@ export class PixaiInstallLifecycle {
         const key = this.activeKey(context.principalId)
         const existing = this.active.get(key)
         if (existing) {
+            if (existing.cancellationRequested) {
+                throw new PluginApiError('CONFLICT', 'Local model cancellation is pending')
+            }
             this.attachCallback(existing, context, callback)
             return { operationId: existing.id }
         }
@@ -342,6 +347,9 @@ export class PixaiInstallLifecycle {
             if (context.signal.aborted) throw new PluginApiError('ABORTED', 'Plugin instance unloaded')
             const coalesced = this.active.get(key)
             if (coalesced) {
+                if (coalesced.cancellationRequested) {
+                    throw new PluginApiError('CONFLICT', 'Local model cancellation is pending')
+                }
                 this.attachCallback(coalesced, context, callback)
                 return { operationId: coalesced.id }
             }
@@ -385,18 +393,28 @@ export class PixaiInstallLifecycle {
         operationIdValue: unknown,
     ): Promise<void> {
         const operation = this.ownedOperation(context, operationIdValue)
+        if (operation.cancelTask) return operation.cancelTask
         if (operation.state !== 'queued' && operation.state !== 'running') {
             throw new PluginApiError('CONFLICT', 'Local model operation is already terminal')
         }
+        operation.cancellationRequested = true
+        operation.controller.abort(new PluginApiError('ABORTED', 'Local model operation cancelled'))
+        const task = this.completeCancellation(operation)
+        operation.cancelTask = task
+        return task
+    }
+
+    private async completeCancellation(operation: LocalModelOperation): Promise<void> {
         let cancellationError: unknown
         try {
             await operation.client.cancel()
         } catch (error) {
             cancellationError = error
         } finally {
-            operation.controller.abort(new PluginApiError('ABORTED', 'Local model operation cancelled'))
             while (!operation.task) await Promise.resolve()
             await operation.task
+            this.releaseActive(operation)
+            operation.cancelTask = undefined
         }
         if (cancellationError) throwNormalized(cancellationError)
     }
@@ -439,8 +457,10 @@ export class PixaiInstallLifecycle {
             if (this.active.size > 0) {
                 throw new PluginApiError('CONFLICT', 'A local model installation is active')
             }
-            const releasedPluginReference = this.owners.delete(context.principalId)
-            if (options.scope === 'plugin' && this.owners.size > 0) {
+            const releasedPluginReference = this.owners.has(context.principalId)
+            const otherOwnerCount = this.owners.size - (releasedPluginReference ? 1 : 0)
+            if (options.scope === 'plugin' && otherOwnerCount > 0) {
+                if (releasedPluginReference) this.owners.delete(context.principalId)
                 return {
                     releasedPluginReference,
                     purgedBytes: 0,
@@ -448,13 +468,14 @@ export class PixaiInstallLifecycle {
                     pending: false,
                 }
             }
-            if (options.scope === 'device') this.owners.clear()
             let result: { purgedBytes: number }
             try {
                 result = await this.clientForPrincipal(context.principalId).remove(options.includePartial)
             } catch (error) {
                 throwNormalized(error)
             }
+            if (options.scope === 'device') this.owners.clear()
+            else if (releasedPluginReference) this.owners.delete(context.principalId)
             return {
                 releasedPluginReference,
                 purgedBytes: result.purgedBytes,
@@ -534,8 +555,15 @@ export class PixaiInstallLifecycle {
         try {
             const result = await operation.client.download(
                 operation.controller.signal,
-                (progress) => this.publishHostProgress(operation, progress),
+                (progress) => {
+                    if (!operation.cancellationRequested) {
+                        this.publishHostProgress(operation, progress)
+                    }
+                },
             )
+            if (operation.cancellationRequested || operation.controller.signal.aborted) {
+                throw new PluginApiError('ABORTED', 'Local model operation cancelled')
+            }
             if (result.state !== 'verified' || result.bytes !== PIXAI_PROFILE.totalBytes) {
                 throw new PluginApiError('INTERNAL', 'Internal plugin API error')
             }
@@ -551,14 +579,18 @@ export class PixaiInstallLifecycle {
             operation.state = operation.error.code === 'ABORTED' ? 'cancelled' : 'failed'
         } finally {
             operation.terminalAt = this.now()
-            const key = this.activeKey(operation.principalId)
-            if (this.active.get(key) === operation) this.active.delete(key)
+            if (!operation.cancellationRequested) this.releaseActive(operation)
             for (const entry of operation.callbacks.values()) {
                 entry.signal.removeEventListener('abort', entry.onAbort)
             }
             operation.callbacks.clear()
             this.prune(operation.principalId)
         }
+    }
+
+    private releaseActive(operation: LocalModelOperation): void {
+        const key = this.activeKey(operation.principalId)
+        if (this.active.get(key) === operation) this.active.delete(key)
     }
 
     private ownedOperation(
