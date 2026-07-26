@@ -56,6 +56,8 @@ import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustr
 import { createPocketInlayLifecycleAdapter } from './illustration/inlayLifecycle.pocket';
 import { NodeStorage } from 'src/ts/storage/nodeStorage';
 import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/deviceCache';
+import { PixaiInstallLifecycle } from './localModel/pixaiInstallLifecycle';
+import { PocketPluginModelClient } from './localModel/pocketPluginModelClient';
 
 /*
     V3 API for RisuAI Plugins
@@ -78,6 +80,15 @@ import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/
 
 const pluginChannels = new InstanceChannelRegistry();
 const pluginInstanceCleanup = new InstanceCleanupRegistry();
+const pluginModelNodeStorage = new NodeStorage();
+const pixaiInstallLifecycle = new PixaiInstallLifecycle({
+    clientForPrincipal: (principalId) => new PocketPluginModelClient(pluginModelNodeStorage, principalId),
+    requirePermission: (executionContext) => pluginPermissionService.require(
+        executionContext,
+        'localModelInference',
+        { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
+    ),
+});
 
 class SafeElement {
     #element: HTMLElement;
@@ -1264,6 +1275,16 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             if (!isPluginPermissionId(permission)) return Promise.resolve(false)
             return getPluginPermission(context, permission);
         },
+        getLocalModelStatus: (profile: unknown) =>
+            pixaiInstallLifecycle.getLocalModelStatus(context, profile),
+        installLocalModel: (profile: unknown, onProgress?: unknown) =>
+            pixaiInstallLifecycle.installLocalModel(context, profile, onProgress),
+        getLocalModelOperation: (operationId: unknown) =>
+            pixaiInstallLifecycle.getLocalModelOperation(context, operationId),
+        cancelLocalModelOperation: (operationId: unknown) =>
+            pixaiInstallLifecycle.cancelLocalModelOperation(context, operationId),
+        removeLocalModel: (profile: unknown, options?: unknown) =>
+            pixaiInstallLifecycle.removeLocalModel(context, profile, options),
         getCapabilities: (ids?: string[]) => getCapabilities(context, ids, {
             permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
             runtime: {

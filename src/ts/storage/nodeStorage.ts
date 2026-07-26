@@ -10,6 +10,16 @@ import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
 import { normalizeChat } from "./database.svelte"
 
+const PLUGIN_MODEL_PROFILE_ID = 'pixai-tagger-v0.9-onnx'
+const PLUGIN_MODEL_PRINCIPAL = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function pluginModelPrincipal(value: string): string {
+    if (typeof value !== 'string' || !PLUGIN_MODEL_PRINCIPAL.test(value)) {
+        throw new Error('Invalid Host plugin principal')
+    }
+    return value.toLowerCase()
+}
+
 // Custom error class for database conflict detection
 export class ConflictError extends Error {
     currentEtag: string
@@ -182,6 +192,43 @@ export class NodeStorage{
         }
 
         return response
+    }
+
+    async pluginModelStatus(): Promise<Response> {
+        return this.authFetch(`/api/plugin-models/${PLUGIN_MODEL_PROFILE_ID}/status`, {
+            method: 'GET',
+        })
+    }
+
+    async pluginModelDownload(principalId: string, signal: AbortSignal): Promise<Response> {
+        return this.authFetch(`/api/plugin-models/${PLUGIN_MODEL_PROFILE_ID}/download`, {
+            method: 'POST',
+            headers: {
+                'x-risu-plugin-principal-id': pluginModelPrincipal(principalId),
+            },
+            signal,
+        })
+    }
+
+    async pluginModelCancel(principalId: string): Promise<Response> {
+        return this.authFetch(`/api/plugin-models/${PLUGIN_MODEL_PROFILE_ID}/download`, {
+            method: 'DELETE',
+            headers: {
+                'x-risu-plugin-principal-id': pluginModelPrincipal(principalId),
+            },
+        })
+    }
+
+    async pluginModelRemove(principalId: string, includePartial: boolean): Promise<Response> {
+        if (typeof includePartial !== 'boolean') throw new Error('Invalid includePartial value')
+        return this.authFetch(`/api/plugin-models/${PLUGIN_MODEL_PROFILE_ID}`, {
+            method: 'DELETE',
+            headers: {
+                'content-type': 'application/json',
+                'x-risu-plugin-principal-id': pluginModelPrincipal(principalId),
+            },
+            body: JSON.stringify({ includePartial }),
+        })
     }
 
     async setItem(key:string, value:Uint8Array, etag?:string) {
