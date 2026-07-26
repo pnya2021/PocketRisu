@@ -36,6 +36,7 @@ const DIGEST = /^[a-f0-9]{64}$/;
 const MAX_ETAG_BYTES = 4_096;
 const MAX_HEADER_BYTES = 128 * 1_024;
 const MAX_DNS_ANSWERS = 64;
+const DNS_LOOKUP_TIMEOUT_MS = 15_000;
 const NETWORK_IDLE_TIMEOUT_MS = 60_000;
 const MAX_OBSERVERS = 64;
 const MAX_NDJSON_BYTES = 4_096;
@@ -334,19 +335,59 @@ function validContentRange(value, offset, total) {
         Number(match[3]) === total;
 }
 
-function openPinnedResponse(input) {
-    return new Promise(async (resolve, reject) => {
-        let addresses;
-        try {
-            const answers = await input.lookup(input.url.hostname, { all: true, verbatim: true });
-            addresses = validateDnsAnswers(answers);
-            throwIfAborted(input.signal);
-        } catch (error) {
-            reject(isAbort(input.signal)
-                ? failure('ABORTED', 'Model download aborted', true)
-                : safeError(error, 'NETWORK_ERROR'));
+function resolvePinnedAddresses(input) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let timer;
+        const cleanup = () => {
+            if (timer !== undefined) clearTimeout(timer);
+            input.signal.removeEventListener('abort', abort);
+        };
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            callback(value);
+        };
+        const abort = () => finish(
+            reject,
+            failure('ABORTED', 'Model download aborted', true),
+        );
+        input.signal.addEventListener('abort', abort, { once: true });
+        if (input.signal.aborted) {
+            abort();
             return;
         }
+        timer = setTimeout(() => finish(
+            reject,
+            failure('NETWORK_ERROR', 'Model artifact DNS timed out', true),
+        ), input.lookupTimeoutMs);
+        timer.unref?.();
+
+        let pending;
+        try {
+            pending = input.lookup(input.url.hostname, { all: true, verbatim: true });
+        } catch {
+            finish(reject, failure('NETWORK_ERROR', 'Model download network request failed', true));
+            return;
+        }
+        Promise.resolve(pending).then((answers) => {
+            if (settled) return;
+            try {
+                finish(resolve, validateDnsAnswers(answers));
+            } catch (error) {
+                finish(reject, safeError(error, 'NETWORK_ERROR'));
+            }
+        }, () => finish(
+            reject,
+            failure('NETWORK_ERROR', 'Model download network request failed', true),
+        ));
+    });
+}
+
+async function openPinnedResponse(input) {
+    const addresses = await resolvePinnedAddresses(input);
+    return new Promise((resolve, reject) => {
 
         let outgoing;
         let response;
@@ -357,6 +398,11 @@ function openPinnedResponse(input) {
             outgoing?.destroy(error);
         };
         input.signal.addEventListener('abort', abort, { once: true });
+        if (input.signal.aborted) {
+            input.signal.removeEventListener('abort', abort);
+            reject(failure('ABORTED', 'Model download aborted', true));
+            return;
+        }
         try {
             outgoing = input.request({
                 protocol: 'https:',
@@ -592,6 +638,7 @@ async function downloadArtifact(input) {
                 headers,
                 signal,
                 lookup: input.lookup,
+                lookupTimeoutMs: input.lookupTimeoutMs,
                 request: input.request,
             });
             const response = opened.response;
@@ -707,7 +754,15 @@ function createPluginModelDownloadService(options) {
     const registry = options.registry ?? { getProfile: getPixaiProfile };
     const store = options.store;
     const lookup = options.lookup ?? dns.lookup;
+    const lookupTimeoutMs = options.lookupTimeoutMs ?? DNS_LOOKUP_TIMEOUT_MS;
     const request = options.request ?? https.request;
+    if (
+        !Number.isSafeInteger(lookupTimeoutMs) ||
+        lookupTimeoutMs <= 0 ||
+        lookupTimeoutMs > NETWORK_IDLE_TIMEOUT_MS
+    ) {
+        throw failure('INVALID_ARGUMENT', 'Model download service options rejected');
+    }
     let active;
 
     function profileFor(profileId) {
@@ -798,7 +853,15 @@ function createPluginModelDownloadService(options) {
                 totalBytes: profile.totalBytes,
             });
             try {
-                await downloadArtifact({ artifact, store, lookup, request, signal: controller.signal, progress });
+                await downloadArtifact({
+                    artifact,
+                    store,
+                    lookup,
+                    lookupTimeoutMs,
+                    request,
+                    signal: controller.signal,
+                    progress,
+                });
             } catch (error) {
                 const stable = safeError(error);
                 if (!stable.keepPartial) await safeRemove(store, artifact.name);
@@ -905,13 +968,15 @@ function createPluginModelDownloadService(options) {
             }
             let lease = operation.leases.get(principalId);
             const samePrincipal = Boolean(lease);
-            if (!lease) lease = createLease(operation, principalId);
             if (observer) {
                 const observerCount = [...operation.leases.values()]
                     .reduce((sum, value) => sum + value.observers.size, 0);
                 if (observerCount >= MAX_OBSERVERS) {
                     throw failure('ACTIVE_DOWNLOAD', 'Too many model progress observers');
                 }
+            }
+            if (!lease) lease = createLease(operation, principalId);
+            if (observer) {
                 lease.observers.add(observer);
                 if (operation.progress) notify(observer, operation.progress);
             }

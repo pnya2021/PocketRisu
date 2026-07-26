@@ -174,17 +174,20 @@ async function harness(options: {
     value?: Profile
     scripts?: ResponseScript[]
     addresses?: Array<{ address: string; family: 4 | 6 }>
+    lookup?: (...args: any[]) => Promise<unknown>
+    lookupTimeoutMs?: number
     store?: any
 } = {}) {
     const value = options.value ?? profile()
     const stored = options.store ? { root: '', store: options.store } : await makeStore(value)
     const network = scriptedNetwork(options.scripts ?? [])
-    const lookup = publicLookup(options.addresses)
+    const lookup = options.lookup ?? publicLookup(options.addresses)
     const { createPluginModelDownloadService } = require('./pluginModelDownload.cjs')
     const service = createPluginModelDownloadService({
         store: stored.store,
         registry: registry(value),
         lookup,
+        lookupTimeoutMs: options.lookupTimeoutMs,
         request: network.request,
     })
     return { ...stored, service, network, lookup, value }
@@ -377,6 +380,41 @@ describe('Pocket PixAI secure download service', () => {
         expect(await h.store.stat('tiny.bin')).toEqual({ state: 'absent', bytes: 0 })
     })
 
+    it('preserves an ETag partial after a transient DNS resolver error', async () => {
+        const lookup = vi.fn(async () => { throw new Error('temporary resolver failure') })
+        const h = await harness({ lookup })
+        const writer = await h.store.beginWrite('tiny.bin', { etag: '"tiny"' })
+        await writer.write(TINY_BYTES.subarray(0, 8))
+        await writer.abort({ keepPartial: true })
+
+        await expectCode(h.service.download(PROFILE_ID, PRINCIPAL_A).promise, 'NETWORK_ERROR')
+        expect(await h.store.stat('tiny.bin')).toMatchObject({
+            state: 'partial',
+            bytes: 8,
+            etag: '"tiny"',
+        })
+    })
+
+    it('bounds a hung DNS lookup and preserves an ETag partial on timeout', async () => {
+        const lookup = vi.fn(() => new Promise(() => undefined))
+        const h = await harness({ lookup, lookupTimeoutMs: 20 })
+        const writer = await h.store.beginWrite('tiny.bin', { etag: '"tiny"' })
+        await writer.write(TINY_BYTES.subarray(0, 8))
+        await writer.abort({ keepPartial: true })
+        const started = h.service.download(PROFILE_ID, PRINCIPAL_A)
+
+        const outcome = await Promise.race([
+            started.promise.then(
+                () => 'resolved',
+                (error: any) => error?.code,
+            ),
+            new Promise((resolve) => setTimeout(() => resolve('hung'), 250)),
+        ])
+        expect(outcome).toBe('NETWORK_ERROR')
+        expect(await h.store.stat('tiny.bin')).toMatchObject({ state: 'partial', bytes: 8 })
+        expect(h.network.calls).toHaveLength(0)
+    })
+
     it('never forwards a hostile persisted ETag and restarts from zero', async () => {
         const h = await harness({
             scripts: [{ headers: [['Content-Length', '26']], chunks: [TINY_BYTES] }],
@@ -516,6 +554,61 @@ describe('Pocket PixAI secure download service', () => {
         const already = h.service.download(PROFILE_ID, PRINCIPAL_A)
         expect(already.joined).toBe(false)
         await expect(already.promise).resolves.toMatchObject({ state: 'verified' })
+    })
+
+    it('settles a last-lease cancellation during hung DNS and ignores its late answer', async () => {
+        let resolveFirst!: (value: Array<{ address: string; family: 4 }>) => void
+        const lookup = vi.fn()
+            .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve }))
+            .mockResolvedValue([{ address: '93.184.216.34', family: 4 }])
+        const h = await harness({
+            lookup,
+            scripts: [{ headers: [['Content-Length', '26']], chunks: [TINY_BYTES] }],
+        })
+        const first = h.service.download(PROFILE_ID, PRINCIPAL_A)
+        await vi.waitFor(() => expect(lookup).toHaveBeenCalledTimes(1))
+
+        expect(h.service.cancel(PROFILE_ID, PRINCIPAL_A)).toBe(true)
+        await expectCode(first.promise, 'ABORTED')
+        await new Promise((resolve) => setImmediate(resolve))
+        await expect(h.service.remove(PROFILE_ID)).resolves.toEqual({ purgedBytes: 0 })
+
+        const second = h.service.download(PROFILE_ID, PRINCIPAL_B)
+        resolveFirst([{ address: '93.184.216.34', family: 4 }])
+        await expect(second.promise).resolves.toEqual({ state: 'verified', bytes: 26 })
+        expect(lookup).toHaveBeenCalledTimes(2)
+        expect(h.network.calls).toHaveLength(1)
+    })
+
+    it('rejects a 65th observer without creating a ghost principal lease', async () => {
+        const h = await harness({
+            scripts: [{
+                headers: [['ETag', '"tiny"']],
+                start() { /* keep the transfer open */ },
+            }],
+        })
+        const principals = Array.from({ length: 64 }, (_, index) => (
+            `aaaaaaaa-aaaa-4aaa-8aaa-${index.toString(16).padStart(12, '0')}`
+        ))
+        const handles = principals.map((principal) => (
+            h.service.download(PROFILE_ID, principal, () => undefined)
+        ))
+        const outcomes = handles.map((handle: any) => handle.promise.catch((error: unknown) => error))
+        await vi.waitFor(() => expect(h.network.requests).toHaveLength(1))
+
+        const rejectedPrincipal = 'aaaaaaaa-aaaa-4aaa-8aaa-000000000040'
+        expect(() => h.service.download(PROFILE_ID, rejectedPrincipal, () => undefined))
+            .toThrowError(expect.objectContaining({ code: 'ACTIVE_DOWNLOAD' }))
+        const rejectedCancel = h.service.cancel(PROFILE_ID, rejectedPrincipal)
+        for (const principal of principals) expect(h.service.cancel(PROFILE_ID, principal)).toBe(true)
+        const errors = await Promise.all(outcomes)
+
+        expect(rejectedCancel).toBe(false)
+        expect(errors.every((error: any) => error?.code === 'ABORTED')).toBe(true)
+        await vi.waitFor(() => expect(h.network.requests[0].destroyed).toBe(true))
+        await vi.waitFor(async () => {
+            await expect(h.service.remove(PROFILE_ID)).resolves.toHaveProperty('purgedBytes')
+        })
     })
 
     it('aborts the request for the last cancelled lease and preserves an ETag partial', async () => {
