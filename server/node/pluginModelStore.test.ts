@@ -239,6 +239,46 @@ describe('Pocket server model artifact store', () => {
         expect(await collect(readable.chunks({ chunkSize: 5 }))).toEqual(TINY_BYTES)
     })
 
+    it('rejects an oversized corrupt partial while reporting its status', async () => {
+        const { root, store } = await createTinyStore()
+        await store.stat('tiny.bin')
+        await fs.writeFile(
+            path.join(root, `${TINY_DIGEST}.partial`),
+            Buffer.alloc(TINY_BYTES.byteLength + 1),
+        )
+
+        await expect(store.stat('tiny.bin')).rejects.toThrow(/length|size|manifest/i)
+    })
+
+    it('rejects an oversized corrupt partial before yielding file bytes', async () => {
+        const root = await makeRoot()
+        let partialOpens = 0
+        const guardedFs = {
+            ...fs,
+            async open(...args: Parameters<typeof fs.open>) {
+                if (String(args[0]).endsWith('.partial')) partialOpens += 1
+                return fs.open(...args)
+            },
+        } as typeof fs
+        const { store } = await createTinyStore({ root, fs: guardedFs })
+        await store.stat('tiny.bin')
+        await fs.writeFile(
+            path.join(root, `${TINY_DIGEST}.partial`),
+            Buffer.alloc(TINY_BYTES.byteLength + 1),
+        )
+        let yieldedBytes = 0
+
+        const read = async () => {
+            for await (const chunk of store.readPartial('tiny.bin', { chunkSize: 3 })) {
+                yieldedBytes += chunk.byteLength
+            }
+        }
+
+        await expect(read()).rejects.toThrow(/length|size|manifest/i)
+        expect(yieldedBytes).toBe(0)
+        expect(partialOpens).toBe(0)
+    })
+
     it('accepts the maximum chunk and rejects one-over chunk and aggregate lengths', async () => {
         const { MAX_MODEL_ARTIFACT_CHUNK_BYTES, createPluginModelStore } = storeModule()
         const root = await makeRoot()
@@ -302,6 +342,26 @@ describe('Pocket server model artifact store', () => {
 
         const exact = await writeTiny(store)
         await expect(exact.commit(TINY_DIGEST)).resolves.toBeUndefined()
+    })
+
+    it('keeps a successful commit intact when abort is called afterward', async () => {
+        const { root, store } = await createTinyStore()
+        const writer = await writeTiny(store)
+        await writer.commit(TINY_DIGEST)
+        const metadataPath = path.join(root, `${TINY_DIGEST}.json`)
+        const metadata = await fs.readFile(metadataPath)
+
+        await expect(writer.abort({ keepPartial: false })).resolves.toBeUndefined()
+        await expect(writer.abort({ keepPartial: true })).resolves.toBeUndefined()
+
+        expect(await fs.readFile(metadataPath)).toEqual(metadata)
+        expect(await store.stat('tiny.bin')).toEqual({
+            state: 'verified',
+            bytes: TINY_BYTES.byteLength,
+            etag: 'tiny-etag',
+        })
+        const readable = await store.openVerified('tiny.bin')
+        expect(await collect(readable.chunks({ chunkSize: 4 }))).toEqual(TINY_BYTES)
     })
 
     it('preserves the primary rename failure as a resumable partial', async () => {
@@ -401,6 +461,30 @@ describe('Pocket server model artifact store', () => {
         roots.add(linkedRoot)
         const linked = storeModule().createPluginModelStore({ root: linkedRoot, manifest: TINY_MANIFEST })
         await expect(linked.stat('tiny.bin')).rejects.toThrow(/symbolic|link/i)
+    })
+
+    it('rejects a root renamed and replaced by a directory link after initial use', async () => {
+        const { root, store } = await createTinyStore()
+        const outside = await makeRoot()
+        const original = `${root}-original`
+        roots.add(original)
+        await store.stat('tiny.bin')
+        await fs.rename(root, original)
+        await fs.symlink(outside, root, process.platform === 'win32' ? 'junction' : 'dir')
+
+        let failure: unknown
+        let unexpectedWriter: Awaited<ReturnType<Store['beginWrite']>> | undefined
+        try {
+            unexpectedWriter = await store.beginWrite('tiny.bin')
+        } catch (error) {
+            failure = error
+        }
+        if (unexpectedWriter) await unexpectedWriter.abort({ keepPartial: false })
+
+        expect(unexpectedWriter).toBeUndefined()
+        expect(failure).toBeInstanceOf(Error)
+        expect(String(failure)).toMatch(/root|link|identity/i)
+        expect(await fs.readdir(outside)).toEqual([])
     })
 
     it('keeps independent injected roots isolated for the same digest', async () => {

@@ -236,6 +236,18 @@ function createPluginModelStore(options) {
     const active = new Set();
     let rootReady;
 
+    async function rootIdentity() {
+        const info = await io.lstat(root);
+        if (info.isSymbolicLink() || !info.isDirectory()) {
+            fail('Model artifact root must not be a symbolic link');
+        }
+        const real = path.resolve(await io.realpath(root));
+        const expected = process.platform === 'win32' ? root.toLowerCase() : root;
+        const actual = process.platform === 'win32' ? real.toLowerCase() : real;
+        if (actual !== expected) fail('Model artifact root must not resolve through a link');
+        return { device: info.dev, inode: info.ino };
+    }
+
     function artifactFor(value) {
         if (typeof value !== 'string') fail('Unknown model artifact');
         const artifact = artifacts.get(value);
@@ -260,20 +272,18 @@ function createPluginModelStore(options) {
         if (!rootReady) {
             rootReady = (async () => {
                 await io.mkdir(root, { recursive: true });
-                const info = await io.lstat(root);
-                if (info.isSymbolicLink() || !info.isDirectory()) {
-                    fail('Model artifact root must not be a symbolic link');
-                }
-                const real = path.resolve(await io.realpath(root));
-                const expected = process.platform === 'win32' ? root.toLowerCase() : root;
-                const actual = process.platform === 'win32' ? real.toLowerCase() : real;
-                if (actual !== expected) fail('Model artifact root must not resolve through a link');
+                return rootIdentity();
             })();
         }
-        return rootReady;
+        const expected = await rootReady;
+        const current = await rootIdentity();
+        if (current.device !== expected.device || current.inode !== expected.inode) {
+            fail('Model artifact root identity changed');
+        }
     }
 
     async function safeFileStat(file) {
+        await ensureRoot();
         let info;
         try {
             info = await io.lstat(file);
@@ -293,6 +303,7 @@ function createPluginModelStore(options) {
         const info = await safeFileStat(file);
         if (!info) return;
         try {
+            await ensureRoot();
             await io.unlink(file);
         } catch (error) {
             if (!isNotFound(error)) throw error;
@@ -338,6 +349,7 @@ function createPluginModelStore(options) {
         const info = await safeFileStat(paths.metadata);
         if (!info) return undefined;
         if (info.size > MAX_METADATA_BYTES) return undefined;
+        await ensureRoot();
         const handle = await io.open(paths.metadata, 'r');
         try {
             const opened = await handle.stat();
@@ -369,6 +381,7 @@ function createPluginModelStore(options) {
         if (Buffer.byteLength(value, 'utf8') > MAX_METADATA_BYTES) {
             fail('Model artifact metadata exceeds its limit');
         }
+        await ensureRoot();
         await io.writeFile(paths.metadata, value, {
             encoding: 'utf8',
             flag: 'w',
@@ -422,6 +435,9 @@ function createPluginModelStore(options) {
         }
         const file = current.partial ?? current.data;
         if (file) {
+            if (current.partial && current.partial.size > artifact.bytes) {
+                fail('Model artifact file size exceeds the manifest length');
+            }
             return {
                 status: {
                     state: 'partial',
@@ -442,18 +458,25 @@ function createPluginModelStore(options) {
         await safeUnlink(paths.metadata);
     }
 
-    async function *readChunks(file, chunkSize, expectedBytes) {
+    async function *readChunks(file, chunkSize, expectedBytes, maximumBytes) {
         const before = await safeFileStat(file);
         if (!before) fail('Model artifact file is absent');
         if (expectedBytes !== undefined && before.size !== expectedBytes) {
             fail('Model artifact file size does not match verified metadata');
         }
+        if (maximumBytes !== undefined && before.size > maximumBytes) {
+            fail('Model artifact file size exceeds the manifest length');
+        }
+        await ensureRoot();
         const handle = await io.open(file, 'r');
         let offset = 0;
         try {
             const opened = await handle.stat();
             if (!opened.isFile() || opened.size !== before.size) {
                 fail('Model artifact file changed before reading');
+            }
+            if (maximumBytes !== undefined && opened.size > maximumBytes) {
+                fail('Model artifact file size exceeds the manifest length');
             }
             while (offset < opened.size) {
                 const length = Math.min(chunkSize, opened.size - offset);
@@ -465,6 +488,9 @@ function createPluginModelStore(options) {
             }
             const after = await handle.stat();
             if (after.size !== opened.size) fail('Model artifact file changed during reading');
+            if (maximumBytes !== undefined && after.size > maximumBytes) {
+                fail('Model artifact file size exceeds the manifest length');
+            }
         } finally {
             await handle.close();
         }
@@ -514,6 +540,7 @@ function createPluginModelStore(options) {
 
             if (resumable && !current.partial && current.data) {
                 try {
+                    await ensureRoot();
                     await io.rename(current.paths.data, current.paths.partial);
                 } catch {
                     resumable = false;
@@ -527,9 +554,11 @@ function createPluginModelStore(options) {
             }
 
             const paths = current.paths;
+            await ensureRoot();
             const handle = await io.open(paths.partial, resumable ? 'a' : 'w');
             let closed = false;
             let aborted = false;
+            let committed = false;
             try {
                 await writeMetadata(artifact, paths, 'partial', options.etag);
             } catch (error) {
@@ -593,12 +622,15 @@ function createPluginModelStore(options) {
                     try {
                         await handle.sync();
                         await closeOnce();
+                        await ensureRoot();
                         await io.rename(paths.partial, paths.data);
                         try {
                             await writeMetadata(artifact, paths, 'verified', options.etag);
+                            committed = true;
                         } catch (error) {
                             primary = error;
                             try {
+                                await ensureRoot();
                                 await io.rename(paths.data, paths.partial);
                             } catch {
                                 // A data file with partial metadata is never advertised as verified.
@@ -617,7 +649,7 @@ function createPluginModelStore(options) {
                 },
 
                 async abort(abortOptions) {
-                    if (aborted) return;
+                    if (aborted || committed) return;
                     const keepPartial = validateAbortOptions(abortOptions);
                     aborted = true;
                     let primary;
@@ -654,7 +686,7 @@ function createPluginModelStore(options) {
             const { status, current } = await statusFor(artifact);
             if (status.state !== 'partial') fail('Model artifact partial data is absent');
             const file = current.partial ? current.paths.partial : current.paths.data;
-            yield* readChunks(file, chunkSize);
+            yield* readChunks(file, chunkSize, undefined, artifact.bytes);
         },
 
         async openVerified(name) {
