@@ -43,6 +43,21 @@ export async function writePersistentJson<T>(storageKey: string, value: T): Prom
     await forageStorage.setItem(storageKey, encoder.encode(JSON.stringify(value)));
 }
 
+export async function readPersistentBytes(storageKey: string): Promise<Uint8Array | null> {
+    await ensureStorageReady();
+    const data = await forageStorage.getItem(storageKey) as Uint8Array | null;
+    if (data === null || data === undefined) {
+        const keys = await forageStorage.keys(storageKey);
+        return keys.includes(storageKey) ? new Uint8Array() : null;
+    }
+    return new Uint8Array(data);
+}
+
+export async function writePersistentBytes(storageKey: string, value: Uint8Array): Promise<void> {
+    await ensureStorageReady();
+    await forageStorage.setItem(storageKey, new Uint8Array(value));
+}
+
 export async function removePersistentKey(storageKey: string): Promise<void> {
     await ensureStorageReady();
     await forageStorage.removeItem(storageKey);

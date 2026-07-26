@@ -55,6 +55,7 @@ import { getInlayAssetRecord, removeInlayAsset, writeInlayImageFromBytes } from 
 import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustration/inlayLifecycle';
 import { createPocketInlayLifecycleAdapter } from './illustration/inlayLifecycle.pocket';
 import { NodeStorage } from 'src/ts/storage/nodeStorage';
+import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/deviceCache';
 
 /*
     V3 API for RisuAI Plugins
@@ -643,6 +644,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }),
         },
     )
+    const deviceCache = new DeviceCacheService(context)
     const pluginStorageMutations = createOwnedSyncStorageMutations({
         storage: oldApis.pluginStorage,
         canMutate: canRegisterResource,
@@ -781,6 +783,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         saveAsset: oldApis.saveAsset,
         createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
         deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
+        putDeviceCacheEntry: (input) => deviceCache.putDeviceCacheEntry(input),
+        getDeviceCacheEntry: (key) => deviceCache.getDeviceCacheEntry(key),
+        listDeviceCacheEntries: (options) => deviceCache.listDeviceCacheEntries(options),
+        deleteDeviceCacheEntry: (key, options) => deviceCache.deleteDeviceCacheEntry(key, options),
+        clearDeviceCache: (options) => deviceCache.clearDeviceCache(options),
         //Same functionality, but new implementation
         getDatabase: async (includeOnly:string[]|'all' = 'all') => {
             const conf = await getPluginPermission(context, 'db', 'periodically');
@@ -1265,6 +1272,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.assets.v1',
                     'context.modules-installed.v1',
                     ...INLAY_LIFECYCLE_CAPABILITY_IDS,
+                    ...DEVICE_CACHE_CAPABILITY_IDS,
                 ]),
                 hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
             },
