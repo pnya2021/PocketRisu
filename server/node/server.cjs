@@ -33,9 +33,14 @@ const {
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
 const { repairDuplicateCharacterIds, repairChatIdsBeforeIndexing } = require('./groupPersistence.cjs');
+const { createPluginModelStore } = require('./pluginModelStore.cjs');
+const { createPluginModelDownloadService, registerPluginModelRoutes } = require('./pluginModelDownload.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
+
+const pluginModelStore = createPluginModelStore({ root: path.join(process.cwd(), 'model-cache') });
+const pluginModelDownloads = createPluginModelDownloadService({ store: pluginModelStore });
 
 // Install process-level error handlers before any other init so early crashes get logged.
 installProcessHandlers();
@@ -2535,6 +2540,13 @@ async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = fal
         return false
     }
 }
+
+registerPluginModelRoutes({
+    app,
+    service: pluginModelDownloads,
+    checkAuth,
+    checkActiveSession,
+});
 
 const reverseProxyFunc = async (req, res, next) => {
     if(!await checkAuth(req, res)){
@@ -5837,7 +5849,7 @@ app.post('/api/self-update', async (req, res) => {
         } catch { /* no user certs */ }
 
         // Keep set — matches updater.cjs + user data/config that must survive updates
-        const keep = new Set(['save', 'backups', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
+        const keep = new Set(['save', 'backups', 'model-cache', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
         if (isWin) keep.add('bin');
 
         // Phase 1: move old files to backup — rollback immediately on any failure
@@ -5860,7 +5872,7 @@ app.post('/api/self-update', async (req, res) => {
         }
 
         // Phase 2: move new files from extracted to app root
-        const skipMove = new Set(['save', 'scripts']);
+        const skipMove = new Set(['save', 'scripts', 'model-cache']);
         if (isWin) skipMove.add('bin');
         const moved = [];
         try {

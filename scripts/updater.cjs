@@ -267,7 +267,7 @@ async function main() {
 
     // Phase 1: move old files to backup (safer than immediate delete)
     log('Replacing files...');
-    const keep = new Set(['save', 'backups', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
+    const keep = new Set(['save', 'backups', 'model-cache', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
     if (isWin || skipBinReplacement) keep.add('bin');
     const customBackupKeep = getCustomBackupKeepEntry();
     if (customBackupKeep && !keep.has(customBackupKeep)) {
@@ -293,7 +293,7 @@ async function main() {
 
     // Phase 2: move new files from extracted to root
     const moved = [];
-    const skipMove = new Set(['save', 'scripts']);
+    const skipMove = new Set(['save', 'scripts', 'model-cache']);
     if (isWin || skipBinReplacement) skipMove.add('bin');
     try {
         for (const entry of fs.readdirSync(extractedRoot)) {
