@@ -99,6 +99,24 @@
 // MCP Types
 // ============================================================================
 
+interface OwnedInlayDescriptor {
+    id: string;
+    revision: string;
+    name: string;
+}
+
+interface OwnedInlayCreateOptions {
+    name?: string;
+    idempotencyKey: string;
+    context: { kind: 'character'; characterId: string };
+    return: 'descriptor';
+}
+
+interface OwnedInlayDeleteResult {
+    deleted: boolean;
+    reason?: 'not-found' | 'referenced';
+}
+
 /**
  * MCP tool definition
  */
@@ -1943,6 +1961,12 @@ interface RisuaiPluginAPI {
      * @returns Saved asset path
      */
     saveAsset(data: any): Promise<string>;
+
+    /** Creates an image Inlay owned by this plugin in the current character context. */
+    createInlay(data: Uint8Array, options: OwnedInlayCreateOptions): Promise<OwnedInlayDescriptor>;
+
+    /** Deletes an unreferenced Inlay owned by this plugin. */
+    deleteInlay(id: string, options?: { expectedRevision?: string }): Promise<OwnedInlayDeleteResult>;
 
     // ========== Plugin Management ==========
 

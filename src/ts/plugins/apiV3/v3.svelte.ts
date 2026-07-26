@@ -51,6 +51,10 @@ import { createOwnedSyncStorageMutations } from '../ownedSyncStorage';
 import { ContextResourceService } from './illustration/contextResources';
 import { createPocketContextResourceAdapter } from './illustration/contextResources.pocket';
 import { ensureCurrentChatReady } from 'src/ts/storage/chatStorage';
+import { getInlayAssetRecord, removeInlayAsset, writeInlayImageFromBytes } from 'src/ts/process/files/inlays';
+import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustration/inlayLifecycle';
+import { createPocketInlayLifecycleAdapter } from './illustration/inlayLifecycle.pocket';
+import { NodeStorage } from 'src/ts/storage/nodeStorage';
 
 /*
     V3 API for RisuAI Plugins
@@ -622,6 +626,23 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }),
         },
     )
+    const inlayNodeStorage = new NodeStorage()
+    const inlayLifecycle = new InlayLifecycleService(
+        context,
+        createPocketInlayLifecycleAdapter({
+            getDatabase,
+            getCurrentCharacter,
+            fetchChatContent: (chaId, chatIndex, chatId) => inlayNodeStorage.fetchChatContent(chaId, chatIndex, chatId),
+            getInlayAssetRecord,
+            writeInlayImageFromBytes,
+            removeInlayAsset,
+        }),
+        {
+            require: (executionContext, permission) => pluginPermissionService.require(executionContext, permission, {
+                locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+            }),
+        },
+    )
     const pluginStorageMutations = createOwnedSyncStorageMutations({
         storage: oldApis.pluginStorage,
         canMutate: canRegisterResource,
@@ -758,6 +779,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         readImage: oldApis.readImage,
         saveAsset: oldApis.saveAsset,
+        createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
+        deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
         //Same functionality, but new implementation
         getDatabase: async (includeOnly:string[]|'all' = 'all') => {
             const conf = await getPluginPermission(context, 'db', 'periodically');
@@ -1241,6 +1264,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.current.v1',
                     'context.assets.v1',
                     'context.modules-installed.v1',
+                    ...INLAY_LIFECYCLE_CAPABILITY_IDS,
                 ]),
                 hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
             },

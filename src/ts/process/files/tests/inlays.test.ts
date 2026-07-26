@@ -1,9 +1,10 @@
 import fc from 'fast-check'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
-import type { InlayAsset } from '../inlays'
+import type { InlayAsset, InlayLifecycleMetadata } from '../inlays'
 import {
     getInlayAsset,
     getInlayAssetBlob,
+    getInlayAssetRecord,
     getCharacterChatIndex,
     listInlayAssets,
     listInlayExplorerItems,
@@ -11,6 +12,8 @@ import {
     removeInlayAsset,
     setInlayAsset,
     writeInlayImage,
+    writeInlayImageFromBytes,
+    InlayImageDecodeError,
     __resetInlayStorageForTest,
 } from '../inlays'
 
@@ -32,22 +35,24 @@ vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: a
     return el
 })
 
-const { nodeStorageMap, inlayMetaMap } = vi.hoisted(() => ({
+const { nodeStorageMap, inlayMetaMap, storageControl } = vi.hoisted(() => ({
     nodeStorageMap: new Map<string, Uint8Array>(),
     inlayMetaMap: new Map<string, any>(),
+    storageControl: { failSet: null as Error | null, skipRemove: false },
 }))
 
 vi.mock('src/ts/storage/nodeStorage', () => {
     class MockNodeStorage {
         authChecked = true
         async setItem(key: string, value: Uint8Array) {
+            if (storageControl.failSet) throw storageControl.failSet
             nodeStorageMap.set(key, value)
         }
         async getItem(key: string) {
             return nodeStorageMap.get(key) ?? null
         }
         async removeItem(key: string) {
-            nodeStorageMap.delete(key)
+            if (!storageControl.skipRemove) nodeStorageMap.delete(key)
         }
         async keys(prefix = '') {
             const ks = [...nodeStorageMap.keys()]
@@ -134,6 +139,8 @@ beforeEach(() => {
     vi.clearAllMocks()
     nodeStorageMap.clear()
     inlayMetaMap.clear()
+    storageControl.failSet = null
+    storageControl.skipRemove = false
     getDatabaseMock.mockReturnValue({ characters: [] })
     __resetInlayStorageForTest()
 })
@@ -225,6 +232,68 @@ describe('getInlayAsset', () => {
 
         const result = await getInlayAsset('str-id')
         expect(result!.data).toBe(b64)
+    })
+})
+
+describe('owned lifecycle storage seam', () => {
+    const lifecycle: InlayLifecycleMetadata = {
+        version: 1,
+        ownerPrincipalId: 'principal-1',
+        operation: 'inlay.create.v1',
+        idempotencyKey: 'create-1',
+        argumentDigest: 'a'.repeat(64),
+        revision: `sha256:${'b'.repeat(64)}`,
+        context: { kind: 'character', characterId: 'character-1' },
+    }
+
+    test('persists lifecycle metadata atomically while projecting it out of every public read', async () => {
+        await setInlayAsset('owned-id', {
+            data: new Blob(['owned']), ext: 'png', name: 'owned.png', type: 'image', lifecycle,
+        })
+
+        const serialized = JSON.parse(new TextDecoder().decode(nodeStorageMap.get('inlay/owned-id')!))
+        expect(serialized.lifecycle).toEqual(lifecycle)
+        expect(await getInlayAssetRecord('owned-id')).toMatchObject({ lifecycle })
+        expect(await getInlayAsset('owned-id')).not.toHaveProperty('lifecycle')
+        expect(await getInlayAssetBlob('owned-id')).not.toHaveProperty('lifecycle')
+        expect((await listInlayAssets())[0][1]).not.toHaveProperty('lifecycle')
+        expect((await listInlayExplorerItems(true))[0]).not.toHaveProperty('lifecycle')
+    })
+
+    test('maps byte decode errors and always revokes the temporary object URL', async () => {
+        const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:bad-image')
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+        const OriginalImage = globalThis.Image
+        class FailingImage {
+            width = 0
+            height = 0
+            onload: null | (() => void) = null
+            onerror: null | (() => void) = null
+            set src(_value: string) { queueMicrotask(() => this.onerror?.()) }
+        }
+        vi.stubGlobal('Image', FailingImage)
+        try {
+            await expect(writeInlayImageFromBytes(new Uint8Array([0]), { id: 'bad-id' }))
+                .rejects.toBeInstanceOf(InlayImageDecodeError)
+        } finally {
+            vi.stubGlobal('Image', OriginalImage)
+        }
+
+        expect(createObjectURL).toHaveBeenCalledOnce()
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:bad-image')
+        expect(nodeStorageMap.has('inlay/bad-id')).toBe(false)
+    })
+
+    test('confirms the primary asset is absent before reporting deletion', async () => {
+        await setInlayAsset('retained', { data: new Blob(['x']), ext: 'png', name: 'x.png', type: 'image', lifecycle })
+        storageControl.skipRemove = true
+
+        await expect(removeInlayAsset('retained')).resolves.toBe(false)
+        expect(await getInlayAssetRecord('retained')).not.toBeNull()
+
+        storageControl.skipRemove = false
+        await expect(removeInlayAsset('retained')).resolves.toBe(true)
+        expect(await getInlayAssetRecord('retained')).toBeNull()
     })
 })
 

@@ -23,6 +23,24 @@ export type InlayAsset = {
     width?: number
 }
 
+export type InlayLifecycleMetadata = {
+    version: 1
+    ownerPrincipalId: string
+    operation: 'inlay.create.v1'
+    idempotencyKey: string
+    argumentDigest: string
+    revision: string
+    context: { kind: 'character'; characterId: string }
+}
+
+export type InlayAssetRecord = InlayAsset & {
+    lifecycle?: InlayLifecycleMetadata
+}
+
+export class InlayImageDecodeError extends Error {
+    readonly name = 'InlayImageDecodeError'
+}
+
 /** Serialized form for server storage (Blob → base64 string) */
 type SerializedInlayAsset = {
     data: string
@@ -31,6 +49,7 @@ type SerializedInlayAsset = {
     name: string
     type: 'image' | 'video' | 'audio' | 'signature'
     width?: number
+    lifecycle?: InlayLifecycleMetadata
 }
 
 export type InlayExplorerInfo = {
@@ -171,7 +190,7 @@ class NodeInlayStorage {
         return `${INLAY_PREFIX}${id}`
     }
 
-    private async serializeAsset(asset: InlayAsset): Promise<Uint8Array> {
+    private async serializeAsset(asset: InlayAssetRecord): Promise<Uint8Array> {
         let dataStr: string
         if (asset.data instanceof Blob) {
             dataStr = await blobToBase64(asset.data)
@@ -185,11 +204,12 @@ class NodeInlayStorage {
             name: asset.name,
             type: asset.type,
             width: asset.width,
+            ...(asset.lifecycle ? { lifecycle: { ...asset.lifecycle, context: { ...asset.lifecycle.context } } } : {}),
         }
         return new TextEncoder().encode(JSON.stringify(serialized))
     }
 
-    private deserializeAsset(buf: Buffer): InlayAsset {
+    private deserializeAsset(buf: Buffer): InlayAssetRecord {
         const json: SerializedInlayAsset = JSON.parse(new TextDecoder().decode(buf))
         let data: string | Blob
         if (json.type !== 'signature' && json.data.startsWith('data:')) {
@@ -204,10 +224,11 @@ class NodeInlayStorage {
             name: json.name,
             type: json.type,
             width: json.width,
+            ...(json.lifecycle ? { lifecycle: { ...json.lifecycle, context: { ...json.lifecycle.context } } } : {}),
         }
     }
 
-    async setItem(id: string, asset: InlayAsset): Promise<void> {
+    async setItem(id: string, asset: InlayAssetRecord): Promise<void> {
         const bytes = await this.serializeAsset(asset)
         await this.nodeStorage.setItem(this.serverKey(id), bytes)
         lruSet(id, toCoreInlayAsset(asset))
@@ -228,6 +249,12 @@ class NodeInlayStorage {
         } catch {
             return null
         }
+    }
+
+    async getRawItem(id: string): Promise<InlayAssetRecord | null> {
+        const buf = await this.nodeStorage.getItem(this.serverKey(id))
+        if (!buf || buf.length === 0) return null
+        return this.deserializeAsset(buf)
     }
 
     async removeItem(id: string): Promise<void> {
@@ -435,36 +462,87 @@ export async function postInlayAsset(img: { name: string, data: Uint8Array }) {
     return null
 }
 
-export async function writeInlayImage(imgObj: HTMLImageElement, arg: { name?: string, ext?: string, id?: string } = {}) {
+type WriteInlayImageOptions = {
+    name?: string
+    ext?: string
+    id?: string
+    lifecycle?: InlayLifecycleMetadata
+    beforeStore?: () => void | Promise<void>
+}
+
+async function storeDecodedInlayImage(imgObj: HTMLImageElement, arg: WriteInlayImageOptions = {}) {
     let drawHeight = 0
     let drawWidth = 0
     const canvas = document.createElement('canvas')
     const ctx = canvas.getContext('2d')
-    await new Promise((resolve) => {
-        imgObj.onload = () => {
-            drawHeight = imgObj.height
-            drawWidth = imgObj.width
-            const maxPixels = 1024 * 1024
-            const currentPixels = drawHeight * drawWidth
-            if (currentPixels > maxPixels) {
-                const scaleFactor = Math.sqrt(maxPixels / currentPixels)
-                drawWidth = Math.floor(drawWidth * scaleFactor)
-                drawHeight = Math.floor(drawHeight * scaleFactor)
-            }
-            canvas.width = drawWidth
-            canvas.height = drawHeight
-            ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
-            resolve(null)
-        }
-    })
+    if (!ctx) throw new InlayImageDecodeError('Inlay canvas is unavailable')
+    drawHeight = imgObj.height
+    drawWidth = imgObj.width
+    if (!Number.isFinite(drawHeight) || !Number.isFinite(drawWidth) || drawHeight < 1 || drawWidth < 1) {
+        throw new InlayImageDecodeError('Decoded Inlay dimensions are invalid')
+    }
+    const maxPixels = 1024 * 1024
+    const currentPixels = drawHeight * drawWidth
+    if (currentPixels > maxPixels) {
+        const scaleFactor = Math.sqrt(maxPixels / currentPixels)
+        drawWidth = Math.floor(drawWidth * scaleFactor)
+        drawHeight = Math.floor(drawHeight * scaleFactor)
+    }
+    canvas.width = drawWidth
+    canvas.height = drawHeight
+    ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
     const db = getDatabase()
     const [mimeType, ext, quality]: [string, string, number?] = db.inlayImageLossless
         ? ['image/png', 'png', undefined]
         : ['image/webp', 'webp', 0.85]
-    const imageBlob = await new Promise<Blob>(resolve => canvas.toBlob(resolve, mimeType, quality))
+    const imageBlob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(
+        (blob) => blob ? resolve(blob) : reject(new InlayImageDecodeError('Inlay image encoding failed')),
+        mimeType,
+        quality,
+    ))
     const imgid = arg.id ?? v4()
-    await setInlayAsset(imgid, { name: arg.name ?? imgid, data: imageBlob, ext, height: drawHeight, width: drawWidth, type: 'image' })
+    await setInlayAsset(imgid, {
+        name: arg.name ?? imgid,
+        data: imageBlob,
+        ext,
+        height: drawHeight,
+        width: drawWidth,
+        type: 'image',
+        ...(arg.lifecycle ? { lifecycle: { ...arg.lifecycle, context: { ...arg.lifecycle.context } } } : {}),
+    }, { beforeStore: arg.beforeStore })
     return `${imgid}`
+}
+
+export async function writeInlayImage(imgObj: HTMLImageElement, arg: WriteInlayImageOptions = {}) {
+    await new Promise<void>((resolve, reject) => {
+        imgObj.onload = () => resolve()
+        imgObj.onerror = () => reject(new InlayImageDecodeError('Unable to decode Inlay image'))
+    })
+    return storeDecodedInlayImage(imgObj, arg)
+}
+
+export async function writeInlayImageFromBytes(
+    data: Uint8Array,
+    arg: WriteInlayImageOptions & { maxDecodedPixels?: number } = {},
+) {
+    const copy = data.slice()
+    const image = new Image()
+    const objectUrl = URL.createObjectURL(new Blob([asBuffer(copy)], { type: `image/${arg.ext ?? 'png'}` }))
+    try {
+        await new Promise<void>((resolve, reject) => {
+            image.onload = () => resolve()
+            image.onerror = () => reject(new InlayImageDecodeError('Unable to decode Inlay image'))
+            image.src = objectUrl
+        })
+        const decodedPixels = image.width * image.height
+        if (!Number.isSafeInteger(decodedPixels) || decodedPixels < 1
+            || decodedPixels > (arg.maxDecodedPixels ?? 64_000_000)) {
+            throw new InlayImageDecodeError('Decoded Inlay exceeds the pixel limit')
+        }
+        return await storeDecodedInlayImage(image, arg)
+    } finally {
+        URL.revokeObjectURL(objectUrl)
+    }
 }
 
 export type InlaySignature = {
@@ -501,6 +579,10 @@ export async function getInlayAsset(id: string) {
         await getInlayInfoStorage().setItem(id, buildInlayExplorerInfo(toCoreInlayAsset(img)))
     }
     return { ...toCoreInlayAsset(img), data }
+}
+
+export async function getInlayAssetRecord(id: string) {
+    return await getInlayStorage().getRawItem(id)
 }
 
 // Returns with Blob
@@ -597,10 +679,15 @@ export async function listInlayExplorerItems(forceRefresh = false): Promise<Inla
     return items
 }
 
-export async function setInlayAsset(id: string, img: InlayAsset) {
+export async function setInlayAsset(
+    id: string,
+    img: InlayAssetRecord,
+    options: { beforeStore?: () => void | Promise<void> } = {},
+) {
     const existingMeta = await getInlayMeta(id)
     const nextMeta = buildInlayMeta(existingMeta)
-    await getInlayStorage().setItem(id, toCoreInlayAsset(img))
+    await options.beforeStore?.()
+    await getInlayStorage().setItem(id, img)
     await getInlayInfoStorage().setItem(id, buildInlayExplorerInfo(toCoreInlayAsset(img)))
     await setInlayMeta(id, nextMeta)
     _explorerItemsCache = null // invalidate gallery cache
@@ -608,9 +695,11 @@ export async function setInlayAsset(id: string, img: InlayAsset) {
 
 export async function removeInlayAsset(id: string) {
     await getInlayStorage().removeItem(id)
+    const removed = await getInlayStorage().getRawItem(id) === null
     await getInlayInfoStorage().removeItem(id)
     await removeInlayMeta(id)
     _explorerItemsCache = null // invalidate gallery cache
+    return removed
 }
 
 export async function removeInlayAssets(ids: string[]): Promise<number> {
@@ -619,8 +708,7 @@ export async function removeInlayAssets(ids: string[]): Promise<number> {
     for (const id of ids) {
         if (!id) continue
         try {
-            await removeInlayAsset(id)
-            removed++
+            if (await removeInlayAsset(id)) removed++
         } catch {
             // best-effort bulk delete
         }
