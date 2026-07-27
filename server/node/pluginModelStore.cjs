@@ -711,6 +711,17 @@ function createPluginModelStore(options) {
             });
         },
 
+        async openVerifiedFile(name) {
+            const artifact = artifactFor(name);
+            const { status, current } = await statusFor(artifact);
+            if (status.state !== 'verified') fail('Model artifact is not verified');
+            const dataPath = current.paths.data;
+            if (path.dirname(dataPath) !== root || !current.data || current.data.size !== artifact.bytes) {
+                fail('Model artifact is not verified');
+            }
+            return Object.freeze({ path: dataPath, size: artifact.bytes });
+        },
+
         async remove(name) {
             const artifact = artifactFor(name);
             await ensureRoot();

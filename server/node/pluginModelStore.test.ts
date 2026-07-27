@@ -33,6 +33,7 @@ type Store = {
         size: number
         chunks(options: { chunkSize: number }): AsyncIterable<Uint8Array>
     }>
+    openVerifiedFile(name: unknown): Promise<{ path: string; size: number }>
     remove(name: unknown): Promise<void>
 }
 
@@ -414,6 +415,26 @@ describe('Pocket server model artifact store', () => {
 
         expect(await store.stat('tiny.bin')).not.toMatchObject({ state: 'verified' })
         await expect(store.openVerified('tiny.bin')).rejects.toThrow(/verified|size|length/i)
+    })
+
+    it('opens only the committed verified data file without exposing its path through chunks', async () => {
+        const { root, store } = await createTinyStore()
+        const writer = await writeTiny(store)
+        await writer.commit(TINY_DIGEST)
+
+        const file = await store.openVerifiedFile('tiny.bin')
+        expect(file).toEqual({ path: path.join(root, `${TINY_DIGEST}.data`), size: TINY_BYTES.byteLength })
+        expect(Object.isFrozen(file)).toBe(true)
+        expect(await store.openVerified('tiny.bin')).not.toHaveProperty('path')
+    })
+
+    it('rejects a partial, corrupt, or symlinked file from the verified-file boundary', async () => {
+        const { root, store } = await createTinyStore()
+        await fs.writeFile(path.join(root, `${TINY_DIGEST}.partial`), TINY_BYTES)
+        await expect(store.openVerifiedFile('tiny.bin')).rejects.toThrow(/verified/i)
+        await fs.rm(path.join(root, `${TINY_DIGEST}.partial`))
+        await fs.symlink(path.join(root, 'outside'), path.join(root, `${TINY_DIGEST}.data`), 'file')
+        await expect(store.openVerifiedFile('tiny.bin')).rejects.toThrow(/symbolic|link|verified/i)
     })
 
     it('removes partial and verified state idempotently', async () => {

@@ -143,6 +143,9 @@ importers:
       ollama:
         specifier: ^0.5.18
         version: 0.5.18
+      onnxruntime-node:
+        specifier: 1.21.0
+        version: 1.21.0
       pdfjs-dist:
         specifier: ^4.10.38
         version: 4.10.38
@@ -161,6 +164,9 @@ importers:
       rfdc:
         specifier: ^1.4.1
         version: 1.4.1
+      sharp:
+        specifier: 0.34.5
+        version: 0.34.5
       sortablejs:
         specifier: ^1.15.6
         version: 1.15.6
