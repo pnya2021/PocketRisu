@@ -49,6 +49,21 @@ describe('Pocket PixAI private inference routes', () => {
         expect(h.broker.acquire).toHaveBeenCalledWith(expect.objectContaining({ principalId: PRINCIPAL, instanceId: INSTANCE, provider: 'auto' }))
     })
 
+    it('forwards request abort to an in-flight acquisition before a response is written', async () => {
+        const h = harness()
+        let finish!: () => void
+        h.broker.acquire.mockImplementation(() => new Promise((resolve) => { finish = () => resolve({ sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', provider: 'node' }) }))
+        const acquire = h.routes.get('POST /api/plugin-model-inference/:profileId/sessions')!
+        const req = request({ 'x-risu-plugin-principal-id': PRINCIPAL, 'x-risu-plugin-instance-id': INSTANCE, 'content-length': '0' })
+        const pending = acquire(req, response())
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        req.emit('aborted')
+        expect(h.broker.acquire).toHaveBeenCalledWith(expect.objectContaining({ signal: expect.any(AbortSignal) }))
+        expect(h.broker.acquire.mock.calls[0][0].signal.aborted).toBe(true)
+        finish()
+        await pending
+    })
+
     it('accepts only exact raw-image wire headers and bounded body before dispatch', async () => {
         const h = harness()
         const run = h.routes.get('POST /api/plugin-model-inference/:profileId/sessions/:sessionId/run')!

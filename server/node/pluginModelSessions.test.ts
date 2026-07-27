@@ -37,6 +37,14 @@ class ManualWorker extends EventEmitter {
     async terminate() { return 0 }
 }
 
+class DelayedInitWorker extends ManualWorker {
+    postMessage(message: any) {
+        this.messages.push(message)
+        if (message.type === 'probe') queueMicrotask(() => this.emit('message', { requestId: message.requestId, ok: true, value: { backendAvailable: true } }))
+    }
+    respondInitialize() { const init = this.messages.find((message) => message.type === 'initialize' && !this.replied.has(message.requestId)); this.replied.add(init.requestId); this.emit('message', { requestId: init.requestId, ok: true, value: { initialized: true } }) }
+}
+
 function store(state = 'verified') {
     return { stat: vi.fn(async () => ({ state, bytes: state === 'verified' ? 1 : 0 })) }
 }
@@ -157,6 +165,41 @@ describe('Pocket PixAI session broker', () => {
         first.emit('error', new Error('late old sentinel'))
         await sessions.acquire({ ...owner, instanceId: INSTANCE_B })
         expect(ManualWorker.instances).toHaveLength(2)
+        await sessions.dispose()
+    })
+
+    it('keeps a same-owner physical initialize coalesced while independently aborting one caller without a lease', async () => {
+        ManualWorker.instances = []
+        const sessions = broker({ Worker: DelayedInitWorker })
+        const owner = { principalId: PRINCIPAL_A, instanceId: INSTANCE_A, profileId: PROFILE, provider: 'node' }
+        const controller = new AbortController()
+        const first = sessions.acquire({ ...owner, signal: controller.signal })
+        const second = sessions.acquire(owner)
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        controller.abort()
+        const worker = ManualWorker.instances[0] as DelayedInitWorker
+        worker.respondInitialize()
+        await expect(first).rejects.toMatchObject({ code: 'ABORTED' })
+        await expect(second).resolves.toMatchObject({ provider: 'node' })
+        const lease = await second
+        await sessions.release({ ...owner, sessionId: lease.sessionId })
+        await sessions.dispose()
+    })
+
+    it('runs a pending removal after an aborted acquisition leaves no physical initializer', async () => {
+        ManualWorker.instances = []
+        const sessions = broker({ Worker: DelayedInitWorker })
+        const owner = { principalId: PRINCIPAL_A, instanceId: INSTANCE_A, profileId: PROFILE, provider: 'node' }
+        const controller = new AbortController()
+        const acquiring = sessions.acquire({ ...owner, signal: controller.signal })
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        const purge = vi.fn(async () => ({ purgedBytes: 3 }))
+        await expect(sessions.removeWithBarrier(PROFILE, purge)).resolves.toEqual({ purgedBytes: 0, pending: true })
+        controller.abort()
+        ManualWorker.instances[0].respondInitialize()
+        await expect(acquiring).rejects.toMatchObject({ code: 'ABORTED' })
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        expect(purge).toHaveBeenCalledTimes(1)
         await sessions.dispose()
     })
 })
