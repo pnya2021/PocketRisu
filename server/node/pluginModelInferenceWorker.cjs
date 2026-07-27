@@ -6,6 +6,7 @@ const { createPluginModelInference } = require('./pluginModelInference.cjs');
 
 let core;
 const active = new Map();
+const aborted = new Set();
 
 function safe(error) {
     const message = error && error.message;
@@ -41,12 +42,12 @@ parentPort.on('message', async (message) => {
             await initialize(); reply(requestId, true, { initialized: true });
         } else if (type === 'run') {
             if (!(message.image instanceof ArrayBuffer)) throw new Error();
-            await initialize();
             const controller = new AbortController(); active.set(requestId, controller);
-            try { reply(requestId, true, await core.run(Buffer.from(message.image), { ...(message.options ?? {}), signal: controller.signal })); }
-            finally { active.delete(requestId); }
+            if (aborted.has(requestId)) controller.abort();
+            try { await initialize(); reply(requestId, true, await core.run(Buffer.from(message.image), { ...(message.options ?? {}), signal: controller.signal })); }
+            finally { active.delete(requestId); aborted.delete(requestId); }
         } else if (type === 'abort') {
-            active.get(requestId)?.abort();
+            aborted.add(requestId); active.get(requestId)?.abort();
         } else if (type === 'dispose') {
             for (const controller of active.values()) controller.abort();
             await core?.dispose(); core = undefined; reply(requestId, true, { disposed: true });
