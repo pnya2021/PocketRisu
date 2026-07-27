@@ -1,4 +1,5 @@
 import { PluginApiError } from '../illustration/errors'
+import type { PluginApiErrorCode } from '../illustration/contracts'
 
 export const PIXAI_PROFILE = Object.freeze({
     id: 'pixai-tagger-v0.9-onnx',
@@ -28,6 +29,9 @@ export const PIXAI_PROFILE = Object.freeze({
 } as const)
 
 export type PixaiProfileId = typeof PIXAI_PROFILE.id
+export type PocketLocalModelProvider = 'auto' | 'webgpu' | 'wasm' | 'node'
+export type PocketLocalModelMediaType = 'image/jpeg' | 'image/png' | 'image/webp'
+export type PocketLocalModelCategory = 'general' | 'character'
 export type PocketModelArtifactState = 'absent' | 'partial' | 'verified'
 export type PocketModelProgressPhase = 'downloading' | 'verifying' | 'committing'
 
@@ -66,11 +70,71 @@ export interface PocketModelStatus {
     active?: PocketModelProgress
 }
 
+export interface PocketInferenceCapabilities {
+    backendAvailable: boolean
+    modelReady: boolean
+    reason?: string
+    providers: Record<'node' | 'webgpu' | 'wasm', { available: boolean }>
+}
+
+export interface PocketInferenceRunOptions {
+    thresholds?: { general?: number; character?: number }
+    categories?: PocketLocalModelCategory[]
+    maxResults?: number
+}
+
+export interface PocketInferenceResult {
+    model: {
+        profile: PixaiProfileId
+        revision: string
+        sha256: string
+        preprocessVersion: string
+    }
+    execution: { provider: 'node' }
+    tags: Array<{
+        index: number
+        name: string
+        score: number
+        category: PocketLocalModelCategory
+    }>
+    thresholds: { general: number; character: number }
+    truncated: boolean
+    timingMs: {
+        decode: number
+        preprocess: number
+        inference: number
+        postprocess: number
+        total: number
+    }
+    warnings: string[]
+}
+
 export interface PocketPluginModelBridge {
     pluginModelStatus(): Promise<Response>
     pluginModelDownload(principalId: string, signal: AbortSignal): Promise<Response>
     pluginModelCancel(principalId: string): Promise<Response>
     pluginModelRemove(principalId: string, includePartial: boolean): Promise<Response>
+    pluginModelInferenceCapabilities(): Promise<Response>
+    pluginModelInferenceAcquire(
+        principalId: string,
+        instanceId: string,
+        provider: PocketLocalModelProvider,
+        signal: AbortSignal,
+    ): Promise<Response>
+    pluginModelInferenceRun(
+        principalId: string,
+        instanceId: string,
+        sessionId: string,
+        image: Uint8Array,
+        mediaType: PocketLocalModelMediaType,
+        options: PocketInferenceRunOptions,
+        signal: AbortSignal,
+    ): Promise<Response>
+    pluginModelInferenceRelease(
+        principalId: string,
+        instanceId: string,
+        sessionId: string,
+    ): Promise<Response>
 }
 
 const PRINCIPAL_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -78,6 +142,15 @@ const MAX_JSON_BYTES = 64 * 1024
 const MAX_NDJSON_RECORD_BYTES = 64 * 1024
 const MAX_NDJSON_BYTES = 4 * 1024 * 1024
 const MAX_NDJSON_RECORDS = 4096
+const MAX_INFERENCE_TAGS = 500
+const MAX_IMAGE_BYTES = 33_554_432
+const MAX_SAFE_TEXT_BYTES = 512
+const MAX_WARNINGS = 16
+const MAX_TIMING_MS = 300_000
+const MAX_TAG_INDEX = 13_460
+const PIXAI_PREPROCESS_VERSION = 'pixai-v0.9-preprocess-448-rgb-bilinear-v1'
+const INFERENCE_MEDIA_TYPES = new Set<PocketLocalModelMediaType>(['image/jpeg', 'image/png', 'image/webp'])
+const INFERENCE_PROVIDERS = new Set<PocketLocalModelProvider>(['auto', 'webgpu', 'wasm', 'node'])
 
 const INTERNAL_MESSAGE = 'Internal plugin API error'
 
@@ -93,6 +166,10 @@ function network(): PluginApiError {
 
 function aborted(): PluginApiError {
     return new PluginApiError('ABORTED', 'Local model download aborted')
+}
+
+function inferenceAborted(): PluginApiError {
+    return new PluginApiError('ABORTED', 'Local model inference aborted')
 }
 
 function unsupported(): PluginApiError {
@@ -139,6 +216,179 @@ function exactDataObject(
 function safeBytes(value: unknown): number {
     if (!Number.isSafeInteger(value) || (value as number) < 0) throw internal()
     return value as number
+}
+
+function safeFinite(value: unknown, maximum = Number.MAX_VALUE): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > maximum) {
+        throw internal()
+    }
+    return value
+}
+
+function safeText(value: unknown, allowEmpty = false): string {
+    if (
+        typeof value !== 'string'
+        || (!allowEmpty && value.length === 0)
+        || new TextEncoder().encode(value).byteLength > MAX_SAFE_TEXT_BYTES
+        || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)
+    ) throw internal()
+    return value
+}
+
+function sessionId(value: unknown): string {
+    if (typeof value !== 'string' || !PRINCIPAL_PATTERN.test(value)) throw internal()
+    return value.toLowerCase()
+}
+
+function decodeProviderAvailability(value: unknown): { available: boolean } {
+    const data = exactDataObject(value, ['available'])
+    if (typeof data.available !== 'boolean') throw internal()
+    return { available: data.available }
+}
+
+function decodeInferenceCapabilities(value: unknown): PocketInferenceCapabilities {
+    const data = exactDataObject(
+        value,
+        ['backendAvailable', 'modelReady', 'providers'],
+        ['reason'],
+    )
+    if (typeof data.backendAvailable !== 'boolean' || typeof data.modelReady !== 'boolean') {
+        throw internal()
+    }
+    const providersData = exactDataObject(data.providers, ['node', 'webgpu', 'wasm'])
+    const providers = {
+        node: decodeProviderAvailability(providersData.node),
+        webgpu: decodeProviderAvailability(providersData.webgpu),
+        wasm: decodeProviderAvailability(providersData.wasm),
+    }
+    const expectedNode = data.backendAvailable && data.modelReady
+    if (
+        data.modelReady && !data.backendAvailable
+        || providers.node.available !== expectedNode
+        || providers.webgpu.available
+        || providers.wasm.available
+    ) throw internal()
+    let reason: string | undefined
+    if (data.reason !== undefined) reason = safeText(data.reason)
+    if ((data.backendAvailable && data.modelReady) === (reason !== undefined)) throw internal()
+    return {
+        backendAvailable: data.backendAvailable,
+        modelReady: data.modelReady,
+        ...(reason === undefined ? {} : { reason }),
+        providers,
+    }
+}
+
+function normalizeInferenceOptions(value: unknown): PocketInferenceRunOptions {
+    const data = exactDataObject(value, [], ['thresholds', 'categories', 'maxResults'])
+    const result: PocketInferenceRunOptions = {}
+    if (data.thresholds !== undefined) {
+        const thresholds = exactDataObject(data.thresholds, [], ['general', 'character'])
+        const normalized: { general?: number; character?: number } = {}
+        for (const category of ['general', 'character'] as const) {
+            if (thresholds[category] === undefined) continue
+            const threshold = safeFinite(thresholds[category], 1)
+            normalized[category] = threshold
+        }
+        result.thresholds = normalized
+    }
+    if (data.categories !== undefined) {
+        if (!Array.isArray(data.categories) || data.categories.length < 1 || data.categories.length > 2) {
+            throw internal()
+        }
+        const categories: PocketLocalModelCategory[] = []
+        for (const category of data.categories) {
+            if (
+                (category !== 'general' && category !== 'character')
+                || categories.includes(category)
+            ) throw internal()
+            categories.push(category)
+        }
+        result.categories = categories
+    }
+    if (data.maxResults !== undefined) {
+        if (!Number.isSafeInteger(data.maxResults) || (data.maxResults as number) < 1
+            || (data.maxResults as number) > MAX_INFERENCE_TAGS) throw internal()
+        result.maxResults = data.maxResults as number
+    }
+    return result
+}
+
+function decodeInferenceResult(value: unknown): PocketInferenceResult {
+    const data = exactDataObject(value, [
+        'modelProfileId', 'modelRevision', 'modelSha256', 'preprocessVersion',
+        'provider', 'tags', 'thresholds', 'truncated', 'timings', 'warnings',
+    ])
+    if (
+        data.modelProfileId !== PIXAI_PROFILE.id
+        || data.modelRevision !== PIXAI_PROFILE.revision
+        || data.modelSha256 !== PIXAI_PROFILE.artifacts[0].sha256
+        || data.preprocessVersion !== PIXAI_PREPROCESS_VERSION
+        || data.provider !== 'node'
+        || typeof data.truncated !== 'boolean'
+        || !Array.isArray(data.tags)
+        || data.tags.length > MAX_INFERENCE_TAGS
+        || !Array.isArray(data.warnings)
+        || data.warnings.length > MAX_WARNINGS
+    ) throw internal()
+
+    const seen = new Set<number>()
+    const tags = data.tags.map((value) => {
+        const tag = exactDataObject(value, ['index', 'name', 'score', 'category'])
+        if (
+            !Number.isSafeInteger(tag.index)
+            || (tag.index as number) < 0
+            || (tag.index as number) > MAX_TAG_INDEX
+            || seen.has(tag.index as number)
+            || (tag.category !== 'general' && tag.category !== 'character')
+        ) throw internal()
+        const index = tag.index as number
+        seen.add(index)
+        return {
+            index,
+            name: safeText(tag.name),
+            score: safeFinite(tag.score, 1),
+            category: tag.category as PocketLocalModelCategory,
+        }
+    })
+
+    const thresholdData = exactDataObject(data.thresholds, ['general', 'character'])
+    const thresholds = {
+        general: safeFinite(thresholdData.general, 1),
+        character: safeFinite(thresholdData.character, 1),
+    }
+    const timingData = exactDataObject(data.timings, [
+        'decodeMs', 'preprocessMs', 'inferenceMs', 'postprocessMs', 'totalMs',
+    ])
+    const timingMs = {
+        decode: safeFinite(timingData.decodeMs, MAX_TIMING_MS),
+        preprocess: safeFinite(timingData.preprocessMs, MAX_TIMING_MS),
+        inference: safeFinite(timingData.inferenceMs, MAX_TIMING_MS),
+        postprocess: safeFinite(timingData.postprocessMs, MAX_TIMING_MS),
+        total: safeFinite(timingData.totalMs, MAX_TIMING_MS),
+    }
+    if (timingMs.total < Math.max(
+        timingMs.decode,
+        timingMs.preprocess,
+        timingMs.inference,
+        timingMs.postprocess,
+    )) throw internal()
+    const warnings = data.warnings.map((warning) => safeText(warning, true))
+
+    return {
+        model: {
+            profile: PIXAI_PROFILE.id,
+            revision: PIXAI_PROFILE.revision,
+            sha256: PIXAI_PROFILE.artifacts[0].sha256,
+            preprocessVersion: PIXAI_PREPROCESS_VERSION,
+        },
+        execution: { provider: 'node' },
+        tags,
+        thresholds,
+        truncated: data.truncated,
+        timingMs,
+        warnings,
+    }
 }
 
 function artifactByName(name: unknown) {
@@ -279,6 +529,29 @@ function mapServerCode(code: unknown): PluginApiError {
     }
 }
 
+function mapInferenceServerCode(code: unknown, retryable: unknown): PluginApiError {
+    if (typeof retryable !== 'boolean') throw internal()
+    const definitions: Partial<Record<string, { message: string; retryable: boolean | 'server' }>> = {
+        NOT_FOUND: { message: 'Local model resource was not found', retryable: false },
+        UNSUPPORTED: { message: 'Local model inference is unavailable', retryable: false },
+        INVALID_ARGUMENT: { message: 'Invalid local model inference request', retryable: false },
+        RESOURCE_LIMIT: { message: 'Local model inference resource limit reached', retryable: true },
+        CONFLICT: { message: 'Local model inference conflict', retryable: 'server' },
+        ABORTED: { message: 'Local model inference aborted', retryable: false },
+        DECODE_FAILED: { message: 'Local image decode failed', retryable: false },
+        PROVIDER_ERROR: { message: 'Local model inference provider failed', retryable: true },
+    }
+    if (typeof code !== 'string') throw internal()
+    const definition = definitions[code]
+    if (!definition || (definition.retryable !== 'server' && retryable !== definition.retryable)) {
+        throw internal()
+    }
+    const publicRetryable = definition.retryable === 'server' ? retryable : definition.retryable
+    return new PluginApiError(code as PluginApiErrorCode, definition.message, {
+        retryable: publicRetryable,
+    })
+}
+
 async function readBoundedText(response: Response, maximum: number): Promise<string> {
     if (!response.body) throw network()
     const reader = response.body.getReader()
@@ -322,32 +595,41 @@ async function decodeJsonResponse(response: Response): Promise<unknown> {
     }
 }
 
-async function responseError(response: Response): Promise<never> {
-    if ([404, 405, 501].includes(response.status)) throw unsupported()
-    if (response.status === 409) throw conflict()
+async function responseError(response: Response, inference = false): Promise<never> {
+    if (!inference && [404, 405, 501].includes(response.status)) throw unsupported()
+    if (!inference && response.status === 409) throw conflict()
     let body: unknown
     try {
         body = await decodeJsonResponse(response)
         const envelope = exactDataObject(body, ['error'])
-        const error = exactDataObject(envelope.error, ['code', 'message'])
+        const error = exactDataObject(
+            envelope.error,
+            inference ? ['code', 'message', 'retryable'] : ['code', 'message'],
+        )
         if (typeof error.message !== 'string') throw internal()
-        throw mapServerCode(error.code)
+        throw inference
+            ? mapInferenceServerCode(error.code, error.retryable)
+            : mapServerCode(error.code)
     } catch (error) {
         if (error instanceof PluginApiError) throw error
         throw internal()
     }
 }
 
-async function checkedResponse(call: () => Promise<Response>, signal?: AbortSignal): Promise<Response> {
+async function checkedResponse(
+    call: () => Promise<Response>,
+    signal?: AbortSignal,
+    inference = false,
+): Promise<Response> {
     let response: Response
     try {
         response = await call()
     } catch {
-        if (signal?.aborted) throw aborted()
+        if (signal?.aborted) throw inference ? inferenceAborted() : aborted()
         throw network()
     }
     if (!(response instanceof Response)) throw internal()
-    if (!response.ok) await responseError(response)
+    if (!response.ok) await responseError(response, inference)
     return response
 }
 
@@ -379,11 +661,19 @@ function decodeStreamError(value: unknown): PluginApiError {
 export class PocketPluginModelClient {
     private readonly bridge: PocketPluginModelBridge
     private readonly principalId: string
+    private readonly instanceId?: string
 
-    constructor(bridge: PocketPluginModelBridge, principalId: string) {
+    constructor(bridge: PocketPluginModelBridge, principalId: string, instanceId?: string) {
         if (!PRINCIPAL_PATTERN.test(principalId)) throw internal()
+        if (instanceId !== undefined && !PRINCIPAL_PATTERN.test(instanceId)) throw internal()
         this.bridge = bridge
         this.principalId = principalId.toLowerCase()
+        this.instanceId = instanceId?.toLowerCase()
+    }
+
+    private inferenceInstance(): string {
+        if (!this.instanceId) throw internal()
+        return this.instanceId
     }
 
     async status(): Promise<PocketModelStatus> {
@@ -505,12 +795,101 @@ export class PocketPluginModelClient {
         return { cancelled: data.cancelled }
     }
 
-    async remove(includePartial: boolean): Promise<{ purgedBytes: number }> {
+    async remove(includePartial: boolean): Promise<{ purgedBytes: number; pending?: true }> {
         if (typeof includePartial !== 'boolean') throw internal()
         const response = await checkedResponse(
             () => this.bridge.pluginModelRemove(this.principalId, includePartial),
         )
-        const data = exactDataObject(await decodeJsonResponse(response), ['purgedBytes'])
-        return { purgedBytes: safeBytes(data.purgedBytes) }
+        const value = await decodeJsonResponse(response)
+        try {
+            const immediate = exactDataObject(value, ['purgedBytes'])
+            return { purgedBytes: safeBytes(immediate.purgedBytes) }
+        } catch (error) {
+            if (!(error instanceof PluginApiError) || error.code !== 'INTERNAL') throw error
+        }
+        const deferred = exactDataObject(value, ['purgedBytes', 'pending'])
+        if (safeBytes(deferred.purgedBytes) !== 0 || deferred.pending !== true) throw internal()
+        return { purgedBytes: 0, pending: true }
+    }
+
+    async inferenceCapabilities(): Promise<PocketInferenceCapabilities> {
+        const response = await checkedResponse(
+            () => this.bridge.pluginModelInferenceCapabilities(),
+            undefined,
+            true,
+        )
+        return decodeInferenceCapabilities(await decodeJsonResponse(response))
+    }
+
+    async acquire(
+        provider: PocketLocalModelProvider,
+        signal: AbortSignal,
+    ): Promise<{ sessionId: string; provider: 'node' }> {
+        const instanceId = this.inferenceInstance()
+        if (!INFERENCE_PROVIDERS.has(provider)) throw internal()
+        if (!(signal instanceof AbortSignal)) throw internal()
+        if (signal.aborted) throw inferenceAborted()
+        const response = await checkedResponse(
+            () => this.bridge.pluginModelInferenceAcquire(
+                this.principalId,
+                instanceId,
+                provider,
+                signal,
+            ),
+            signal,
+            true,
+        )
+        const data = exactDataObject(await decodeJsonResponse(response), ['sessionId', 'provider'])
+        if (data.provider !== 'node') throw internal()
+        return { sessionId: sessionId(data.sessionId), provider: 'node' }
+    }
+
+    async run(
+        sessionIdValue: string,
+        image: Uint8Array,
+        mediaType: PocketLocalModelMediaType,
+        optionsValue: PocketInferenceRunOptions,
+        signal: AbortSignal,
+    ): Promise<PocketInferenceResult> {
+        const instanceId = this.inferenceInstance()
+        const normalizedSessionId = sessionId(sessionIdValue)
+        if (
+            !(image instanceof Uint8Array)
+            || Object.getPrototypeOf(image) !== Uint8Array.prototype
+            || image.byteLength < 1
+            || image.byteLength > MAX_IMAGE_BYTES
+        ) throw internal()
+        if (!INFERENCE_MEDIA_TYPES.has(mediaType)) throw internal()
+        if (!(signal instanceof AbortSignal)) throw internal()
+        const options = normalizeInferenceOptions(optionsValue)
+        if (signal.aborted) throw inferenceAborted()
+        const response = await checkedResponse(
+            () => this.bridge.pluginModelInferenceRun(
+                this.principalId,
+                instanceId,
+                normalizedSessionId,
+                image,
+                mediaType,
+                options,
+                signal,
+            ),
+            signal,
+            true,
+        )
+        return decodeInferenceResult(await decodeJsonResponse(response))
+    }
+
+    async release(sessionIdValue: string): Promise<void> {
+        const response = await checkedResponse(
+            () => this.bridge.pluginModelInferenceRelease(
+                this.principalId,
+                this.inferenceInstance(),
+                sessionId(sessionIdValue),
+            ),
+            undefined,
+            true,
+        )
+        const data = exactDataObject(await decodeJsonResponse(response), ['released'])
+        if (data.released !== true) throw internal()
     }
 }

@@ -12,10 +12,20 @@ import { normalizeChat } from "./database.svelte"
 
 const PLUGIN_MODEL_PROFILE_ID = 'pixai-tagger-v0.9-onnx'
 const PLUGIN_MODEL_PRINCIPAL = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const PLUGIN_MODEL_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
+const PLUGIN_MODEL_PROVIDERS = new Set(['auto', 'webgpu', 'wasm', 'node'])
+const PLUGIN_MODEL_OPTIONS_MAX_BYTES = 2048
 
 function pluginModelPrincipal(value: string): string {
     if (typeof value !== 'string' || !PLUGIN_MODEL_PRINCIPAL.test(value)) {
         throw new Error('Invalid Host plugin principal')
+    }
+    return value.toLowerCase()
+}
+
+function pluginModelUuid(value: string, label: 'instance' | 'session'): string {
+    if (typeof value !== 'string' || !PLUGIN_MODEL_PRINCIPAL.test(value)) {
+        throw new Error(`Invalid Host plugin ${label}`)
     }
     return value.toLowerCase()
 }
@@ -229,6 +239,94 @@ export class NodeStorage{
             },
             body: JSON.stringify({ includePartial }),
         })
+    }
+
+    async pluginModelInferenceCapabilities(): Promise<Response> {
+        return this.authFetch(`/api/plugin-model-inference/${PLUGIN_MODEL_PROFILE_ID}/capabilities`, {
+            method: 'GET',
+        })
+    }
+
+    async pluginModelInferenceAcquire(
+        principalId: string,
+        instanceId: string,
+        provider: string | undefined,
+        signal: AbortSignal,
+    ): Promise<Response> {
+        if (provider !== undefined && !PLUGIN_MODEL_PROVIDERS.has(provider)) {
+            throw new Error('Invalid local model provider')
+        }
+        if (!(signal instanceof AbortSignal)) throw new Error('Invalid local model abort signal')
+        const headers: Record<string, string> = {
+            'x-risu-plugin-principal-id': pluginModelPrincipal(principalId),
+            'x-risu-plugin-instance-id': pluginModelUuid(instanceId, 'instance'),
+        }
+        if (provider !== undefined) headers['x-risu-local-model-provider'] = provider
+        return this.authFetch(`/api/plugin-model-inference/${PLUGIN_MODEL_PROFILE_ID}/sessions`, {
+            method: 'POST',
+            headers,
+            signal,
+        })
+    }
+
+    async pluginModelInferenceRun(
+        principalId: string,
+        instanceId: string,
+        sessionId: string,
+        image: Uint8Array,
+        mediaType: string,
+        options: unknown,
+        signal: AbortSignal,
+    ): Promise<Response> {
+        if (!(image instanceof Uint8Array) || Object.getPrototypeOf(image) !== Uint8Array.prototype) {
+            throw new Error('Invalid local model image bytes')
+        }
+        if (!PLUGIN_MODEL_IMAGE_TYPES.has(mediaType)) throw new Error('Invalid local model image media type')
+        if (!(signal instanceof AbortSignal)) throw new Error('Invalid local model abort signal')
+        let encodedOptions: string
+        try {
+            encodedOptions = JSON.stringify(options)
+        } catch {
+            throw new Error('Invalid local model inference options')
+        }
+        if (
+            typeof encodedOptions !== 'string'
+            || new TextEncoder().encode(encodedOptions).byteLength > PLUGIN_MODEL_OPTIONS_MAX_BYTES
+        ) throw new Error('Invalid local model inference options')
+        const normalizedSessionId = pluginModelUuid(sessionId, 'session')
+        return this.authFetch(
+            `/api/plugin-model-inference/${PLUGIN_MODEL_PROFILE_ID}/sessions/${normalizedSessionId}/run`,
+            {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/x-risu-local-model-image',
+                    'x-risu-plugin-principal-id': pluginModelPrincipal(principalId),
+                    'x-risu-plugin-instance-id': pluginModelUuid(instanceId, 'instance'),
+                    'x-risu-local-model-media-type': mediaType,
+                    'x-risu-local-model-options': encodedOptions,
+                },
+                body: image as BodyInit,
+                signal,
+            },
+        )
+    }
+
+    async pluginModelInferenceRelease(
+        principalId: string,
+        instanceId: string,
+        sessionId: string,
+    ): Promise<Response> {
+        const normalizedSessionId = pluginModelUuid(sessionId, 'session')
+        return this.authFetch(
+            `/api/plugin-model-inference/${PLUGIN_MODEL_PROFILE_ID}/sessions/${normalizedSessionId}`,
+            {
+                method: 'DELETE',
+                headers: {
+                    'x-risu-plugin-principal-id': pluginModelPrincipal(principalId),
+                    'x-risu-plugin-instance-id': pluginModelUuid(instanceId, 'instance'),
+                },
+            },
+        )
     }
 
     async setItem(key:string, value:Uint8Array, etag?:string) {

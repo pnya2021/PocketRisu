@@ -51,13 +51,14 @@ import { createOwnedSyncStorageMutations } from '../ownedSyncStorage';
 import { ContextResourceService } from './illustration/contextResources';
 import { createPocketContextResourceAdapter } from './illustration/contextResources.pocket';
 import { ensureCurrentChatReady } from 'src/ts/storage/chatStorage';
-import { getInlayAssetRecord, removeInlayAsset, writeInlayImageFromBytes } from 'src/ts/process/files/inlays';
+import { getInlayAssetBlob, getInlayAssetRecord, removeInlayAsset, writeInlayImageFromBytes } from 'src/ts/process/files/inlays';
 import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustration/inlayLifecycle';
 import { createPocketInlayLifecycleAdapter } from './illustration/inlayLifecycle.pocket';
 import { NodeStorage } from 'src/ts/storage/nodeStorage';
 import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/deviceCache';
 import { PixaiInstallLifecycle } from './localModel/pixaiInstallLifecycle';
 import { PocketPluginModelClient } from './localModel/pocketPluginModelClient';
+import { PixaiLocalModel, withPixaiInferenceCapability } from './localModel/pixaiLocalModel';
 
 /*
     V3 API for RisuAI Plugins
@@ -656,6 +657,21 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
     )
     const deviceCache = new DeviceCacheService(context)
+    const pixaiLocalModel = new PixaiLocalModel({
+        context,
+        client: new PocketPluginModelClient(
+            pluginModelNodeStorage,
+            context.principalId,
+            context.instanceId,
+        ),
+        contextResources,
+        requirePermission: (permission) => pluginPermissionService.require(context, permission, {
+            locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+        }),
+        getInlayAssetRecord,
+        getInlayAssetBlob,
+    })
+    addPluginUnloadCallback(context.instanceId, () => pixaiLocalModel.releaseAll())
     const pluginStorageMutations = createOwnedSyncStorageMutations({
         storage: oldApis.pluginStorage,
         canMutate: canRegisterResource,
@@ -1277,6 +1293,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         getLocalModelStatus: (profile: unknown) =>
             pixaiInstallLifecycle.getLocalModelStatus(context, profile),
+        getLocalModelCapabilities: (profile: unknown) =>
+            pixaiLocalModel.getLocalModelCapabilities(profile),
         installLocalModel: (profile: unknown, onProgress?: unknown) =>
             pixaiInstallLifecycle.installLocalModel(context, profile, onProgress),
         getLocalModelOperation: (operationId: unknown) =>
@@ -1285,19 +1303,32 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             pixaiInstallLifecycle.cancelLocalModelOperation(context, operationId),
         removeLocalModel: (profile: unknown, options?: unknown) =>
             pixaiInstallLifecycle.removeLocalModel(context, profile, options),
-        getCapabilities: (ids?: string[]) => getCapabilities(context, ids, {
-            permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
-            runtime: {
-                registeredServices: new Set([
+        acquireLocalModelSession: (profile: unknown, options?: unknown) =>
+            pixaiLocalModel.acquireLocalModelSession(profile, options),
+        runLocalModel: (sessionId: unknown, request: unknown, options?: unknown) =>
+            pixaiLocalModel.runLocalModel(sessionId, request, options),
+        releaseLocalModelSession: (sessionId: unknown) =>
+            pixaiLocalModel.releaseLocalModelSession(sessionId),
+        getCapabilities: async (ids?: string[]) => {
+            const registeredServices = await withPixaiInferenceCapability(
+                ids,
+                [
                     'context.current.v1',
                     'context.assets.v1',
                     'context.modules-installed.v1',
                     ...INLAY_LIFECYCLE_CAPABILITY_IDS,
                     ...DEVICE_CACHE_CAPABILITY_IDS,
-                ]),
-                hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
-            },
-        }),
+                ],
+                () => pixaiLocalModel.backendHealthy(),
+            )
+            return getCapabilities(context, ids, {
+                permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
+                runtime: {
+                    registeredServices,
+                    hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
+                },
+            })
+        },
         getCurrentContext: () => contextResources.getCurrentContext(),
         getCharacterCardSnapshot: (characterId?: string) => contextResources.getCharacterCardSnapshot(characterId),
         getConversationContextSnapshot: (conversationId?: string) => contextResources.getConversationContextSnapshot(conversationId),

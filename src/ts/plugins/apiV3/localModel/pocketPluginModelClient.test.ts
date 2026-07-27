@@ -7,6 +7,47 @@ import {
 } from './pocketPluginModelClient'
 
 const PRINCIPAL = '123e4567-e89b-42d3-a456-426614174000'
+const INSTANCE = '223e4567-e89b-42d3-a456-426614174000'
+const SESSION = '323e4567-e89b-42d3-a456-426614174000'
+
+function inferenceCapabilityBody(modelReady = true) {
+    return {
+        backendAvailable: true,
+        modelReady,
+        ...(modelReady ? {} : { reason: 'model-not-ready' }),
+        providers: {
+            node: { available: modelReady },
+            webgpu: { available: false },
+            wasm: { available: false },
+        },
+    }
+}
+
+function inferenceResultBody(tags: unknown[] = [{
+    index: 4,
+    name: '1girl',
+    score: 0.91,
+    category: 'general',
+}]) {
+    return {
+        modelProfileId: PIXAI_PROFILE.id,
+        modelRevision: PIXAI_PROFILE.revision,
+        modelSha256: PIXAI_PROFILE.artifacts[0].sha256,
+        preprocessVersion: 'pixai-v0.9-preprocess-448-rgb-bilinear-v1',
+        provider: 'node',
+        tags,
+        thresholds: { general: 0.3, character: 0.85 },
+        truncated: false,
+        timings: {
+            decodeMs: 1,
+            preprocessMs: 2,
+            inferenceMs: 3,
+            postprocessMs: 4,
+            totalMs: 10,
+        },
+        warnings: [],
+    }
+}
 
 function statusBody(state: 'absent' | 'partial' | 'verified' = 'absent') {
     const stored = state === 'absent'
@@ -65,6 +106,10 @@ function bridge(overrides: Partial<PocketPluginModelBridge> = {}): PocketPluginM
         pluginModelDownload: vi.fn(async () => ndjsonResponse([])),
         pluginModelCancel: vi.fn(async () => Response.json({ cancelled: false })),
         pluginModelRemove: vi.fn(async () => Response.json({ purgedBytes: 0 })),
+        pluginModelInferenceCapabilities: vi.fn(async () => Response.json(inferenceCapabilityBody())),
+        pluginModelInferenceAcquire: vi.fn(async () => Response.json({ sessionId: SESSION, provider: 'node' })),
+        pluginModelInferenceRun: vi.fn(async () => Response.json(inferenceResultBody())),
+        pluginModelInferenceRelease: vi.fn(async () => Response.json({ released: true })),
         ...overrides,
     }
 }
@@ -257,5 +302,203 @@ describe('PocketPluginModelClient', () => {
         }), PRINCIPAL)
         await expect(malformed.cancel()).rejects.toMatchObject({ code: 'INTERNAL' })
         await expect(malformed.remove(true)).rejects.toMatchObject({ code: 'INTERNAL' })
+    })
+
+    it('strictly decodes backend capabilities without initializing or prompting', async () => {
+        const transport = bridge()
+        const client = new PocketPluginModelClient(transport, PRINCIPAL, INSTANCE)
+        await expect(client.inferenceCapabilities()).resolves.toEqual(inferenceCapabilityBody())
+        expect(transport.pluginModelInferenceCapabilities).toHaveBeenCalledWith()
+
+        for (const value of [
+            { ...inferenceCapabilityBody(), extra: true },
+            { ...inferenceCapabilityBody(), backendAvailable: 'yes' },
+            { ...inferenceCapabilityBody(), providers: { ...inferenceCapabilityBody().providers, node: { available: true, detail: 'raw' } } },
+            { ...inferenceCapabilityBody(), reason: 'x'.repeat(513) },
+        ]) {
+            const malformed = new PocketPluginModelClient(bridge({
+                pluginModelInferenceCapabilities: vi.fn(async () => Response.json(value)),
+            }), PRINCIPAL, INSTANCE)
+            await expect(malformed.inferenceCapabilities()).rejects.toMatchObject({
+                code: 'INTERNAL', message: 'Internal plugin API error',
+            })
+        }
+    })
+
+    it('acquires, runs, maps the bounded P4 result, and releases with captured ownership', async () => {
+        const transport = bridge()
+        const client = new PocketPluginModelClient(transport, PRINCIPAL, INSTANCE)
+        const acquireSignal = new AbortController().signal
+        const runSignal = new AbortController().signal
+        const image = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+
+        await expect(client.acquire('auto', acquireSignal)).resolves.toEqual({
+            sessionId: SESSION,
+            provider: 'node',
+        })
+        await expect(client.run(
+            SESSION,
+            image,
+            'image/png',
+            { thresholds: { general: 0.3 }, categories: ['general'], maxResults: 100 },
+            runSignal,
+        )).resolves.toEqual({
+            model: {
+                profile: PIXAI_PROFILE.id,
+                revision: PIXAI_PROFILE.revision,
+                sha256: PIXAI_PROFILE.artifacts[0].sha256,
+                preprocessVersion: 'pixai-v0.9-preprocess-448-rgb-bilinear-v1',
+            },
+            execution: { provider: 'node' },
+            tags: [{ index: 4, name: '1girl', score: 0.91, category: 'general' }],
+            thresholds: { general: 0.3, character: 0.85 },
+            truncated: false,
+            timingMs: { decode: 1, preprocess: 2, inference: 3, postprocess: 4, total: 10 },
+            warnings: [],
+        })
+        await expect(client.release(SESSION)).resolves.toBeUndefined()
+
+        expect(transport.pluginModelInferenceAcquire).toHaveBeenCalledWith(
+            PRINCIPAL, INSTANCE, 'auto', acquireSignal,
+        )
+        expect(transport.pluginModelInferenceRun).toHaveBeenCalledWith(
+            PRINCIPAL,
+            INSTANCE,
+            SESSION,
+            image,
+            'image/png',
+            { thresholds: { general: 0.3 }, categories: ['general'], maxResults: 100 },
+            runSignal,
+        )
+        expect(transport.pluginModelInferenceRelease).toHaveBeenCalledWith(PRINCIPAL, INSTANCE, SESSION)
+    })
+
+    it('enforces the 500-tag public boundary and rejects malformed private results', async () => {
+        const validTags = Array.from({ length: 500 }, (_, index) => ({
+            index,
+            name: `tag_${index}`,
+            score: 0.5,
+            category: index % 2 ? 'character' : 'general',
+        }))
+        const client = new PocketPluginModelClient(bridge({
+            pluginModelInferenceRun: vi.fn(async () => Response.json(inferenceResultBody(validTags))),
+        }), PRINCIPAL, INSTANCE)
+        await expect(client.run(
+            SESSION, new Uint8Array([1]), 'image/jpeg', {}, new AbortController().signal,
+        )).resolves.toHaveProperty('tags', validTags)
+
+        const malformed = [
+            inferenceResultBody([...validTags, { index: 501, name: 'overflow', score: 0.5, category: 'general' }]),
+            { ...inferenceResultBody(), rawScores: [0.1] },
+            { ...inferenceResultBody(), modelRevision: 'private-revision' },
+            { ...inferenceResultBody(), tags: [{ index: -1, name: 'raw', score: 0.2, category: 'general' }] },
+            { ...inferenceResultBody(), timings: { ...inferenceResultBody().timings, totalMs: Number.POSITIVE_INFINITY } },
+            { ...inferenceResultBody(), warnings: ['x'.repeat(513)] },
+        ]
+        for (const value of malformed) {
+            const invalid = new PocketPluginModelClient(bridge({
+                pluginModelInferenceRun: vi.fn(async () => Response.json(value)),
+            }), PRINCIPAL, INSTANCE)
+            await expect(invalid.run(
+                SESSION, new Uint8Array([1]), 'image/jpeg', {}, new AbortController().signal,
+            )).rejects.toSatisfy((error: unknown) => {
+                expectCode(error, 'INTERNAL')
+                expect(JSON.stringify(error)).not.toContain('private-revision')
+                return true
+            })
+        }
+    })
+
+    it.each([
+        ['NOT_FOUND', 'NOT_FOUND', false],
+        ['UNSUPPORTED', 'UNSUPPORTED', false],
+        ['INVALID_ARGUMENT', 'INVALID_ARGUMENT', false],
+        ['RESOURCE_LIMIT', 'RESOURCE_LIMIT', true],
+        ['CONFLICT', 'CONFLICT', false],
+        ['ABORTED', 'ABORTED', false],
+        ['DECODE_FAILED', 'DECODE_FAILED', false],
+        ['PROVIDER_ERROR', 'PROVIDER_ERROR', true],
+    ])('maps inference %s to stable public %s without raw detail', async (privateCode, publicCode, retryable) => {
+        const raw = 'native stack C:\\secret\\model.onnx'
+        const client = new PocketPluginModelClient(bridge({
+            pluginModelInferenceRun: vi.fn(async () => Response.json({
+                error: { code: privateCode, message: raw, retryable },
+            }, { status: privateCode === 'NOT_FOUND' ? 404 : 400 })),
+        }), PRINCIPAL, INSTANCE)
+        await expect(client.run(
+            SESSION, new Uint8Array([1]), 'image/webp', {}, new AbortController().signal,
+        )).rejects.toSatisfy((error: unknown) => {
+            expectCode(error, publicCode, retryable)
+            expect(String((error as Error).message)).not.toContain(raw)
+            expect(JSON.stringify(error)).not.toContain('secret')
+            return true
+        })
+    })
+
+    it('preserves the P5-A retryable pending-removal conflict without exposing its message', async () => {
+        const client = new PocketPluginModelClient(bridge({
+            pluginModelInferenceAcquire: vi.fn(async () => Response.json({
+                error: { code: 'CONFLICT', message: 'private removal state', retryable: true },
+            }, { status: 409 })),
+        }), PRINCIPAL, INSTANCE)
+        await expect(client.acquire('node', new AbortController().signal)).rejects.toSatisfy(
+            (error: unknown) => {
+                expectCode(error, 'CONFLICT', true)
+                expect(String((error as Error).message)).not.toContain('private removal state')
+                return true
+            },
+        )
+    })
+
+    it('rejects malformed, unknown, oversized inference responses and maps aborted transport', async () => {
+        const malformedBodies = [
+            { error: { code: 'UNKNOWN', message: 'raw', retryable: false } },
+            { error: { code: 'NOT_FOUND', message: 'raw', retryable: false }, extra: true },
+            { error: { code: 'RESOURCE_LIMIT', message: 'raw', retryable: false } },
+        ]
+        for (const body of malformedBodies) {
+            const client = new PocketPluginModelClient(bridge({
+                pluginModelInferenceAcquire: vi.fn(async () => Response.json(body, { status: 400 })),
+            }), PRINCIPAL, INSTANCE)
+            await expect(client.acquire('node', new AbortController().signal))
+                .rejects.toMatchObject({ code: 'INTERNAL', message: 'Internal plugin API error' })
+        }
+
+        const oversized = new PocketPluginModelClient(bridge({
+            pluginModelInferenceCapabilities: vi.fn(async () => new Response('x'.repeat(70_000))),
+        }), PRINCIPAL, INSTANCE)
+        await expect(oversized.inferenceCapabilities()).rejects.toMatchObject({ code: 'INTERNAL' })
+
+        const controller = new AbortController()
+        const abortedClient = new PocketPluginModelClient(bridge({
+            pluginModelInferenceAcquire: vi.fn(async () => {
+                controller.abort()
+                throw new Error('raw URL')
+            }),
+        }), PRINCIPAL, INSTANCE)
+        await expect(abortedClient.acquire('auto', controller.signal)).rejects.toMatchObject({ code: 'ABORTED' })
+    })
+
+    it('accepts only immediate or deferred exact remove results', async () => {
+        const immediate = new PocketPluginModelClient(bridge({
+            pluginModelRemove: vi.fn(async () => Response.json({ purgedBytes: 1234 })),
+        }), PRINCIPAL)
+        await expect(immediate.remove(false)).resolves.toEqual({ purgedBytes: 1234 })
+
+        const deferred = new PocketPluginModelClient(bridge({
+            pluginModelRemove: vi.fn(async () => Response.json({ purgedBytes: 0, pending: true })),
+        }), PRINCIPAL)
+        await expect(deferred.remove(true)).resolves.toEqual({ purgedBytes: 0, pending: true })
+
+        for (const value of [
+            { purgedBytes: 0, pending: false },
+            { purgedBytes: 1, pending: true },
+            { purgedBytes: 0, pending: true, raw: 'secret' },
+        ]) {
+            const malformed = new PocketPluginModelClient(bridge({
+                pluginModelRemove: vi.fn(async () => Response.json(value)),
+            }), PRINCIPAL)
+            await expect(malformed.remove(true)).rejects.toMatchObject({ code: 'INTERNAL' })
+        }
     })
 })

@@ -57,7 +57,7 @@ export interface PixaiInstallLifecycleClient {
         onProgress?: (progress: PocketModelProgress) => unknown,
     ): Promise<{ state: 'verified'; bytes: number }>
     cancel(): Promise<{ cancelled: boolean }>
-    remove(includePartial: boolean): Promise<{ purgedBytes: number }>
+    remove(includePartial: boolean): Promise<{ purgedBytes: number; pending?: true }>
 }
 
 export interface PixaiInstallLifecycleOptions {
@@ -468,7 +468,7 @@ export class PixaiInstallLifecycle {
                     pending: false,
                 }
             }
-            let result: { purgedBytes: number }
+            let result: { purgedBytes: number; pending?: true }
             try {
                 result = await this.clientForPrincipal(context.principalId).remove(options.includePartial)
             } catch (error) {
@@ -480,7 +480,7 @@ export class PixaiInstallLifecycle {
                 releasedPluginReference,
                 purgedBytes: result.purgedBytes,
                 retainedForOtherOwners: false,
-                pending: false,
+                pending: result.pending === true,
             }
         })
     }

@@ -63,7 +63,10 @@ class HostBackend {
     current = hostStatus()
     readonly status = vi.fn(async () => this.current)
     readonly cancel = vi.fn(async (_principal: string) => ({ cancelled: true }))
-    readonly remove = vi.fn(async (_principal: string, _includePartial: boolean) => {
+    readonly remove = vi.fn(async (
+        _principal: string,
+        _includePartial: boolean,
+    ): Promise<{ purgedBytes: number; pending?: true }> => {
         const purgedBytes = this.current.storedBytes
         this.current = hostStatus()
         return { purgedBytes }
@@ -381,6 +384,19 @@ describe('PixAI install lifecycle', () => {
         await deviceCase.queue.whenPresented()
         decide(deviceCase.queue, true)
         await expect(retryPurge).resolves.toMatchObject({ releasedPluginReference: true })
+    })
+
+    it('propagates a deferred Host removal as pending without inventing purged bytes', async () => {
+        const { backend, lifecycle } = setup()
+        backend.current = hostStatus('verified')
+        backend.remove.mockResolvedValueOnce({ purgedBytes: 0, pending: true })
+
+        await expect(lifecycle.removeLocalModel(context().context, PIXAI_PROFILE.id)).resolves.toEqual({
+            releasedPluginReference: false,
+            purgedBytes: 0,
+            retainedForOtherOwners: false,
+            pending: true,
+        })
     })
 
     it('confirms device purge, preserves bytes on denial, and blocks purge during active work', async () => {

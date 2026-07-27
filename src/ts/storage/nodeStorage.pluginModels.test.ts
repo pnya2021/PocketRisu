@@ -15,6 +15,8 @@ vi.mock('./risuSave', () => ({
 import { NodeStorage } from './nodeStorage'
 
 const PRINCIPAL = '11111111-1111-4111-8111-111111111111'
+const INSTANCE = '22222222-2222-4222-8222-222222222222'
+const SESSION = '33333333-3333-4333-8333-333333333333'
 const PROFILE = 'pixai-tagger-v0.9-onnx'
 
 function readyStorage() {
@@ -101,6 +103,135 @@ describe('NodeStorage Pocket plugin-model bridge', () => {
         }
         expect(requestHeaders(fetchMock.mock.calls[0]).get('risu-auth')).toBe('jwt-old')
         expect(requestHeaders(fetchMock.mock.calls[1]).get('risu-auth')).toBe('jwt-new')
+    })
+
+    it('uses the four fixed inference routes with Host-owned identity and raw image bytes', async () => {
+        const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+            new Response('{}', { status: 200 }))
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+        const acquireController = new AbortController()
+        const runController = new AbortController()
+        const image = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+
+        await storage.pluginModelInferenceCapabilities()
+        await storage.pluginModelInferenceAcquire(
+            PRINCIPAL,
+            INSTANCE,
+            'node',
+            acquireController.signal,
+        )
+        await storage.pluginModelInferenceRun(
+            PRINCIPAL,
+            INSTANCE,
+            SESSION,
+            image,
+            'image/png',
+            { thresholds: { general: 0.4 }, categories: ['general'], maxResults: 20 },
+            runController.signal,
+        )
+        await storage.pluginModelInferenceRelease(PRINCIPAL, INSTANCE, SESSION)
+
+        expect(fetchMock.mock.calls.map(([url, init]) => [url, (init as RequestInit).method ?? 'GET']))
+            .toEqual([
+                [`/api/plugin-model-inference/${PROFILE}/capabilities`, 'GET'],
+                [`/api/plugin-model-inference/${PROFILE}/sessions`, 'POST'],
+                [`/api/plugin-model-inference/${PROFILE}/sessions/${SESSION}/run`, 'POST'],
+                [`/api/plugin-model-inference/${PROFILE}/sessions/${SESSION}`, 'DELETE'],
+            ])
+        for (const call of fetchMock.mock.calls) {
+            const headers = requestHeaders(call)
+            expect(headers.get('risu-auth')).toBe('jwt-one')
+            expect(headers.get('x-session-id')).toMatch(/\S/)
+        }
+        expect(requestHeaders(fetchMock.mock.calls[0]).has('x-risu-plugin-principal-id')).toBe(false)
+        for (const index of [1, 2, 3]) {
+            const headers = requestHeaders(fetchMock.mock.calls[index])
+            expect(headers.get('x-risu-plugin-principal-id')).toBe(PRINCIPAL)
+            expect(headers.get('x-risu-plugin-instance-id')).toBe(INSTANCE)
+        }
+        expect(requestHeaders(fetchMock.mock.calls[1]).get('x-risu-local-model-provider')).toBe('node')
+        expect((fetchMock.mock.calls[1][1] as RequestInit).signal).toBe(acquireController.signal)
+        expect((fetchMock.mock.calls[1][1] as RequestInit).body).toBeUndefined()
+
+        const run = fetchMock.mock.calls[2]
+        expect((run[1] as RequestInit).body).toBe(image)
+        expect((run[1] as RequestInit).signal).toBe(runController.signal)
+        expect(requestHeaders(run).get('content-type')).toBe('application/x-risu-local-model-image')
+        expect(requestHeaders(run).get('x-risu-local-model-media-type')).toBe('image/png')
+        expect(requestHeaders(run).get('x-risu-local-model-options')).toBe(
+            '{"thresholds":{"general":0.4},"categories":["general"],"maxResults":20}',
+        )
+        expect(requestHeaders(run).has('content-length')).toBe(false)
+        expect((fetchMock.mock.calls[3][1] as RequestInit).body).toBeUndefined()
+        expect((fetchMock.mock.calls[3][1] as RequestInit).signal).toBeUndefined()
+    })
+
+    it('preserves inference identity, raw body, options and signal across auth retry', async () => {
+        const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>()
+            .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'Token Expired' }), {
+                status: 401,
+                headers: { 'content-type': 'application/json' },
+            }))
+            .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+        vi.mocked(storage.createAuth)
+            .mockResolvedValueOnce('jwt-old')
+            .mockResolvedValueOnce('jwt-new')
+        const controller = new AbortController()
+        const image = new Uint8Array([1, 2, 3])
+
+        await storage.pluginModelInferenceRun(
+            PRINCIPAL,
+            INSTANCE,
+            SESSION,
+            image,
+            'image/webp',
+            {},
+            controller.signal,
+        )
+
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        for (const call of fetchMock.mock.calls) {
+            expect(call[0]).toBe(`/api/plugin-model-inference/${PROFILE}/sessions/${SESSION}/run`)
+            expect((call[1] as RequestInit).body).toBe(image)
+            expect((call[1] as RequestInit).signal).toBe(controller.signal)
+            expect(requestHeaders(call).get('x-risu-plugin-principal-id')).toBe(PRINCIPAL)
+            expect(requestHeaders(call).get('x-risu-plugin-instance-id')).toBe(INSTANCE)
+            expect(requestHeaders(call).get('x-risu-local-model-options')).toBe('{}')
+        }
+        expect(requestHeaders(fetchMock.mock.calls[0]).get('risu-auth')).toBe('jwt-old')
+        expect(requestHeaders(fetchMock.mock.calls[1]).get('risu-auth')).toBe('jwt-new')
+    })
+
+    it('rejects non-Host inference wire values before fetch', async () => {
+        const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }))
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+        const signal = new AbortController().signal
+
+        await expect(storage.pluginModelInferenceAcquire(PRINCIPAL, 'bad', 'auto', signal))
+            .rejects.toThrow(/instance/i)
+        await expect(storage.pluginModelInferenceRun(
+            PRINCIPAL,
+            INSTANCE,
+            'bad',
+            new Uint8Array([1]),
+            'image/png',
+            {},
+            signal,
+        )).rejects.toThrow(/session/i)
+        await expect(storage.pluginModelInferenceRun(
+            PRINCIPAL,
+            INSTANCE,
+            SESSION,
+            new Uint8Array([1]),
+            'image/gif',
+            {},
+            signal,
+        )).rejects.toThrow(/media/i)
+        expect(fetchMock).not.toHaveBeenCalled()
     })
 
     it('forwards the session-conflict response and rejects non-Host wire values before fetch', async () => {
