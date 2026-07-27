@@ -177,6 +177,7 @@ async function harness(options: {
     lookup?: (...args: any[]) => Promise<unknown>
     lookupTimeoutMs?: number
     store?: any
+    sessions?: any
 } = {}) {
     const value = options.value ?? profile()
     const stored = options.store ? { root: '', store: options.store } : await makeStore(value)
@@ -189,6 +190,7 @@ async function harness(options: {
         lookup,
         lookupTimeoutMs: options.lookupTimeoutMs,
         request: network.request,
+        ...(options.sessions ? { sessions: options.sessions } : {}),
     })
     return { ...stored, service, network, lookup, value }
 }
@@ -198,6 +200,17 @@ async function expectCode(promise: Promise<unknown>, code: string) {
 }
 
 describe('Pocket PixAI secure download service', () => {
+    it('defers removal through the active-session barrier without touching artifacts', async () => {
+        const sessions = {
+            isRemovalPending: vi.fn(() => false),
+            removeWithBarrier: vi.fn(async () => ({ purgedBytes: 0, pending: true })),
+        }
+        const h = await harness({ sessions })
+
+        await expect(h.service.remove(PROFILE_ID)).resolves.toEqual({ purgedBytes: 0, pending: true })
+        expect(sessions.removeWithBarrier).toHaveBeenCalledWith(PROFILE_ID, expect.any(Function))
+    })
+
     it('rejects an unknown or hostile profile before storage, DNS, or HTTPS work', async () => {
         const stat = vi.fn()
         const lookup = vi.fn()

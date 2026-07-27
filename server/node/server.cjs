@@ -35,12 +35,16 @@ const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasR
 const { repairDuplicateCharacterIds, repairChatIdsBeforeIndexing } = require('./groupPersistence.cjs');
 const { createPluginModelStore } = require('./pluginModelStore.cjs');
 const { createPluginModelDownloadService, registerPluginModelRoutes } = require('./pluginModelDownload.cjs');
+const { createPluginModelSessionBroker } = require('./pluginModelSessions.cjs');
+const { registerPluginModelInferenceRoutes } = require('./pluginModelInferenceRoutes.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
 
-const pluginModelStore = createPluginModelStore({ root: path.join(process.cwd(), 'model-cache') });
-const pluginModelDownloads = createPluginModelDownloadService({ store: pluginModelStore });
+const pluginModelRoot = path.join(process.cwd(), 'model-cache');
+const pluginModelStore = createPluginModelStore({ root: pluginModelRoot });
+const pluginModelSessions = createPluginModelSessionBroker({ store: pluginModelStore, root: pluginModelRoot });
+const pluginModelDownloads = createPluginModelDownloadService({ store: pluginModelStore, sessions: pluginModelSessions });
 
 // Install process-level error handlers before any other init so early crashes get logged.
 installProcessHandlers();
@@ -2544,6 +2548,12 @@ async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = fal
 registerPluginModelRoutes({
     app,
     service: pluginModelDownloads,
+    checkAuth,
+    checkActiveSession,
+});
+registerPluginModelInferenceRoutes({
+    app,
+    broker: pluginModelSessions,
     checkAuth,
     checkActiveSession,
 });
@@ -6234,6 +6244,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, async () => {
         console.log(`[Server] Received ${sig}, flushing pending data...`);
         stopTunnel();
+        try { await pluginModelSessions.dispose(); } catch (e) { logger.error('[Server] Model session shutdown error:', e); }
         try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
         try { checkpointWal('TRUNCATE'); } catch { /* non-fatal */ }
         process.exit(0);

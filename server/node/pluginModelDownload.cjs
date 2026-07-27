@@ -756,6 +756,7 @@ function createPluginModelDownloadService(options) {
     const lookup = options.lookup ?? dns.lookup;
     const lookupTimeoutMs = options.lookupTimeoutMs ?? DNS_LOOKUP_TIMEOUT_MS;
     const request = options.request ?? https.request;
+    const sessions = options.sessions;
     if (
         !Number.isSafeInteger(lookupTimeoutMs) ||
         lookupTimeoutMs <= 0 ||
@@ -958,6 +959,9 @@ function createPluginModelDownloadService(options) {
         download(profileId, principalValue, observer) {
             const profile = profileFor(profileId);
             const principalId = validatePrincipal(principalValue);
+            if (sessions?.isRemovalPending?.(profile.id)) {
+                throw failure('CONFLICT', 'Model removal is pending');
+            }
             if (observer !== undefined && typeof observer !== 'function') {
                 throw failure('INVALID_ARGUMENT', 'Invalid progress observer');
             }
@@ -1013,18 +1017,19 @@ function createPluginModelDownloadService(options) {
             if (active?.profile.id === profile.id) {
                 throw failure('ACTIVE_DOWNLOAD', 'Model download is active');
             }
-            let purgedBytes = 0;
-            try {
-                for (const artifact of profile.artifacts) {
-                    const state = await store.stat(artifact.name);
-                    if (state.state === 'partial' && !includePartialValue) continue;
-                    purgedBytes += state.bytes;
-                    await store.remove(artifact.name);
-                }
-            } catch (error) {
-                throw safeError(error);
-            }
-            return Object.freeze({ purgedBytes });
+            const purge = async () => {
+                let purgedBytes = 0;
+                try {
+                    for (const artifact of profile.artifacts) {
+                        const state = await store.stat(artifact.name);
+                        if (state.state === 'partial' && !includePartialValue) continue;
+                        purgedBytes += state.bytes;
+                        await store.remove(artifact.name);
+                    }
+                } catch (error) { throw safeError(error); }
+                return Object.freeze({ purgedBytes });
+            };
+            return sessions?.removeWithBarrier ? sessions.removeWithBarrier(profile.id, purge) : purge();
         },
     };
     return Object.freeze(service);
@@ -1035,6 +1040,7 @@ function routeStatus(error) {
         case 'NOT_FOUND': return 404;
         case 'INVALID_ARGUMENT': return 400;
         case 'ACTIVE_DOWNLOAD': return 409;
+        case 'CONFLICT': return 409;
         case 'STORAGE_QUOTA': return 507;
         case 'NETWORK_ERROR': return 502;
         default: return 500;
