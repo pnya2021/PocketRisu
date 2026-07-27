@@ -130,6 +130,16 @@ async function revision(data: Uint8Array) {
     return `sha256:${[...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, '0')).join('')}`
 }
 
+async function deterministicInlayId(ownerPrincipalId: string, idempotencyKey: string) {
+    const encoded = new TextEncoder().encode(JSON.stringify([
+        ownerPrincipalId,
+        'inlay.create.v1',
+        idempotencyKey,
+    ]))
+    const digest = await crypto.subtle.digest('SHA-256', encoded)
+    return `inlay_${[...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, '0')).join('')}`
+}
+
 async function ownedRecord(data = png): Promise<InlayAssetRecord> {
     return {
         data: new Blob([data]),
@@ -309,7 +319,11 @@ describe('PixaiLocalModel facade', () => {
         })
         await facade.acquireLocalModelSession(PIXAI_PROFILE.id)
 
-        for (const inlayId of ['owned-id', 'foreign-id', 'legacy-id']) {
+        for (const inlayId of [
+            await deterministicInlayId(PRINCIPAL, own.lifecycle!.idempotencyKey),
+            await deterministicInlayId(foreign.lifecycle!.ownerPrincipalId, foreign.lifecycle!.idempotencyKey),
+            'legacy-id',
+        ]) {
             await facade.runLocalModel(SESSION_A, {
                 image: { kind: 'inlay', inlayId, revision: await revision(png) },
             })
@@ -320,6 +334,30 @@ describe('PixaiLocalModel facade', () => {
             ['localModelInference'], ['inlayRead'],
             ['localModelInference'], ['inlayRead'],
         ])
+    })
+
+    it('treats an own-looking lifecycle relocated to a non-deterministic ID as foreign', async () => {
+        const relocated = await ownedRecord()
+        const { facade, client: modelClient, permission } = setup({
+            getInlayAssetRecord: async () => relocated,
+            getInlayAssetBlob: async () => ({ data: new Blob([png]) }),
+            requirePermission: async (requested) => {
+                if (requested === 'inlayRead') {
+                    throw new PluginApiError('PERMISSION_DENIED', 'Foreign Inlay read was denied')
+                }
+            },
+        })
+        await facade.acquireLocalModelSession(PIXAI_PROFILE.id)
+
+        await expect(facade.runLocalModel(SESSION_A, {
+            image: { kind: 'inlay', inlayId: 'relocated-id', revision: await revision(png) },
+        })).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+        expect(permission.mock.calls).toEqual([
+            ['localModelInference'],
+            ['localModelInference'],
+            ['inlayRead'],
+        ])
+        expect(modelClient.run).not.toHaveBeenCalled()
     })
 
     it('rejects inlay races, revision, size and media failures before private inference', async () => {

@@ -380,12 +380,22 @@ function boundedFingerprint(value: unknown, depth = 0): unknown {
     }
 }
 
-function lifecycleSnapshot(record: InlayAssetRecord): {
+async function deterministicLifecycleInlayId(ownerPrincipalId: string, idempotencyKey: string) {
+    const encoded = new TextEncoder().encode(JSON.stringify([
+        ownerPrincipalId,
+        'inlay.create.v1',
+        idempotencyKey,
+    ]))
+    const revision = await sha256Revision(encoded)
+    return `inlay_${revision.slice('sha256:'.length)}`
+}
+
+async function lifecycleSnapshot(record: InlayAssetRecord, inlayId: string): Promise<{
     valid?: Record<string, unknown>
     key: string
     owner?: string
     revision?: string
-} {
+}> {
     let descriptor: PropertyDescriptor | undefined
     try {
         descriptor = Object.getOwnPropertyDescriptor(record, 'lifecycle')
@@ -396,6 +406,13 @@ function lifecycleSnapshot(record: InlayAssetRecord): {
     if (!('value' in descriptor)) return { key: 'malformed:[accessor]' }
     const valid = lifecycleValue(descriptor.value)
     if (valid) {
+        const expectedId = await deterministicLifecycleInlayId(
+            valid.ownerPrincipalId as string,
+            valid.idempotencyKey as string,
+        )
+        if (expectedId !== inlayId) {
+            return { key: `relocated:${JSON.stringify(valid)}` }
+        }
         return {
             valid,
             key: `valid:${JSON.stringify(valid)}`,
@@ -534,7 +551,8 @@ export class PixaiLocalModel {
         const before = await this.getInlayAssetRecord(source.inlayId)
         throwIfAborted(signal)
         if (!before) throw new PluginApiError('NOT_FOUND', 'Inlay was not found')
-        const beforeLifecycle = lifecycleSnapshot(before)
+        const beforeLifecycle = await lifecycleSnapshot(before, source.inlayId)
+        throwIfAborted(signal)
         await this.requirePermission(beforeLifecycle.owner === this.context.principalId
             ? 'inlayWrite'
             : 'inlayRead')
@@ -566,7 +584,7 @@ export class PixaiLocalModel {
         }
         const after = await this.getInlayAssetRecord(source.inlayId)
         throwIfAborted(signal)
-        if (!after || lifecycleSnapshot(after).key !== beforeLifecycle.key) {
+        if (!after || (await lifecycleSnapshot(after, source.inlayId)).key !== beforeLifecycle.key) {
             throw new PluginApiError('CONFLICT', 'Inlay changed while it was being read', { retryable: true })
         }
         return validateImageBytes(data)
