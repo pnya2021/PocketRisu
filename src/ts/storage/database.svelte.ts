@@ -2180,6 +2180,17 @@ export interface Chat{
         completedAt: number
         expiresAt: number
     }>
+    /** Host-private durable replay receipts stored with atomic generated-Inlay attachments. */
+    pluginAtomicAttachReceipts?: Array<{
+        version: 1
+        principalId: string
+        operation: 'inlay.atomic-attach.v1'
+        idempotencyKey: string
+        digest: string
+        target: { characterId: string; conversationId: string; messageId: string }
+        result: unknown
+        completedAt: number
+    }>
     /** Runtime-only: true while awaiting hydration from server. Never persisted. */
     _placeholder?: boolean
 }
@@ -2216,10 +2227,10 @@ export interface Message{
     /** Principal-namespaced state owned by the restricted V3 message APIs. */
     pluginMessageState?: Record<string, {
         metadata: Record<string, any>
-        /** Reserved for later attachment slices; H11-A never creates or exposes these. */
+        /** Caller-owned inline Inlay attachments managed by the restricted V3 APIs. */
         attachments: Array<{
             inlayId: string
-            presentation?: 'inline' | 'styled' | 'model-input'
+            presentation: 'inline'
             metadata?: any
             [key: string]: unknown
         }>

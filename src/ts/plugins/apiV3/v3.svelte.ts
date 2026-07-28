@@ -62,8 +62,10 @@ import { PocketPluginModelClient } from './localModel/pocketPluginModelClient';
 import { PixaiLocalModel, withPixaiInferenceCapability } from './localModel/pixaiLocalModel';
 import { MESSAGE_QUERY_CAPABILITY_IDS, MessageQueryService } from './illustration/messageQuery';
 import { createPocketMessageQueryAdapter } from './illustration/messageQuery.pocket';
-import { MESSAGE_PATCH_CAPABILITY_IDS, MessagePatchService } from './illustration/messagePatch';
+import { MESSAGE_PATCH_CAPABILITY_IDS, MessageMutationRateLimiter, MessagePatchService } from './illustration/messagePatch';
 import { createPocketMessagePatchAdapter } from './illustration/messagePatch.pocket';
+import { INLAY_ATOMIC_ATTACH_CAPABILITY_IDS, InlayAtomicAttachService } from './illustration/inlayAtomicAttach';
+import { createPocketInlayAtomicAttachAdapter } from './illustration/inlayAtomicAttach.pocket';
 
 /*
     V3 API for RisuAI Plugins
@@ -87,6 +89,7 @@ import { createPocketMessagePatchAdapter } from './illustration/messagePatch.poc
 const pluginChannels = new InstanceChannelRegistry();
 const pluginInstanceCleanup = new InstanceCleanupRegistry();
 const pluginModelNodeStorage = new NodeStorage();
+const messageMutationRateLimiter = new MessageMutationRateLimiter();
 const pixaiInstallLifecycle = new PixaiInstallLifecycle({
     clientForPrincipal: (principalId) => new PocketPluginModelClient(pluginModelNodeStorage, principalId),
     requirePermission: (executionContext) => pluginPermissionService.require(
@@ -677,6 +680,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 permission,
                 { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
             ),
+            rateLimiter: messageMutationRateLimiter,
         },
     )
     const inlayLifecycle = new InlayLifecycleService(
@@ -693,6 +697,28 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             require: (executionContext, permission) => pluginPermissionService.require(executionContext, permission, {
                 locale: DBState.db.language === 'ko' ? 'ko' : 'en',
             }),
+        },
+    )
+    const inlayAtomicAttach = new InlayAtomicAttachService(
+        context,
+        createPocketInlayAtomicAttachAdapter({
+            getDatabase,
+            getCurrentCharacter,
+            ensureChatHydrated,
+            saveChatToServer,
+            runFailClosedExclusiveMutation: (operation) =>
+                databasePersistenceCoordinator.runFailClosedExclusiveMutation(operation),
+            listInlayKeys,
+            stageAtomicInlay: (data, request) => inlayLifecycle.stageAtomicInlay(data, request),
+            deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
+        }),
+        {
+            requirePermission: (executionContext, permission) => pluginPermissionService.require(
+                executionContext,
+                permission,
+                { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
+            ),
+            rateLimiter: messageMutationRateLimiter,
         },
     )
     const deviceCache = new DeviceCacheService(context)
@@ -1357,6 +1383,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.modules-installed.v1',
                     ...MESSAGE_QUERY_CAPABILITY_IDS,
                     ...MESSAGE_PATCH_CAPABILITY_IDS,
+                    ...INLAY_ATOMIC_ATTACH_CAPABILITY_IDS,
                     ...INLAY_LIFECYCLE_CAPABILITY_IDS,
                     ...DEVICE_CACHE_CAPABILITY_IDS,
                 ],
@@ -1381,6 +1408,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getLatestCommittedMessage: (options) => messageQuery.getLatestCommittedMessage(options),
         getRecentCommittedMessages: (options) => messageQuery.getRecentCommittedMessages(options),
         patchMessage: (input) => messagePatch.patchMessage(input),
+        attachGeneratedInlayToMessage: (input) => inlayAtomicAttach.attachGeneratedInlayToMessage(input),
         //Internal use APIs
         _getOldKeys: () => {
             return Object.keys(oldApis)

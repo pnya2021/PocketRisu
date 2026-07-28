@@ -1,14 +1,17 @@
 import { safeStructuredClone } from '../../../polyfill'
 import { PluginApiError } from './errors'
 import type {
-    MessagePatchHostAdapter,
-    MessagePatchResult,
-    PreparedMessagePatch,
-} from './messagePatch'
+    InlayAtomicAttachHostAdapter,
+    InlayAtomicAttachResult,
+    PreparedInlayAtomicAttach,
+} from './inlayAtomicAttach'
+import type { AtomicInlayStageRequest, InlayDescriptor } from './inlayLifecycle'
+import { deterministicAtomicInlayId } from './inlayLifecycle'
 import {
     MAX_CALLER_ATTACHMENTS,
     projectCallerAttachments,
     projectLogicalContent,
+    resolveLogicalInsertionOffset,
     type MessageSnapshot,
     type PluginJsonValue,
 } from './messageQuery'
@@ -16,38 +19,38 @@ import { canonicalJson, createRevision, validateJsonLimits } from './revision'
 
 type UnknownRecord = Record<string, any>
 
-const OPERATION = 'chat.message-patch.v1'
-const RETENTION_MS = 86_400_000
+const OPERATION = 'inlay.atomic-attach.v1'
+const MAX_METADATA_BYTES = 65_536
+const MAX_METADATA_KEYS = 16
 const MAX_RECEIPTS_PER_PRINCIPAL = 4_096
 const MAX_RECEIPT_BYTES = 2_200_000
 const MAX_CHAT_RECEIPT_BYTES = 134_217_728
-const MAX_METADATA_BYTES = 65_536
-const MAX_METADATA_KEYS = 16
 const MAX_SNAPSHOT_UTF16 = 262_144
 const MAX_SNAPSHOT_JSON_BYTES = 2_097_152
 
-export interface PocketMessagePatchDependencies {
+export interface PocketInlayAtomicAttachDependencies {
     getDatabase(): { characters?: UnknownRecord[] }
     getCurrentCharacter(): UnknownRecord | undefined
     ensureChatHydrated(chats: any[], index: number, chaId: string): Promise<UnknownRecord | null>
     saveChatToServer(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void>
-    runExclusiveMutation<T>(operation: () => T | Promise<T>): Promise<T>
+    runFailClosedExclusiveMutation<T>(operation: () => T | Promise<T>): Promise<T>
     listInlayKeys(): Promise<string[]>
+    stageAtomicInlay(data: Uint8Array, request: AtomicInlayStageRequest): Promise<InlayDescriptor>
+    deleteInlay(id: string, options?: { expectedRevision?: string }): Promise<unknown>
     createRevision?(value: unknown): Promise<string>
     createId?(): string
     now?(): number
 }
 
-interface PersistedReceipt {
+interface PersistedAtomicReceipt {
     version: 1
     principalId: string
     operation: typeof OPERATION
     idempotencyKey: string
     digest: string
     target: { characterId: string; conversationId: string; messageId: string }
-    result: MessagePatchResult
+    result: InlayAtomicAttachResult
     completedAt: number
-    expiresAt: number
 }
 
 interface LiveCapture {
@@ -68,9 +71,18 @@ interface LiveCapture {
     canonicalSource: string
 }
 
-const nonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.length > 0
+type LeaseOutcome =
+    | { ok: true; result: InlayAtomicAttachResult }
+    | { ok: false; error: unknown }
 
-const conflict = (message = 'Message changed; retry the patch'): never => {
+const nonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.length > 0
+const plainRecord = (value: unknown): value is UnknownRecord => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+}
+
+const conflict = (message = 'Message changed; retry the attachment'): never => {
     throw new PluginApiError('CONFLICT', message, { retryable: true })
 }
 
@@ -78,7 +90,7 @@ const notFound = (): never => {
     throw new PluginApiError('NOT_FOUND', 'Message or conversation was not found')
 }
 
-const currentTarget = (dependencies: PocketMessagePatchDependencies) => {
+const currentTarget = (dependencies: PocketInlayAtomicAttachDependencies) => {
     const character = dependencies.getCurrentCharacter()
     const characterId = character?.chaId
     const page = character?.chatPage
@@ -88,17 +100,20 @@ const currentTarget = (dependencies: PocketMessagePatchDependencies) => {
         : null
 }
 
-const ensureCurrentTarget = (dependencies: PocketMessagePatchDependencies, request: PreparedMessagePatch) => {
+const ensureRequestActive = (request: PreparedInlayAtomicAttach) => {
+    if (request.signal.aborted) throw new PluginApiError('ABORTED', 'Operation aborted')
+}
+
+const ensureCurrentTarget = (
+    dependencies: PocketInlayAtomicAttachDependencies,
+    request: PreparedInlayAtomicAttach,
+) => {
     const current = currentTarget(dependencies)
     if (!current || current.characterId !== request.input.target.characterId
         || current.conversationId !== request.input.target.conversationId) {
         throw new PluginApiError('PERMISSION_DENIED', 'Message target is not current')
     }
     return current
-}
-
-const ensureRequestActive = (request: PreparedMessagePatch) => {
-    if (request.signal.aborted) throw new PluginApiError('ABORTED', 'Operation aborted')
 }
 
 const dependencyFailure = (error: unknown, label: string): never => {
@@ -157,8 +172,8 @@ const sourceValue = (message: UnknownRecord) => ({
 })
 
 const captureLive = (
-    dependencies: PocketMessagePatchDependencies,
-    request: PreparedMessagePatch,
+    dependencies: PocketInlayAtomicAttachDependencies,
+    request: PreparedInlayAtomicAttach,
 ): LiveCapture => {
     const root = dependencies.getDatabase()
     if (!root || typeof root !== 'object') notFound()
@@ -187,8 +202,8 @@ const captureLive = (
 }
 
 const isCaptureCurrent = (
-    dependencies: PocketMessagePatchDependencies,
-    request: PreparedMessagePatch,
+    dependencies: PocketInlayAtomicAttachDependencies,
+    request: PreparedInlayAtomicAttach,
     capture: LiveCapture,
 ) => {
     try {
@@ -222,8 +237,8 @@ const isCaptureCurrent = (
 }
 
 const ensureCaptureCurrent = (
-    dependencies: PocketMessagePatchDependencies,
-    request: PreparedMessagePatch,
+    dependencies: PocketInlayAtomicAttachDependencies,
+    request: PreparedInlayAtomicAttach,
     capture: LiveCapture,
 ) => {
     ensureRequestActive(request)
@@ -232,8 +247,8 @@ const ensureCaptureCurrent = (
 }
 
 const rejectAfterCaptureFailure = (
-    dependencies: PocketMessagePatchDependencies,
-    request: PreparedMessagePatch,
+    dependencies: PocketInlayAtomicAttachDependencies,
+    request: PreparedInlayAtomicAttach,
     capture: LiveCapture,
     error: unknown,
     label: string,
@@ -242,15 +257,9 @@ const rejectAfterCaptureFailure = (
     return dependencyFailure(error, label)
 }
 
-const plainRecord = (value: unknown): value is UnknownRecord => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-    const prototype = Object.getPrototypeOf(value)
-    return prototype === Object.prototype || prototype === null
-}
-
 const cloneJson = <T>(value: T): T => JSON.parse(canonicalJson(value)) as T
 
-const validReceipt = (value: unknown): value is PersistedReceipt => {
+const validReceipt = (value: unknown): value is PersistedAtomicReceipt => {
     if (!plainRecord(value)) return false
     return value.version === 1
         && nonEmptyString(value.principalId)
@@ -262,34 +271,51 @@ const validReceipt = (value: unknown): value is PersistedReceipt => {
         && nonEmptyString(value.target.conversationId)
         && nonEmptyString(value.target.messageId)
         && plainRecord(value.result)
-        && typeof value.result.changed === 'boolean'
-        && nonEmptyString(value.result.commitId)
+        && plainRecord(value.result.inlay)
+        && nonEmptyString(value.result.inlay.id)
+        && nonEmptyString(value.result.inlay.revision)
+        && nonEmptyString(value.result.inlay.name)
         && plainRecord(value.result.message)
+        && nonEmptyString(value.result.commitId)
         && typeof value.completedAt === 'number' && Number.isFinite(value.completedAt)
-        && typeof value.expiresAt === 'number' && Number.isFinite(value.expiresAt)
 }
 
-const receipts = (conversation: UnknownRecord, now: number) => {
-    const raw = conversation.pluginMessagePatchReceipts
-    if (raw === undefined) return [] as PersistedReceipt[]
+const receipts = (conversation: UnknownRecord) => {
+    const raw = conversation.pluginAtomicAttachReceipts
+    if (raw === undefined) return [] as PersistedAtomicReceipt[]
     if (!Array.isArray(raw) || raw.some((entry) => !validReceipt(entry))) {
-        throw new PluginApiError('INTERNAL', 'Message patch receipts are invalid', { retryable: true })
+        throw new PluginApiError('INTERNAL', 'Atomic Inlay receipts are invalid', { retryable: true })
     }
-    return raw.filter((entry) => entry.expiresAt > now).map((entry) => cloneJson(entry))
+    return raw.map((entry) => cloneJson(entry))
 }
 
 const receiptReplay = (
-    records: PersistedReceipt[],
-    request: PreparedMessagePatch,
-): MessagePatchResult | undefined => {
+    records: PersistedAtomicReceipt[],
+    request: PreparedInlayAtomicAttach,
+): InlayAtomicAttachResult | undefined => {
     const matches = records.filter((record) => record.principalId === request.principalId
         && record.operation === OPERATION && record.idempotencyKey === request.input.idempotencyKey)
-    if (matches.length > 1) throw new PluginApiError('INTERNAL', 'Duplicate message patch receipt', { retryable: true })
+    if (matches.length > 1) throw new PluginApiError('INTERNAL', 'Duplicate atomic Inlay receipt', { retryable: true })
     if (matches.length === 0) return undefined
     if (matches[0].digest !== request.argumentDigest) {
         throw new PluginApiError('CONFLICT', 'Idempotency key arguments conflict')
     }
     return cloneJson(matches[0].result)
+}
+
+const appendReceipt = (records: PersistedAtomicReceipt[], receipt: PersistedAtomicReceipt) => {
+    const principalCount = records.filter((record) => record.principalId === receipt.principalId).length
+    if (principalCount >= MAX_RECEIPTS_PER_PRINCIPAL) {
+        throw new PluginApiError('RESOURCE_LIMIT', 'Atomic Inlay receipt capacity is full', { retryable: true })
+    }
+    if (new TextEncoder().encode(canonicalJson(receipt)).byteLength > MAX_RECEIPT_BYTES) {
+        throw new PluginApiError('RESOURCE_LIMIT', 'Atomic Inlay receipt exceeds storage limit')
+    }
+    const next = [...records, receipt]
+    if (new TextEncoder().encode(canonicalJson(next)).byteLength > MAX_CHAT_RECEIPT_BYTES) {
+        throw new PluginApiError('RESOURCE_LIMIT', 'Atomic Inlay receipt storage is full', { retryable: true })
+    }
+    return next
 }
 
 const callerState = (message: UnknownRecord, principalId: string) => {
@@ -309,11 +335,11 @@ const callerState = (message: UnknownRecord, principalId: string) => {
     return {
         ...(existing ?? {}),
         metadata: cloneJson(metadata) as Record<string, PluginJsonValue>,
-        attachments: safeStructuredClone(attachments),
+        attachments: safeStructuredClone(attachments) as UnknownRecord[],
     }
 }
 
-const validateCallerMetadata = (state: UnknownRecord) => {
+const validateCallerState = (state: UnknownRecord) => {
     const keys = Reflect.ownKeys(state.metadata)
     if (keys.some((key) => typeof key !== 'string')) {
         throw new PluginApiError('INVALID_ARGUMENT', 'Invalid caller metadata')
@@ -344,16 +370,17 @@ const timestamp = (value: unknown) => typeof value === 'number' && Number.isFini
 const snapshot = async (
     capture: LiveCapture,
     message: UnknownRecord,
-    request: PreparedMessagePatch,
+    request: PreparedInlayAtomicAttach,
     recognized: ReadonlySet<string>,
     revision: (value: unknown) => Promise<string>,
 ): Promise<MessageSnapshot> => {
     const state = message.pluginMessageState?.[request.principalId]
     const metadata = state?.metadata === undefined ? {} : cloneJson(state.metadata)
+    const projection = projectLogicalContent(message.data, recognized)
     const result: MessageSnapshot = {
         ...request.input.target,
         role: message.role,
-        content: projectLogicalContent(message.data, recognized).content,
+        content: projection.content,
         revision: await revision(revisionValue(message)),
         updatedAt: Math.max(timestamp(message.time), timestamp(message.pluginMessageUpdatedAt), timestamp(state?.updatedAt)),
         callerPluginState: {
@@ -375,34 +402,19 @@ const snapshot = async (
         callerAttachmentCount: result.callerPluginState.attachments.length,
     }
     if (result.content.length > MAX_SNAPSHOT_UTF16
+        || result.callerPluginState.attachments.length > MAX_CALLER_ATTACHMENTS
         || new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_SNAPSHOT_JSON_BYTES) {
         throw new PluginApiError('RESOURCE_LIMIT', 'Message snapshot exceeds limit', { details })
     }
     return result
 }
 
-const appendReceipt = (records: PersistedReceipt[], receipt: PersistedReceipt) => {
-    const principalCount = records.filter((record) => record.principalId === receipt.principalId).length
-    if (principalCount >= MAX_RECEIPTS_PER_PRINCIPAL) {
-        throw new PluginApiError('RESOURCE_LIMIT', 'Message patch receipt capacity is full', { retryable: true })
-    }
-    const receiptBytes = new TextEncoder().encode(canonicalJson(receipt)).byteLength
-    if (receiptBytes > MAX_RECEIPT_BYTES) {
-        throw new PluginApiError('RESOURCE_LIMIT', 'Message patch receipt exceeds storage limit')
-    }
-    const next = [...records, receipt]
-    if (new TextEncoder().encode(canonicalJson(next)).byteLength > MAX_CHAT_RECEIPT_BYTES) {
-        throw new PluginApiError('RESOURCE_LIMIT', 'Message patch receipt storage is full', { retryable: true })
-    }
-    return next
-}
-
-export function createPocketMessagePatchAdapter(
-    dependencies: PocketMessagePatchDependencies,
-): MessagePatchHostAdapter {
+export function createPocketInlayAtomicAttachAdapter(
+    dependencies: PocketInlayAtomicAttachDependencies,
+): InlayAtomicAttachHostAdapter {
     const revision = dependencies.createRevision ?? createRevision
-    const now = dependencies.now ?? Date.now
     const createId = dependencies.createId ?? (() => crypto.randomUUID())
+    const now = dependencies.now ?? Date.now
 
     return {
         current() {
@@ -410,126 +422,193 @@ export function createPocketMessagePatchAdapter(
             return current ? { characterId: current.characterId, conversationId: current.conversationId } : null
         },
 
-        patchCurrentMessage(request) {
-            return dependencies.runExclusiveMutation(async () => {
-                ensureRequestActive(request)
-                ensureCurrentTarget(dependencies, request)
-                const root = dependencies.getDatabase()
-                if (!root || typeof root !== 'object') notFound()
-                const character = exactCharacter(root, request.input.target.characterId)
-                const conversation = exactConversation(character.character, request.input.target.conversationId)
-                const initialIndex = conversation.index
-                let hydrated: UnknownRecord | null
+        async attachCurrentMessage(request) {
+            const outcome = await dependencies.runFailClosedExclusiveMutation<LeaseOutcome>(async () => {
+                let staged: InlayDescriptor | undefined
+                let persistenceRequested = false
                 try {
-                    hydrated = await dependencies.ensureChatHydrated(
-                        conversation.chats, initialIndex, request.input.target.characterId,
-                    )
-                } catch (error) {
+                    ensureRequestActive(request)
+                    ensureCurrentTarget(dependencies, request)
+                    const root = dependencies.getDatabase()
+                    if (!root || typeof root !== 'object') notFound()
+                    const character = exactCharacter(root, request.input.target.characterId)
+                    const conversation = exactConversation(character.character, request.input.target.conversationId)
+                    const initialIndex = conversation.index
+                    let hydrated: UnknownRecord | null
+                    try {
+                        hydrated = await dependencies.ensureChatHydrated(
+                            conversation.chats, initialIndex, request.input.target.characterId,
+                        )
+                    } catch (error) {
+                        ensureRequestActive(request)
+                        ensureCurrentTarget(dependencies, request)
+                        if (dependencies.getDatabase() !== root || root.characters !== character.characters
+                            || character.characters[character.index] !== character.character
+                            || character.character.chats !== conversation.chats
+                            || conversation.chats[initialIndex] !== conversation.conversation) conflict()
+                        return dependencyFailure(error, 'Message hydration')
+                    }
                     ensureRequestActive(request)
                     ensureCurrentTarget(dependencies, request)
                     if (dependencies.getDatabase() !== root || root.characters !== character.characters
                         || character.characters[character.index] !== character.character
-                        || character.character.chats !== conversation.chats
-                        || conversation.chats[initialIndex] !== conversation.conversation) conflict()
-                    return dependencyFailure(error, 'Message hydration')
-                }
-                ensureRequestActive(request)
-                ensureCurrentTarget(dependencies, request)
-                if (dependencies.getDatabase() !== root || root.characters !== character.characters
-                    || character.characters[character.index] !== character.character
-                    || character.character.chats !== conversation.chats) conflict()
-                const afterHydration = exactConversation(character.character, request.input.target.conversationId)
-                if (!hydrated || hydrated._placeholder === true || !Array.isArray(hydrated.message)
-                    || afterHydration.index !== initialIndex || afterHydration.conversation !== hydrated) conflict()
+                        || character.character.chats !== conversation.chats) conflict()
+                    const afterHydration = exactConversation(character.character, request.input.target.conversationId)
+                    if (!hydrated || hydrated._placeholder === true || !Array.isArray(hydrated.message)
+                        || afterHydration.index !== initialIndex || afterHydration.conversation !== hydrated) conflict()
 
-                const activeReceipts = receipts(afterHydration.conversation, now())
-                const replay = receiptReplay(activeReceipts, request)
-                if (replay) return replay
+                    const activeReceipts = receipts(afterHydration.conversation)
+                    const replay = receiptReplay(activeReceipts, request)
+                    if (replay) return { ok: true, result: replay }
 
-                const capture = captureLive(dependencies, request)
-                let actualRevision: string
-                try {
-                    actualRevision = await revision(revisionValue(capture.message))
-                } catch (error) {
-                    return rejectAfterCaptureFailure(
-                        dependencies, request, capture, error, 'Message revision',
+                    const capture = captureLive(dependencies, request)
+                    let actualRevision: string
+                    try {
+                        actualRevision = await revision(revisionValue(capture.message))
+                    } catch (error) {
+                        return rejectAfterCaptureFailure(
+                            dependencies, request, capture, error, 'Message revision',
+                        )
+                    }
+                    ensureCaptureCurrent(dependencies, request, capture)
+                    if (actualRevision !== request.input.expectedMessageRevision) {
+                        conflict('Message revision is stale')
+                    }
+
+                    let keys: string[]
+                    try {
+                        keys = await dependencies.listInlayKeys()
+                    } catch (error) {
+                        return rejectAfterCaptureFailure(
+                            dependencies, request, capture, error, 'Inlay enumeration',
+                        )
+                    }
+                    ensureCaptureCurrent(dependencies, request, capture)
+                    if (!Array.isArray(keys) || keys.some((key) => typeof key !== 'string')) {
+                        throw new PluginApiError('INTERNAL', 'Unable to enumerate Inlays', { retryable: true })
+                    }
+                    const known = new Set(keys)
+                    const rawOffset = resolveLogicalInsertionOffset(
+                        capture.message.data, known, request.input.placement,
                     )
-                }
-                ensureCaptureCurrent(dependencies, request, capture)
-                if (actualRevision !== request.input.expectedRevision) conflict('Message revision is stale')
+                    if (rawOffset === null) {
+                        throw new PluginApiError('INVALID_ARGUMENT', 'Invalid logical UTF-16 placement')
+                    }
+                    let anticipatedId: string
+                    try {
+                        anticipatedId = await deterministicAtomicInlayId(
+                            request.principalId, request.input.idempotencyKey,
+                        )
+                    } catch (error) {
+                        return rejectAfterCaptureFailure(
+                            dependencies, request, capture, error, 'Atomic Inlay identity',
+                        )
+                    }
+                    ensureCaptureCurrent(dependencies, request, capture)
+                    const state = callerState(capture.message, request.principalId)
+                    if (state.attachments.some((attachment) => attachment?.inlayId === anticipatedId)) {
+                        conflict('Inlay is already attached to this message')
+                    }
+                    const metadataEntry = request.input.messageMetadata[0]
+                    Object.defineProperty(state.metadata, metadataEntry.key, {
+                        value: cloneJson(metadataEntry.value), enumerable: true, configurable: true, writable: true,
+                    })
+                    state.attachments.push({
+                        inlayId: anticipatedId,
+                        presentation: 'inline',
+                        metadata: cloneJson(request.input.attachmentMetadata),
+                    })
+                    validateCallerState(state)
 
-                let keys: string[]
-                try {
-                    keys = await dependencies.listInlayKeys()
-                } catch (error) {
-                    return rejectAfterCaptureFailure(
-                        dependencies, request, capture, error, 'Inlay enumeration',
-                    )
-                }
-                ensureCaptureCurrent(dependencies, request, capture)
-                if (!Array.isArray(keys) || keys.some((key) => typeof key !== 'string')) {
-                    throw new PluginApiError('INTERNAL', 'Unable to enumerate Inlays', { retryable: true })
-                }
+                    try {
+                        staged = await dependencies.stageAtomicInlay(request.input.data.slice(), {
+                            name: request.input.inlay.name,
+                            idempotencyKey: request.input.idempotencyKey,
+                            argumentDigest: request.argumentDigest,
+                            target: { ...request.input.target },
+                            inputRevision: request.input.expectedMessageRevision,
+                            beforeMutation: () => ensureCaptureCurrent(dependencies, request, capture),
+                        })
+                    } catch (error) {
+                        return rejectAfterCaptureFailure(
+                            dependencies, request, capture, error, 'Atomic Inlay staging',
+                        )
+                    }
+                    ensureCaptureCurrent(dependencies, request, capture)
+                    if (staged.id !== anticipatedId || staged.name !== request.input.inlay.name
+                        || !nonEmptyString(staged.revision)) {
+                        throw new PluginApiError('INTERNAL', 'Atomic Inlay lifecycle returned an invalid descriptor', {
+                            retryable: true,
+                        })
+                    }
 
-                const staged = safeStructuredClone(capture.conversation)
-                const stagedMessage = staged.message[capture.messageIndex]
-                const state = callerState(stagedMessage, request.principalId)
-                const previous = Object.hasOwn(state.metadata, request.input.patch.key)
-                    ? canonicalJson(state.metadata[request.input.patch.key])
-                    : undefined
-                Object.defineProperty(state.metadata, request.input.patch.key, {
-                    value: cloneJson(request.input.patch.value), enumerable: true, configurable: true, writable: true,
-                })
-                validateCallerMetadata(state)
-                const changed = previous !== canonicalJson(request.input.patch.value)
-                const completedAt = now()
-                if (changed) {
+                    const completedAt = now()
                     state.updatedAt = completedAt
+                    const stagedChat = safeStructuredClone(capture.conversation)
+                    const stagedMessage = stagedChat.message[capture.messageIndex]
+                    stagedMessage.data = `${stagedMessage.data.slice(0, rawOffset)}{{inlay::${staged.id}}}${stagedMessage.data.slice(rawOffset)}`
                     stagedMessage.pluginMessageState = {
                         ...(stagedMessage.pluginMessageState ?? {}),
                         [request.principalId]: state,
                     }
                     stagedMessage.pluginMessageUpdatedAt = completedAt
-                }
-                let message: MessageSnapshot
-                try {
-                    message = await snapshot(capture, stagedMessage, request, new Set(keys), revision)
-                } catch (error) {
-                    return rejectAfterCaptureFailure(
-                        dependencies, request, capture, error, 'Message snapshot',
-                    )
-                }
-                ensureCaptureCurrent(dependencies, request, capture)
-                const result: MessagePatchResult = { changed, message, commitId: createId() }
-                const receipt: PersistedReceipt = {
-                    version: 1,
-                    principalId: request.principalId,
-                    operation: OPERATION,
-                    idempotencyKey: request.input.idempotencyKey,
-                    digest: request.argumentDigest,
-                    target: { ...request.input.target },
-                    result: cloneJson(result),
-                    completedAt,
-                    expiresAt: completedAt + RETENTION_MS,
-                }
-                staged.pluginMessagePatchReceipts = appendReceipt(activeReceipts, receipt)
+                    const recognized = new Set([...known, staged.id])
+                    let message: MessageSnapshot
+                    try {
+                        message = await snapshot(capture, stagedMessage, request, recognized, revision)
+                    } catch (error) {
+                        return rejectAfterCaptureFailure(
+                            dependencies, request, capture, error, 'Message snapshot',
+                        )
+                    }
+                    ensureCaptureCurrent(dependencies, request, capture)
+                    const result: InlayAtomicAttachResult = {
+                        inlay: cloneJson(staged),
+                        message,
+                        commitId: createId(),
+                    }
+                    const receipt: PersistedAtomicReceipt = {
+                        version: 1,
+                        principalId: request.principalId,
+                        operation: OPERATION,
+                        idempotencyKey: request.input.idempotencyKey,
+                        digest: request.argumentDigest,
+                        target: { ...request.input.target },
+                        result: cloneJson(result),
+                        completedAt,
+                    }
+                    stagedChat.pluginAtomicAttachReceipts = appendReceipt(activeReceipts, receipt)
 
-                try {
-                    await dependencies.saveChatToServer(
-                        request.input.target.characterId,
-                        capture.conversationIndex,
-                        request.input.target.conversationId,
-                        staged,
-                    )
+                    persistenceRequested = true
+                    try {
+                        await dependencies.saveChatToServer(
+                            request.input.target.characterId,
+                            capture.conversationIndex,
+                            request.input.target.conversationId,
+                            stagedChat,
+                        )
+                    } catch (error) {
+                        return rejectAfterCaptureFailure(
+                            dependencies, request, capture, error, 'Message persistence',
+                        )
+                    }
+                    ensureCaptureCurrent(dependencies, request, capture)
+                    capture.chats[capture.conversationIndex] = stagedChat
+                    return { ok: true, result: cloneJson(result) }
                 } catch (error) {
-                    return rejectAfterCaptureFailure(
-                        dependencies, request, capture, error, 'Message persistence',
-                    )
+                    if (persistenceRequested) throw error
+                    if (staged) {
+                        try {
+                            await dependencies.deleteInlay(staged.id, { expectedRevision: staged.revision })
+                        } catch {
+                            // Preserve the primary known failure; deterministic staging remains retryable.
+                        }
+                    }
+                    return { ok: false, error }
                 }
-                ensureCaptureCurrent(dependencies, request, capture)
-                capture.chats[capture.conversationIndex] = staged
-                return cloneJson(result)
             })
+            if (outcome.ok === false) throw outcome.error
+            return outcome.result
         },
     }
 }

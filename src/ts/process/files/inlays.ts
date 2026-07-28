@@ -23,14 +23,25 @@ export type InlayAsset = {
     width?: number
 }
 
-export type InlayLifecycleMetadata = {
+type InlayLifecycleMetadataBase = {
     version: 1
     ownerPrincipalId: string
-    operation: 'inlay.create.v1'
     idempotencyKey: string
     argumentDigest: string
     revision: string
-    context: { kind: 'character'; characterId: string }
+}
+
+export type InlayLifecycleMetadata = InlayLifecycleMetadataBase & {
+    operation: 'inlay.create.v1' | 'inlay.atomic-attach.v1'
+    context:
+        | { kind: 'character'; characterId: string }
+        | {
+            kind: 'message'
+            characterId: string
+            conversationId: string
+            messageId: string
+        }
+    inputRevision?: string
 }
 
 export type InlayAssetRecord = InlayAsset & {

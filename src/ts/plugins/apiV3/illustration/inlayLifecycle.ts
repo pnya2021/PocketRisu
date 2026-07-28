@@ -9,6 +9,7 @@ export const INLAY_LIFECYCLE_CAPABILITY_IDS = [
 ] as const
 
 const CREATE_OPERATION = INLAY_LIFECYCLE_CAPABILITY_IDS[0]
+const ATOMIC_ATTACH_OPERATION = 'inlay.atomic-attach.v1' as const
 const MAX_INPUT_BYTES = 33_554_432
 const MAX_NAME_BYTES = 255
 
@@ -25,14 +26,39 @@ export interface InlayDescriptor {
     name: string
 }
 
-export interface InlayLifecycleMetadata {
+interface InlayLifecycleMetadataBase {
     version: 1
     ownerPrincipalId: string
-    operation: typeof CREATE_OPERATION
     idempotencyKey: string
     argumentDigest: string
     revision: string
+}
+
+export interface InlayCreateLifecycleMetadata extends InlayLifecycleMetadataBase {
+    operation: typeof CREATE_OPERATION
     context: { kind: 'character'; characterId: string }
+}
+
+export interface InlayAtomicLifecycleMetadata extends InlayLifecycleMetadataBase {
+    operation: typeof ATOMIC_ATTACH_OPERATION
+    context: {
+        kind: 'message'
+        characterId: string
+        conversationId: string
+        messageId: string
+    }
+    inputRevision: string
+}
+
+export type InlayLifecycleMetadata = InlayCreateLifecycleMetadata | InlayAtomicLifecycleMetadata
+
+export interface AtomicInlayStageRequest {
+    name: string
+    idempotencyKey: string
+    argumentDigest: string
+    target: { characterId: string; conversationId: string; messageId: string }
+    inputRevision: string
+    beforeMutation(): void | Promise<void>
 }
 
 export interface InlayLifecycleRecord extends InlayDescriptor {
@@ -109,25 +135,32 @@ const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)]
 
 const sha256 = async (data: Uint8Array) => hex(await crypto.subtle.digest('SHA-256', Uint8Array.from(data).buffer))
 
-const deterministicInlayId = async (principalId: string, idempotencyKey: string) => {
-    const encoded = new TextEncoder().encode(JSON.stringify([principalId, CREATE_OPERATION, idempotencyKey]))
+const deterministicInlayId = async (principalId: string, operation: string, idempotencyKey: string) => {
+    const encoded = new TextEncoder().encode(JSON.stringify([principalId, operation, idempotencyKey]))
     return `inlay_${await sha256(encoded)}`
 }
+
+export const deterministicAtomicInlayId = (principalId: string, idempotencyKey: string) =>
+    deterministicInlayId(principalId, ATOMIC_ATTACH_OPERATION, idempotencyKey)
 
 const validMetadata = (value: unknown): value is InlayLifecycleMetadata => {
     if (!value || typeof value !== 'object') return false
     const metadata = value as Partial<InlayLifecycleMetadata>
-    return metadata.version === 1
+    const common = metadata.version === 1
         && nonEmptyString(metadata.ownerPrincipalId)
-        && metadata.operation === CREATE_OPERATION
+        && (metadata.operation === CREATE_OPERATION || metadata.operation === ATOMIC_ATTACH_OPERATION)
         && nonEmptyString(metadata.idempotencyKey)
         && utf8ByteLength(metadata.idempotencyKey) <= 256
         && typeof metadata.argumentDigest === 'string'
         && /^[0-9a-f]{64}$/.test(metadata.argumentDigest)
         && typeof metadata.revision === 'string'
         && /^sha256:[0-9a-f]{64}$/.test(metadata.revision)
-        && metadata.context?.kind === 'character'
-        && nonEmptyString(metadata.context.characterId)
+    if (!common || !metadata.context || !nonEmptyString(metadata.context.characterId)) return false
+    if (metadata.operation === CREATE_OPERATION) return metadata.context.kind === 'character'
+    return metadata.context.kind === 'message'
+        && nonEmptyString(metadata.context.conversationId)
+        && nonEmptyString(metadata.context.messageId)
+        && nonEmptyString(metadata.inputRevision)
 }
 
 export class InlayLifecycleService {
@@ -154,7 +187,7 @@ export class InlayLifecycleService {
         const bytes = Uint8Array.from(data)
         assertLimit(bytes.byteLength, MAX_INPUT_BYTES, 'data')
         const options = normalizeCreateOptions(rawOptions)
-        const id = await deterministicInlayId(this.context.principalId, options.idempotencyKey)
+        const id = await deterministicInlayId(this.context.principalId, CREATE_OPERATION, options.idempotencyKey)
         const name = options.name ?? `${id}.png`
         const canonicalArgs = { data: bytes, name, context: options.context, return: options.return }
 
@@ -174,6 +207,7 @@ export class InlayLifecycleService {
                 if (existing) {
                     const metadata = existing.lifecycle
                     if (!validMetadata(metadata)
+                        || metadata.operation !== CREATE_OPERATION
                         || metadata.ownerPrincipalId !== this.context.principalId
                         || metadata.idempotencyKey !== options.idempotencyKey
                         || metadata.argumentDigest !== argumentDigest
@@ -224,6 +258,104 @@ export class InlayLifecycleService {
         )
     }
 
+    /** Internal atomic-attach staging; its caller has already authorized inlayWrite. */
+    async stageAtomicInlay(data: Uint8Array, request: AtomicInlayStageRequest): Promise<InlayDescriptor> {
+        if (!(data instanceof Uint8Array) || Object.getPrototypeOf(data) !== Uint8Array.prototype) {
+            invalidArgument('Atomic Inlay data must be a Uint8Array')
+        }
+        const bytes = Uint8Array.from(data)
+        assertLimit(bytes.byteLength, MAX_INPUT_BYTES, 'data')
+        const name = requiredString(request.name, 'Inlay name must be non-empty')
+        assertUtf8Limit(name, MAX_NAME_BYTES, 'name')
+        const idempotencyKey = requiredString(request.idempotencyKey, 'idempotencyKey is required')
+        assertUtf8Limit(idempotencyKey, 256, 'idempotencyKey')
+        if (!/^[0-9a-f]{64}$/u.test(request.argumentDigest)) invalidArgument('Invalid atomic argument digest')
+        const characterId = requiredString(request.target?.characterId, 'Invalid atomic message target')
+        const conversationId = requiredString(request.target?.conversationId, 'Invalid atomic message target')
+        const messageId = requiredString(request.target?.messageId, 'Invalid atomic message target')
+        const inputRevision = requiredString(request.inputRevision, 'Invalid atomic input revision')
+        if (typeof request.beforeMutation !== 'function') invalidArgument('Invalid atomic mutation guard')
+        const target = { characterId, conversationId, messageId }
+        const id = await deterministicAtomicInlayId(this.context.principalId, idempotencyKey)
+        const canonicalArgs = {
+            data: bytes, name, argumentDigest: request.argumentDigest, target, inputRevision,
+        }
+
+        return this.ledger.run(
+            this.context.principalId,
+            ATOMIC_ATTACH_OPERATION,
+            idempotencyKey,
+            canonicalArgs,
+            async () => {
+                const contentDigest = await sha256(bytes)
+                const revision = `sha256:${contentDigest}`
+                const descriptor = { id, revision, name }
+                const existing = await this.adapter.getInlay(id)
+                if (existing) {
+                    const metadata = existing.lifecycle
+                    if (!validMetadata(metadata)
+                        || metadata.operation !== ATOMIC_ATTACH_OPERATION
+                        || metadata.ownerPrincipalId !== this.context.principalId
+                        || metadata.idempotencyKey !== idempotencyKey
+                        || metadata.argumentDigest !== request.argumentDigest
+                        || metadata.revision !== revision
+                        || metadata.context.characterId !== characterId
+                        || metadata.context.conversationId !== conversationId
+                        || metadata.context.messageId !== messageId
+                        || metadata.inputRevision !== inputRevision
+                        || existing.id !== id
+                        || existing.revision !== revision
+                        || existing.name !== name) {
+                        throw new PluginApiError('CONFLICT', 'Stored Inlay conflicts with the atomic attach request')
+                    }
+                    return descriptor
+                }
+
+                const lifecycle: InlayAtomicLifecycleMetadata = {
+                    version: 1,
+                    ownerPrincipalId: this.context.principalId,
+                    operation: ATOMIC_ATTACH_OPERATION,
+                    idempotencyKey,
+                    argumentDigest: request.argumentDigest,
+                    revision,
+                    context: { kind: 'message', ...target },
+                    inputRevision,
+                }
+                await this.adapter.writeImage(bytes.slice(), {
+                    id,
+                    name,
+                    lifecycle,
+                    beforeMutation: async () => {
+                        if (this.adapter.getCurrentCharacterId() !== characterId) {
+                            throw new PluginApiError('PERMISSION_DENIED', 'Character context is no longer current')
+                        }
+                        await request.beforeMutation()
+                    },
+                })
+                const stored = await this.adapter.getInlay(id)
+                if (!stored || !validMetadata(stored.lifecycle)
+                    || stored.lifecycle.operation !== ATOMIC_ATTACH_OPERATION
+                    || stored.lifecycle.ownerPrincipalId !== this.context.principalId
+                    || stored.lifecycle.idempotencyKey !== idempotencyKey
+                    || stored.lifecycle.argumentDigest !== request.argumentDigest
+                    || stored.lifecycle.revision !== revision
+                    || stored.lifecycle.context.characterId !== characterId
+                    || stored.lifecycle.context.conversationId !== conversationId
+                    || stored.lifecycle.context.messageId !== messageId
+                    || stored.lifecycle.inputRevision !== inputRevision
+                    || stored.id !== id
+                    || stored.name !== name
+                    || stored.revision !== revision) {
+                    throw new PluginApiError('INTERNAL', 'Inlay storage did not confirm the atomic lifecycle record', {
+                        retryable: true,
+                    })
+                }
+                return descriptor
+            },
+            { durable: true },
+        )
+    }
+
     async deleteInlay(id: string, rawOptions: { expectedRevision?: string } = {}) {
         await this.requirePermission()
         if (!nonEmptyString(id)) invalidArgument('Inlay id must be non-empty')
@@ -237,7 +369,7 @@ export class InlayLifecycleService {
         if (!validMetadata(metadata) || metadata.ownerPrincipalId !== this.context.principalId) {
             throw new PluginApiError('PERMISSION_DENIED', 'Inlay is not owned by the current plugin')
         }
-        if (await deterministicInlayId(metadata.ownerPrincipalId, metadata.idempotencyKey) !== id) {
+        if (await deterministicInlayId(metadata.ownerPrincipalId, metadata.operation, metadata.idempotencyKey) !== id) {
             throw new PluginApiError('PERMISSION_DENIED', 'Inlay lifecycle identity is malformed')
         }
         if (expectedRevision !== undefined && expectedRevision !== record.revision) {

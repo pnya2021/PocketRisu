@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createPocketMessageQueryAdapter } from './messageQuery.pocket'
+import { MessageQueryService } from './messageQuery'
 
 const fullChat = (overrides: Record<string, unknown> = {}) => ({
     id: 'conversation-2',
@@ -109,6 +110,38 @@ describe('Pocket message-query adapter', () => {
         const state = harness()
         await expect(state.adapter.recognizedInlayIds()).resolves.toEqual(new Set(['known', 'second']))
         expect(state.dependencies.listInlayKeys).toHaveBeenCalledTimes(1)
+    })
+
+    it('projects only caller-owned persisted attachments through the hydrated Pocket adapter', async () => {
+        const state = harness({ placeholder: false })
+        const message = state.database.characters[1].chats[0].message[0]
+        message.data = 'a{{inlay::known}}b{{inlayeddata::second}}'
+        message.pluginMessageState = {
+            'plugin-a': {
+                metadata: { ledger: 1 },
+                attachments: [{ inlayId: 'known', presentation: 'inline', metadata: { alt: 'own' } }],
+            },
+            foreign: {
+                metadata: { secret: true },
+                attachments: [{ inlayId: 'known', presentation: 'inline', metadata: { alt: 'foreign' } }],
+            },
+        }
+        const service = new MessageQueryService({
+            principalId: 'plugin-a', instanceId: 'instance-1', displayName: 'Plugin',
+            signal: new AbortController().signal,
+        }, state.adapter, { requirePermission: async () => undefined })
+
+        await expect(service.getMessageSnapshot({
+            characterId: 'group-1', conversationId: 'conversation-2', messageId: 'message-1',
+        })).resolves.toMatchObject({
+            content: 'ab',
+            callerPluginState: {
+                metadata: { ledger: 1 },
+                attachments: [
+                    { inlayId: 'known', presentation: 'inline', utf16Offset: 1, metadata: { alt: 'own' } },
+                ],
+            },
+        })
     })
 
     it.each([

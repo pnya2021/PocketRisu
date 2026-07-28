@@ -137,6 +137,32 @@ describe('Pocket current-message metadata persistence', () => {
             .toEqual({ metadata: { private: true }, attachments: [{ inlayId: 'foreign' }] })
     })
 
+    it('uses the shared query projection for known caller attachments', async () => {
+        const state = harness()
+        state.chat.message[0].data = 'a{{inlay::known}}b'
+        state.chat.message[0].pluginMessageState = {
+            'plugin-a': {
+                metadata: {},
+                attachments: [{ inlayId: 'known', presentation: 'inline', metadata: { alt: 'own' } }],
+            },
+            foreign: {
+                metadata: {},
+                attachments: [{ inlayId: 'known', presentation: 'inline', metadata: { secret: true } }],
+            },
+        }
+        state.dependencies.listInlayKeys.mockResolvedValue(['known'])
+
+        const result = await state.adapter.patchCurrentMessage({
+            ...request,
+            input: { ...request.input, expectedRevision: 'sha256:after' },
+        })
+
+        expect(result.message.content).toBe('ab')
+        expect(result.message.callerPluginState.attachments).toEqual([
+            { inlayId: 'known', presentation: 'inline', utf16Offset: 1, metadata: { alt: 'own' } },
+        ])
+    })
+
     it('enforces stale, missing, duplicate, and streaming message conflicts', async () => {
         const stale = harness()
         await expect(stale.adapter.patchCurrentMessage({
@@ -208,6 +234,28 @@ describe('Pocket current-message metadata persistence', () => {
                 patch: { op: 'setPluginMetadata', key: 'ledger', value: 'x'.repeat(65_494) },
             },
         })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+    })
+
+    it.each([
+        [256, undefined],
+        [257, 'RESOURCE_LIMIT'],
+    ])('accepts 256 caller attachments and rejects 257', async (count, expectedCode) => {
+        const state = harness()
+        state.chat.message[0].pluginMessageState = {
+            'plugin-a': {
+                metadata: {},
+                attachments: Array.from({ length: count }, (_, index) => ({
+                    inlayId: `known-${index}`, presentation: 'inline', metadata: {},
+                })),
+            },
+        }
+        const pending = state.adapter.patchCurrentMessage({
+            ...request,
+            input: { ...request.input, expectedRevision: 'sha256:after' },
+        })
+
+        if (expectedCode) await expect(pending).rejects.toMatchObject({ code: expectedCode })
+        else await expect(pending).resolves.toMatchObject({ changed: true })
     })
 
     it('conflicts after save acknowledgement when the live source changes and does not swap the slot', async () => {

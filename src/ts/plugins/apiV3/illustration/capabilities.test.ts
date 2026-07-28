@@ -6,6 +6,7 @@ import { DEVICE_CACHE_CAPABILITY_IDS } from './deviceCache'
 import { withPixaiInferenceCapability } from '../localModel/pixaiLocalModel'
 import { MESSAGE_QUERY_CAPABILITY_IDS } from './messageQuery'
 import { MESSAGE_PATCH_CAPABILITY_IDS } from './messagePatch'
+import { INLAY_ATOMIC_ATTACH_CAPABILITY_IDS } from './inlayAtomicAttach'
 
 const context = {
     principalId: '11111111-1111-4111-8111-111111111111',
@@ -214,6 +215,41 @@ describe('V3 capability discovery', () => {
         })
         expect(descriptors['inlay.atomic-attach.v1']).toMatchObject({
             available: false, reason: 'temporarily-unavailable',
+        })
+    })
+
+    it('makes atomic Inlay attachment available only after registration, permission, and current context', async () => {
+        expect(INLAY_ATOMIC_ATTACH_CAPABILITY_IDS).toEqual(['inlay.atomic-attach.v1'])
+        const unavailable = await getCapabilities(context, [...INLAY_ATOMIC_ATTACH_CAPABILITY_IDS], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(), hasCurrentContext: true },
+        })
+        expect(unavailable['inlay.atomic-attach.v1']).toMatchObject({
+            available: false, reason: 'temporarily-unavailable',
+        })
+
+        const permissionRequired = await getCapabilities(context, [...INLAY_ATOMIC_ATTACH_CAPABILITY_IDS], {
+            permissionState: async () => 'not-requested',
+            runtime: { registeredServices: new Set(INLAY_ATOMIC_ATTACH_CAPABILITY_IDS), hasCurrentContext: true },
+        })
+        expect(permissionRequired['inlay.atomic-attach.v1']).toMatchObject({
+            available: false, reason: 'permission-required', permission: 'chatWrite',
+        })
+
+        const noContext = await getCapabilities(context, [...INLAY_ATOMIC_ATTACH_CAPABILITY_IDS], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(INLAY_ATOMIC_ATTACH_CAPABILITY_IDS), hasCurrentContext: false },
+        })
+        expect(noContext['inlay.atomic-attach.v1']).toMatchObject({
+            available: false, reason: 'no-current-context',
+        })
+
+        const available = await getCapabilities(context, [...INLAY_ATOMIC_ATTACH_CAPABILITY_IDS], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(INLAY_ATOMIC_ATTACH_CAPABILITY_IDS), hasCurrentContext: true },
+        })
+        expect(available['inlay.atomic-attach.v1']).toMatchObject({
+            available: true, permission: 'chatWrite', permissionState: 'granted',
         })
     })
 
