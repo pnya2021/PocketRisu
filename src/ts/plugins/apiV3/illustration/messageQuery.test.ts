@@ -117,7 +117,44 @@ describe('message query core', () => {
             data: 'final {{inlay::known}} text {{inlayed::missing}}',
             saying: 'member-b',
             generationId: 'generation-4',
+            pluginMessageState: {},
         })
+    })
+
+    it('projects only caller metadata while hashing every principal state', async () => {
+        let revisionInput: unknown
+        const pluginMessageState = {
+            [context().principalId]: {
+                metadata: { ledger: { prefix: 2 } },
+                attachments: [{ inlayId: 'future-own', presentation: 'inline', metadata: { hidden: true } }],
+                updatedAt: 55,
+            },
+            'foreign-plugin': {
+                metadata: { secret: 'not-visible' },
+                attachments: [{ inlayId: 'future-foreign', presentation: 'styled' }],
+            },
+        }
+        const { service } = harness({
+            messages: [{
+                role: 'char', data: 'hello', messageId: 'message-4', createdAt: 40,
+                pluginMessageUpdatedAt: 50, pluginMessageState,
+            }],
+            createRevision: async (value) => {
+                revisionInput = value
+                return `sha256:${'d'.repeat(64)}`
+            },
+        })
+
+        const result = await service.getMessageSnapshot(target())
+        expect(result.callerPluginState).toEqual({
+            metadata: { ledger: { prefix: 2 } },
+            attachments: [],
+        })
+        expect(result.updatedAt).toBe(55)
+        expect(revisionInput).toEqual({
+            role: 'char', data: 'hello', saying: null, generationId: null, pluginMessageState,
+        })
+        expect(result.callerPluginState.metadata).not.toBe(pluginMessageState[context().principalId].metadata)
     })
 
     it('hashes persisted empty saying and generation IDs without normalizing revision inputs', async () => {
@@ -135,7 +172,7 @@ describe('message query core', () => {
 
         const snapshot = await service.getMessageSnapshot(target())
         expect(revisionInput).toEqual({
-            role: 'char', data: 'empty fields', saying: '', generationId: '',
+            role: 'char', data: 'empty fields', saying: '', generationId: '', pluginMessageState: {},
         })
         expect(snapshot).not.toHaveProperty('speakerCharacterId')
         expect(snapshot).not.toHaveProperty('generationId')

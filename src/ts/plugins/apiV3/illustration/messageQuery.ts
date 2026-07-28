@@ -1,6 +1,6 @@
 import { PluginApiError } from './errors'
 import type { PluginExecutionContext, PluginPermissionId } from './permissions'
-import { createRevision } from './revision'
+import { canonicalJson, createRevision, validateJsonLimits } from './revision'
 
 export const MESSAGE_QUERY_CAPABILITY_IDS = ['chat.message-query.v1'] as const
 
@@ -10,6 +10,15 @@ const DEFAULT_RECENT_UTF16 = 12_000
 const MAX_RECENT_UTF16 = 65_536
 const MAX_SNAPSHOT_UTF16 = 262_144
 const MAX_SNAPSHOT_JSON_BYTES = 2_097_152
+const MAX_CALLER_METADATA_JSON_BYTES = 65_536
+
+export type PluginJsonValue =
+    | null
+    | boolean
+    | number
+    | string
+    | PluginJsonValue[]
+    | { [key: string]: PluginJsonValue }
 
 export interface MessageRef {
     characterId: string
@@ -25,7 +34,7 @@ export interface MessageSnapshot extends MessageRef {
     generationId?: string
     createdAt?: number
     updatedAt: number
-    callerPluginState: { metadata: Record<string, never>; attachments: never[] }
+    callerPluginState: { metadata: Record<string, PluginJsonValue>; attachments: never[] }
 }
 
 export interface MessageQuerySourceMessage {
@@ -36,6 +45,8 @@ export interface MessageQuerySourceMessage {
     generationId?: unknown
     createdAt?: unknown
     updatedAt?: unknown
+    pluginMessageState?: unknown
+    pluginMessageUpdatedAt?: unknown
 }
 
 export interface MessageQueryConversation {
@@ -118,6 +129,35 @@ const committed = (conversation: MessageQueryConversation, index: number) =>
 
 const finiteTimestamp = (value: unknown): value is number =>
     typeof value === 'number' && Number.isFinite(value)
+
+const plainRecord = (value: unknown): value is Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+}
+
+const callerMetadata = (message: MessageQuerySourceMessage, principalId: string) => {
+    const root = message.pluginMessageState
+    if (root === undefined) return {} as Record<string, PluginJsonValue>
+    if (!plainRecord(root)) throw new PluginApiError('INTERNAL', 'Plugin message state is invalid', { retryable: true })
+    const state = Object.getOwnPropertyDescriptor(root, principalId)?.value
+    if (state === undefined) return {} as Record<string, PluginJsonValue>
+    if (!plainRecord(state) || !plainRecord(state.metadata)) {
+        throw new PluginApiError('INTERNAL', 'Caller message state is invalid', { retryable: true })
+    }
+    const canonical = validateJsonLimits(state.metadata, {
+        maxDepth: 32, maxBytes: MAX_CALLER_METADATA_JSON_BYTES,
+    })
+    return JSON.parse(canonical) as Record<string, PluginJsonValue>
+}
+
+const messageRevisionValue = (message: MessageQuerySourceMessage) => ({
+    role: message.role,
+    data: message.data,
+    saying: typeof message.speakerSourceId === 'string' ? message.speakerSourceId : null,
+    generationId: typeof message.generationId === 'string' ? message.generationId : null,
+    pluginMessageState: message.pluginMessageState ?? {},
+})
 
 export class MessageQueryService {
     private readonly requirePermission: (
@@ -300,12 +340,10 @@ export class MessageQueryService {
         const messageId = this.stableIndex(conversation, index)
         const raw = message.data as string
         const role = message.role as 'user' | 'char'
-        const saying = typeof message.speakerSourceId === 'string' ? message.speakerSourceId : null
-        const revisionGenerationId = typeof message.generationId === 'string' ? message.generationId : null
         const generationId = nonEmptyString(message.generationId) ? message.generationId : null
         let revision: string
         try {
-            revision = await this.revision({ role, data: raw, saying, generationId: revisionGenerationId })
+            revision = await this.revision(messageRevisionValue(message))
         } catch (error) {
             return this.rejectAfterAsyncFailure(conversation, conversation, permission, error)
         }
@@ -314,9 +352,15 @@ export class MessageQueryService {
         permission = await this.ensureScope(conversation, permission, conversation)
         this.ensureConversation(conversation)
         const createdAt = finiteTimestamp(message.createdAt) ? message.createdAt : undefined
-        const updatedAt = finiteTimestamp(message.updatedAt)
-            ? message.updatedAt
-            : createdAt ?? 0
+        const stateRoot = plainRecord(message.pluginMessageState) ? message.pluginMessageState : undefined
+        const callerState = stateRoot && plainRecord(Object.getOwnPropertyDescriptor(stateRoot, this.context.principalId)?.value)
+            ? Object.getOwnPropertyDescriptor(stateRoot, this.context.principalId)!.value as Record<string, unknown>
+            : undefined
+        const updatedAt = Math.max(
+            finiteTimestamp(message.updatedAt) ? message.updatedAt : createdAt ?? 0,
+            finiteTimestamp(message.pluginMessageUpdatedAt) ? message.pluginMessageUpdatedAt : 0,
+            finiteTimestamp(callerState?.updatedAt) ? callerState.updatedAt : 0,
+        )
         const snapshot: MessageSnapshot = {
             characterId: conversation.characterId,
             conversationId: conversation.conversationId,
@@ -325,7 +369,7 @@ export class MessageQueryService {
             content: projectLogicalContent(raw, recognized),
             revision,
             updatedAt,
-            callerPluginState: { metadata: {}, attachments: [] },
+            callerPluginState: { metadata: callerMetadata(message, this.context.principalId), attachments: [] },
         }
         const speakerCharacterId = this.speaker(conversation, message)
         if (speakerCharacterId) snapshot.speakerCharacterId = speakerCharacterId

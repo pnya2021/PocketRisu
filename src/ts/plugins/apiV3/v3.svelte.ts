@@ -50,7 +50,8 @@ import { isCurrentPluginRuntimeRecord } from '../pluginRuntimeReplacement';
 import { createOwnedSyncStorageMutations } from '../ownedSyncStorage';
 import { ContextResourceService } from './illustration/contextResources';
 import { createPocketContextResourceAdapter } from './illustration/contextResources.pocket';
-import { ensureChatHydrated, ensureCurrentChatReady } from 'src/ts/storage/chatStorage';
+import { ensureChatHydrated, ensureCurrentChatReady, saveChatToServer } from 'src/ts/storage/chatStorage';
+import { databasePersistenceCoordinator } from 'src/ts/storage/databasePersistenceCoordinator';
 import { getInlayAssetBlob, getInlayAssetRecord, listInlayKeys, removeInlayAsset, writeInlayImageFromBytes } from 'src/ts/process/files/inlays';
 import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustration/inlayLifecycle';
 import { createPocketInlayLifecycleAdapter } from './illustration/inlayLifecycle.pocket';
@@ -61,6 +62,8 @@ import { PocketPluginModelClient } from './localModel/pocketPluginModelClient';
 import { PixaiLocalModel, withPixaiInferenceCapability } from './localModel/pixaiLocalModel';
 import { MESSAGE_QUERY_CAPABILITY_IDS, MessageQueryService } from './illustration/messageQuery';
 import { createPocketMessageQueryAdapter } from './illustration/messageQuery.pocket';
+import { MESSAGE_PATCH_CAPABILITY_IDS, MessagePatchService } from './illustration/messagePatch';
+import { createPocketMessagePatchAdapter } from './illustration/messagePatch.pocket';
 
 /*
     V3 API for RisuAI Plugins
@@ -648,6 +651,24 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             getDatabase,
             getCurrentCharacter,
             ensureChatHydrated,
+            listInlayKeys,
+        }),
+        {
+            requirePermission: (executionContext, permission) => pluginPermissionService.require(
+                executionContext,
+                permission,
+                { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
+            ),
+        },
+    )
+    const messagePatch = new MessagePatchService(
+        context,
+        createPocketMessagePatchAdapter({
+            getDatabase,
+            getCurrentCharacter,
+            ensureChatHydrated,
+            saveChatToServer,
+            runExclusiveMutation: (operation) => databasePersistenceCoordinator.runExclusiveMutation(operation),
             listInlayKeys,
         }),
         {
@@ -1335,6 +1356,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.assets.v1',
                     'context.modules-installed.v1',
                     ...MESSAGE_QUERY_CAPABILITY_IDS,
+                    ...MESSAGE_PATCH_CAPABILITY_IDS,
                     ...INLAY_LIFECYCLE_CAPABILITY_IDS,
                     ...DEVICE_CACHE_CAPABILITY_IDS,
                 ],
@@ -1358,6 +1380,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getMessageSnapshot: (target) => messageQuery.getMessageSnapshot(target),
         getLatestCommittedMessage: (options) => messageQuery.getLatestCommittedMessage(options),
         getRecentCommittedMessages: (options) => messageQuery.getRecentCommittedMessages(options),
+        patchMessage: (input) => messagePatch.patchMessage(input),
         //Internal use APIs
         _getOldKeys: () => {
             return Object.keys(oldApis)

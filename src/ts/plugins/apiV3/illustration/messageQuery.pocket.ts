@@ -4,6 +4,7 @@ import type {
     MessageQueryHostAdapter,
     MessageQuerySourceMessage,
 } from './messageQuery'
+import { canonicalJson } from './revision'
 
 type UnknownRecord = Record<string, any>
 
@@ -23,6 +24,9 @@ type MessageFieldSnapshot = {
     time: unknown
     generationInfo: unknown
     generationId: unknown
+    pluginMessageState: unknown
+    pluginMessageStateCanonical: string
+    pluginMessageUpdatedAt: unknown
 }
 
 type PocketValidationToken = {
@@ -81,7 +85,14 @@ const sourceMessage = (message: UnknownRecord): MessageQuerySourceMessage => ({
     speakerSourceId: message?.saying,
     generationId: message?.generationInfo?.generationId,
     createdAt: message?.time,
-    updatedAt: message?.time,
+    updatedAt: Math.max(
+        typeof message?.time === 'number' && Number.isFinite(message.time) ? message.time : 0,
+        typeof message?.pluginMessageUpdatedAt === 'number' && Number.isFinite(message.pluginMessageUpdatedAt)
+            ? message.pluginMessageUpdatedAt
+            : 0,
+    ),
+    pluginMessageState: message?.pluginMessageState,
+    pluginMessageUpdatedAt: message?.pluginMessageUpdatedAt,
 })
 
 const snapshotFields = (messages: UnknownRecord[]): MessageFieldSnapshot[] => messages.map((message) => ({
@@ -93,6 +104,9 @@ const snapshotFields = (messages: UnknownRecord[]): MessageFieldSnapshot[] => me
     time: message?.time,
     generationInfo: message?.generationInfo,
     generationId: message?.generationInfo?.generationId,
+    pluginMessageState: message?.pluginMessageState,
+    pluginMessageStateCanonical: canonicalJson(message?.pluginMessageState ?? {}),
+    pluginMessageUpdatedAt: message?.pluginMessageUpdatedAt,
 }))
 
 const sameMembers = (current: unknown, baseline: unknown[] | undefined) => {
@@ -260,7 +274,10 @@ export function createPocketMessageQueryAdapter(
                         || message?.chatId !== baseline.chatId
                         || message?.time !== baseline.time
                         || message?.generationInfo !== baseline.generationInfo
-                        || message?.generationInfo?.generationId !== baseline.generationId) return false
+                        || message?.generationInfo?.generationId !== baseline.generationId
+                        || message?.pluginMessageState !== baseline.pluginMessageState
+                        || canonicalJson(message?.pluginMessageState ?? {}) !== baseline.pluginMessageStateCanonical
+                        || message?.pluginMessageUpdatedAt !== baseline.pluginMessageUpdatedAt) return false
                 }
                 return true
             } catch {

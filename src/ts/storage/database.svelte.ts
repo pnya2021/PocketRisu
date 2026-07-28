@@ -2168,6 +2168,18 @@ export interface Chat{
      * (temperature, top_p, penalties, ...). Off (or absent) => preset params only.
      * No effect in classic mode, where prompt-preset params already apply. */
     usePromptPresetParams?: boolean
+    /** Host-private replay receipts stored atomically with restricted message patches. */
+    pluginMessagePatchReceipts?: Array<{
+        version: 1
+        principalId: string
+        operation: 'chat.message-patch.v1'
+        idempotencyKey: string
+        digest: string
+        target: { characterId: string; conversationId: string; messageId: string }
+        result: unknown
+        completedAt: number
+        expiresAt: number
+    }>
     /** Runtime-only: true while awaiting hydration from server. Never persisted. */
     _placeholder?: boolean
 }
@@ -2201,6 +2213,20 @@ export interface Message{
     isComment?:boolean
     swipes?: string[]
     swipeId?: number
+    /** Principal-namespaced state owned by the restricted V3 message APIs. */
+    pluginMessageState?: Record<string, {
+        metadata: Record<string, any>
+        /** Reserved for later attachment slices; H11-A never creates or exposes these. */
+        attachments: Array<{
+            inlayId: string
+            presentation?: 'inline' | 'styled' | 'model-input'
+            metadata?: any
+            [key: string]: unknown
+        }>
+        updatedAt?: number
+    }>
+    /** Last Host-owned restricted mutation timestamp. */
+    pluginMessageUpdatedAt?: number
 }
 
 export interface MessageGenerationInfo{

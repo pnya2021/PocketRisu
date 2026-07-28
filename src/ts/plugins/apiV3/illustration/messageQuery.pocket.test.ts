@@ -7,6 +7,8 @@ const fullChat = (overrides: Record<string, unknown> = {}) => ({
     message: [{
         role: 'char', data: 'hello', saying: 'member-a', chatId: 'message-1', time: 50,
         generationInfo: { generationId: 'generation-1' },
+        pluginMessageState: { 'plugin-a': { metadata: { ledger: 1 }, attachments: [] } },
+        pluginMessageUpdatedAt: 60,
     }],
     ...overrides,
 })
@@ -70,6 +72,9 @@ describe('Pocket message-query adapter', () => {
                 messageId: 'message-1',
                 generationId: 'generation-1',
                 createdAt: 50,
+                updatedAt: 60,
+                pluginMessageState: { 'plugin-a': { metadata: { ledger: 1 }, attachments: [] } },
+                pluginMessageUpdatedAt: 60,
             }],
         })
         expect(captured && state.adapter.isConversationCurrent(captured)).toBe(true)
@@ -169,6 +174,10 @@ describe('Pocket message-query adapter', () => {
             },
             (state: ReturnType<typeof harness>) => {
                 state.database.characters[1].chats[0].message[0].data = 'changed'
+            },
+            (state: ReturnType<typeof harness>) => {
+                state.database.characters[1].chats[0].message[0]
+                    .pluginMessageState['plugin-a'].metadata.ledger = 2
             },
             (state: ReturnType<typeof harness>) => {
                 state.database.characters[1].characters.reverse()

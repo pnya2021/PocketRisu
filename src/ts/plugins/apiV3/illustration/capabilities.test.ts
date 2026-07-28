@@ -5,6 +5,7 @@ import { INLAY_LIFECYCLE_CAPABILITY_IDS } from './inlayLifecycle'
 import { DEVICE_CACHE_CAPABILITY_IDS } from './deviceCache'
 import { withPixaiInferenceCapability } from '../localModel/pixaiLocalModel'
 import { MESSAGE_QUERY_CAPABILITY_IDS } from './messageQuery'
+import { MESSAGE_PATCH_CAPABILITY_IDS } from './messagePatch'
 
 const context = {
     principalId: '11111111-1111-4111-8111-111111111111',
@@ -180,6 +181,39 @@ describe('V3 capability discovery', () => {
         })
         expect(available['chat.message-query.v1']).toMatchObject({
             available: true, permission: 'chatObserve', permissionState: 'granted',
+        })
+    })
+
+    it('makes only the current metadata patch callable while atomic attachment remains unavailable', async () => {
+        expect(MESSAGE_PATCH_CAPABILITY_IDS).toEqual(['chat.message-patch.v1'])
+        const unavailable = await getCapabilities(context, MESSAGE_PATCH_CAPABILITY_IDS as unknown as string[], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(), hasCurrentContext: true },
+        })
+        expect(unavailable['chat.message-patch.v1']).toMatchObject({
+            available: false, reason: 'temporarily-unavailable',
+        })
+        const noContext = await getCapabilities(context, MESSAGE_PATCH_CAPABILITY_IDS as unknown as string[], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(MESSAGE_PATCH_CAPABILITY_IDS), hasCurrentContext: false },
+        })
+        expect(noContext['chat.message-patch.v1']).toMatchObject({
+            available: false, reason: 'no-current-context',
+        })
+        const descriptors = await getCapabilities(context, [
+            'chat.message-patch.v1', 'inlay.atomic-attach.v1',
+        ], {
+            permissionState: async () => 'granted',
+            runtime: {
+                registeredServices: new Set(MESSAGE_PATCH_CAPABILITY_IDS),
+                hasCurrentContext: true,
+            },
+        })
+        expect(descriptors['chat.message-patch.v1']).toMatchObject({
+            available: true, permission: 'chatWrite', permissionState: 'granted',
+        })
+        expect(descriptors['inlay.atomic-attach.v1']).toMatchObject({
+            available: false, reason: 'temporarily-unavailable',
         })
     })
 
