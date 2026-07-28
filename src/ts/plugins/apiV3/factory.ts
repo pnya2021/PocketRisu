@@ -62,6 +62,7 @@ const CLEANUP_CALLBACK_INVOKER = Symbol('cleanupCallbackInvoker')
 const invokedCleanupCallbacks = new WeakSet<Function>()
 type CallbackWrapper = ((...args: any[]) => Promise<any>) & {
     release: () => void
+    cancelPending: (reason?: unknown) => void
     [CLEANUP_CALLBACK_INVOKER]: (...args: any[]) => Promise<any>
 };
 
@@ -864,6 +865,7 @@ export class SandboxHost {
         reject: (reason?: any) => void
         cleanup: boolean
         runGeneration: number
+        callbackId: string
     }>();
     private pendingExecutions = new Map<string, { resolve: (value: any) => void, reject: (reason?: any) => void }>();
     private messageHandler?: (event: MessageEvent) => void;
@@ -1006,7 +1008,9 @@ export class SandboxHost {
                     }
                     return new Promise((resolve, reject) => {
                         const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
-                        this.pendingCallbacks.set(reqId, { resolve, reject, cleanup, runGeneration });
+                        this.pendingCallbacks.set(reqId, {
+                            resolve, reject, cleanup, runGeneration, callbackId: cbRef.id,
+                        });
 
                         // AbortSignal cannot be structured-cloned for postMessage.
                         // Convert to a serializable ref and forward abort events
@@ -1051,6 +1055,13 @@ export class SandboxHost {
                 }
                 const wrapper = ((...innerArgs: any[]) => invoke(false, innerArgs)) as CallbackWrapper;
                 wrapper[CLEANUP_CALLBACK_INVOKER] = (...innerArgs: any[]) => invoke(true, innerArgs)
+                wrapper.cancelPending = (reason = new PluginApiError('ABORTED', 'Callback cancelled')) => {
+                    for (const [reqId, pending] of this.pendingCallbacks) {
+                        if (pending.callbackId !== cbRef.id) continue
+                        this.pendingCallbacks.delete(reqId)
+                        pending.reject(reason)
+                    }
+                }
                 wrapper.release = () => {
                     const entry = this.callbackWrapperCache.get(cbRef.id);
                     if (!entry || entry.wrapper !== wrapper || entry.refCount <= 0) return;

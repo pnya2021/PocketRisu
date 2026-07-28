@@ -28,6 +28,14 @@ import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
 import { buildGroupSpeakerInstruction, resolveGroupMembers, resolveGroupMessageSpeaker, runGroupGeneration, type GroupGenerationMode } from "./group";
+import {
+    capturePocketMessageBaseline,
+    collectPocketGeneratedCommits,
+    commitPocketMessageBatch,
+    correctContinueMessageIdentity,
+    correctRerollMessageIdentity,
+    pocketMessageRevisionKey,
+} from "../plugins/apiV3/illustration/messageEvents.pocket";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -70,6 +78,8 @@ export interface SendChatArgs {
     groupMode?:GroupGenerationMode
     rerollSpeakerId?:string
     continueMessageIndex?:number
+    rerollIdentity?:Message
+    messageEventTriggerIds?:Set<string>
 }
 
 export async function sendChat(chatProcessIndex = -1, arg:SendChatArgs = {}):Promise<boolean> {
@@ -77,41 +87,107 @@ export async function sendChat(chatProcessIndex = -1, arg:SendChatArgs = {}):Pro
     const selected = get(selectedCharID)
     const room = DBState.db.characters[selected]
     if (!room) return false
-    if (room.type !== 'group') {
-        return generateResolvedSpeaker(room, room, chatProcessIndex, arg)
-    }
-
-    const members = resolveGroupMembers(room, DBState.db.characters)
-    if (chatProcessIndex >= 0) {
-        const member = members.find((candidate) => candidate.index === chatProcessIndex)
-        if (!member) return false
-        return generateResolvedSpeaker(room, member.card, member.index, arg)
-    }
-
     const currentChat = room.chats[room.chatPage]
     if (!currentChat || currentChat._placeholder) return false
-    const mode = arg.groupMode ?? (arg.continue ? 'continue' : 'send')
-    const groupSignal = arg.signal ?? new AbortController().signal
-    return runGroupGeneration({
-        group: room,
-        records: DBState.db.characters,
-        messages: currentChat.message,
-        mode,
-        rerollSpeakerId: arg.rerollSpeakerId,
-        signal: groupSignal,
-        generate: (speaker, request) => generateResolvedSpeaker(
-            room,
-            speaker,
-            members.find((member) => member.id === speaker.chaId)?.index ?? -1,
-            {
-                ...arg,
+    currentChat.id = currentChat.id ?? v4()
+    for (const message of currentChat.message) message.chatId = message.chatId ?? v4()
+    const before = capturePocketMessageBaseline(currentChat.message)
+    if (arg.rerollIdentity?.chatId) {
+        for (const [id, entry] of capturePocketMessageBaseline([arg.rerollIdentity])) before.set(id, entry)
+    }
+    const continueTargetIndex = arg.continue
+        ? arg.continueMessageIndex ?? currentChat.message.findLastIndex((message) =>
+            message.role === 'char' && !message.isComment && !message.disabled)
+        : -1
+    const continueBefore = continueTargetIndex >= 0
+        ? safeStructuredClone(currentChat.message[continueTargetIndex])
+        : undefined
+    const triggerIds = arg.messageEventTriggerIds ?? new Set<string>()
+    const generationArg = { ...arg, messageEventTriggerIds: triggerIds }
+    let generated = false
+    if (room.type !== 'group') {
+        generated = await generateResolvedSpeaker(room, room, chatProcessIndex, generationArg)
+    }
+    else {
+        const members = resolveGroupMembers(room, DBState.db.characters)
+        if (chatProcessIndex >= 0) {
+            const member = members.find((candidate) => candidate.index === chatProcessIndex)
+            if (!member) return false
+            generated = await generateResolvedSpeaker(room, member.card, member.index, generationArg)
+        }
+        else {
+            const mode = arg.groupMode ?? (arg.continue ? 'continue' : 'send')
+            const groupSignal = arg.signal ?? new AbortController().signal
+            generated = await runGroupGeneration({
+                group: room,
+                records: DBState.db.characters,
+                messages: currentChat.message,
+                mode,
+                rerollSpeakerId: arg.rerollSpeakerId,
                 signal: groupSignal,
-                continue: request.continue,
-                continueMessageIndex: request.targetMessageIndex,
-                groupMode: request.mode,
-            },
-        ),
+                generate: (speaker, request) => generateResolvedSpeaker(
+                    room,
+                    speaker,
+                    members.find((member) => member.id === speaker.chaId)?.index ?? -1,
+                    {
+                        ...generationArg,
+                        signal: groupSignal,
+                        continue: request.continue,
+                        continueMessageIndex: request.targetMessageIndex,
+                        groupMode: request.mode,
+                    },
+                ),
+            })
+        }
+    }
+    if (!generated || arg.signal?.aborted) return false
+
+    const committedChat = room.chats.find((chat) => chat?.id === currentChat.id)
+    if (!committedChat || committedChat._placeholder) return false
+    if (continueBefore && continueTargetIndex < committedChat.message.length) {
+        const transientMessageId = committedChat.message[continueTargetIndex]?.chatId
+        committedChat.message[continueTargetIndex] = correctContinueMessageIdentity(
+            continueBefore,
+            committedChat.message[continueTargetIndex],
+        ) as Message
+        if (transientMessageId && triggerIds.delete(transientMessageId)
+            && committedChat.message[continueTargetIndex].chatId) {
+            triggerIds.add(committedChat.message[continueTargetIndex].chatId!)
+        }
+    }
+    if (arg.rerollIdentity) {
+        const rerollIndex = committedChat.message.findLastIndex((message) =>
+            message.role === 'char' && !message.isComment && !message.disabled)
+        if (rerollIndex >= 0) {
+            const transientMessageId = committedChat.message[rerollIndex]?.chatId
+            committedChat.message[rerollIndex] = correctRerollMessageIdentity(
+                arg.rerollIdentity,
+                committedChat.message[rerollIndex],
+            ) as Message
+            if (transientMessageId && triggerIds.delete(transientMessageId)
+                && committedChat.message[rerollIndex].chatId) {
+                triggerIds.add(committedChat.message[rerollIndex].chatId!)
+            }
+        }
+    }
+    for (const message of committedChat.message) message.chatId = message.chatId ?? v4()
+    const mode = arg.rerollIdentity || arg.groupMode === 'reroll'
+        ? 'reroll'
+        : arg.continue ? 'continue' : 'model'
+    const continueMessageId = continueBefore?.chatId
+    const commits = collectPocketGeneratedCommits({
+        before,
+        after: committedChat.message,
+        mode,
+        ...(continueMessageId ? { continueMessageId } : {}),
+        triggerMutatedMessageIds: triggerIds,
     })
+    await commitPocketMessageBatch({
+        characterId: room.chaId,
+        conversationId: committedChat.id!,
+        commits,
+    })
+    return true
 }
 
 /** The one tokenizer/prompt/transport/stream/trigger/Inlay/TTS/commit path. */
@@ -174,6 +250,18 @@ export async function generateResolvedSpeaker(
             return data.trim()
         }
         return data.trim()
+    }
+
+    function setFinalGenerationInfo(messageIndex: number) {
+        if (messageIndex < 0) return
+        const message = DBState.db.characters[selectedChar]?.chats?.[selectedChat]?.message?.[messageIndex]
+        if (!message?.generationInfo || !generationInfo) return
+        if (arg.continue) {
+            DBState.db.characters[selectedChar].chats[selectedChat].message[messageIndex] =
+                correctContinueMessageIdentity(message, { ...message, generationInfo }) as Message
+            return
+        }
+        message.generationInfo = generationInfo
     }
 
     function throwError(error:string){
@@ -1525,7 +1613,7 @@ export async function generateResolvedSpeaker(
             prefix = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data
         }
         else{
-            DBState.db.characters[selectedChar].chats[selectedChat].message.push({
+            const generatedMessage: Message = {
                 role: 'char',
                 data: "",
                 saying: currentChar.chaId,
@@ -1533,7 +1621,12 @@ export async function generateResolvedSpeaker(
                 generationInfo,
                 promptInfo,
                 chatId: generationId,
-            })
+            }
+            DBState.db.characters[selectedChar].chats[selectedChat].message.push(
+                arg.rerollIdentity
+                    ? correctRerollMessageIdentity(arg.rerollIdentity, generatedMessage) as Message
+                    : generatedMessage,
+            )
         }
         DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = true
         DBState.db.characters[selectedChar].reloadKeys += 1
@@ -1589,10 +1682,21 @@ export async function generateResolvedSpeaker(
         }
 
         DBState.db.characters[selectedChar].chats[selectedChat] = runCurrentChatFunction(DBState.db.characters[selectedChar].chats[selectedChat])
-        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]        
+        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
+        const beforeTriggerMessage = currentChat.message[msgIndex]
+        const beforeTriggerRevision = beforeTriggerMessage ? pocketMessageRevisionKey(beforeTriggerMessage) : undefined
+        const beforeTriggerMessageId = beforeTriggerMessage?.chatId
         const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
         if(triggerResult && triggerResult.chat){
             currentChat = normalizeChat(triggerResult.chat)
+        }
+        const afterTriggerMessage = currentChat.message[msgIndex]
+        if (afterTriggerMessage && beforeTriggerMessageId && !afterTriggerMessage.chatId) {
+            afterTriggerMessage.chatId = beforeTriggerMessageId
+        }
+        if (afterTriggerMessage?.chatId && beforeTriggerRevision !== undefined
+            && pocketMessageRevisionKey(afterTriggerMessage) !== beforeTriggerRevision) {
+            arg.messageEventTriggerIds?.add(afterTriggerMessage.chatId)
         }
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
@@ -1619,9 +1723,11 @@ export async function generateResolvedSpeaker(
             let mess = msg[1]
             let msgIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length
             let result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
+            let continueIdentity: Message | undefined
             if(i === 0 && arg.continue){
                 msgIndex = arg.continueMessageIndex ?? (msgIndex - 1)
                 let beforeChat = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
+                continueIdentity = safeStructuredClone(beforeChat)
                 result2 = await processScriptFull(nowChatroom, reformatContent(beforeChat.data + mess), 'editoutput', msgIndex)
             }
             if(DBState.db.removeIncompleteResponse){
@@ -1632,7 +1738,7 @@ export async function generateResolvedSpeaker(
             result = inlayResult.text
             emoChanged = result2.emoChanged
             if(i === 0 && arg.continue){
-                DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex] = {
+                const replacement: Message = {
                     role: 'char',
                     data: result,
                     saying: currentChar.chaId,
@@ -1640,14 +1746,17 @@ export async function generateResolvedSpeaker(
                     generationInfo,
                     promptInfo,
                     chatId: generationId,
-                }       
+                }
+                DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex] = continueIdentity
+                    ? correctContinueMessageIdentity(continueIdentity, replacement) as Message
+                    : replacement
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = p
                 }
             }
             else if(i===0){
-                DBState.db.characters[selectedChar].chats[selectedChat].message.push({
+                const generatedMessage: Message = {
                     role: msg[0],
                     data: result,
                     saying: currentChar.chaId,
@@ -1655,7 +1764,12 @@ export async function generateResolvedSpeaker(
                     generationInfo,
                     promptInfo,
                     chatId: generationId,
-                })
+                }
+                DBState.db.characters[selectedChar].chats[selectedChat].message.push(
+                    arg.rerollIdentity
+                        ? correctRerollMessageIdentity(arg.rerollIdentity, generatedMessage) as Message
+                        : generatedMessage,
+                )
                 const ind = DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
@@ -1673,11 +1787,25 @@ export async function generateResolvedSpeaker(
         }
 
         DBState.db.characters[selectedChar].chats[selectedChat] = runCurrentChatFunction(DBState.db.characters[selectedChar].chats[selectedChat])
-        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]        
+        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
 
+        const triggerMessageIndex = arg.continueMessageIndex
+            ?? (currentChat.message.length - 1)
+        const beforeTriggerMessage = currentChat.message[triggerMessageIndex]
+        const beforeTriggerRevision = beforeTriggerMessage ? pocketMessageRevisionKey(beforeTriggerMessage) : undefined
+        const beforeTriggerMessageId = beforeTriggerMessage?.chatId
         const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
         if(triggerResult && triggerResult.chat){
-            DBState.db.characters[selectedChar].chats[selectedChat] = normalizeChat(triggerResult.chat)
+            currentChat = normalizeChat(triggerResult.chat)
+            DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
+        }
+        const afterTriggerMessage = currentChat.message[triggerMessageIndex]
+        if (afterTriggerMessage && beforeTriggerMessageId && !afterTriggerMessage.chatId) {
+            afterTriggerMessage.chatId = beforeTriggerMessageId
+        }
+        if (afterTriggerMessage?.chatId && beforeTriggerRevision !== undefined
+            && pocketMessageRevisionKey(afterTriggerMessage) !== beforeTriggerRevision) {
+            arg.messageEventTriggerIds?.add(afterTriggerMessage.chatId)
         }
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
@@ -1704,6 +1832,7 @@ export async function generateResolvedSpeaker(
             usedContinueTokens: resultTokens,
             continueMessageIndex: arg.continueMessageIndex,
             groupMode: nowChatroom.type === 'group' ? 'continue' : arg.groupMode,
+            messageEventTriggerIds: arg.messageEventTriggerIds,
         })
     }
 
@@ -1741,13 +1870,12 @@ export async function generateResolvedSpeaker(
         
         const lastMessageIndex = arg.continueMessageIndex
             ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
-        if(lastMessageIndex >= 0 && DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo) {
-            DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
-        }
+        setFinalGenerationInfo(lastMessageIndex)
         
         doingChat.set(false)
         return await generateResolvedSpeaker(nowChatroom, currentChar, chatProcessIndex, {
-            signal: abortSignal
+            signal: abortSignal,
+            messageEventTriggerIds: arg.messageEventTriggerIds,
         })
     }
 
@@ -2002,9 +2130,7 @@ export async function generateResolvedSpeaker(
     
     const lastMessageIndex = arg.continueMessageIndex
         ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
-    if(lastMessageIndex >= 0 && DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo) {
-        DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
-    }
+    setFinalGenerationInfo(lastMessageIndex)
 
     return true
 }

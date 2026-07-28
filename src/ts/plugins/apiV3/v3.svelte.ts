@@ -66,6 +66,16 @@ import { MESSAGE_PATCH_CAPABILITY_IDS, MessageMutationRateLimiter, MessagePatchS
 import { createPocketMessagePatchAdapter } from './illustration/messagePatch.pocket';
 import { INLAY_ATOMIC_ATTACH_CAPABILITY_IDS, InlayAtomicAttachService } from './illustration/inlayAtomicAttach';
 import { createPocketInlayAtomicAttachAdapter } from './illustration/inlayAtomicAttach.pocket';
+import { PluginApiError } from './illustration/errors';
+import {
+    configurePocketMessageEvents,
+    pocketCommittedMessageEvents,
+} from './illustration/messageEvents.pocket';
+import {
+    MESSAGE_EVENT_CAPABILITY_IDS,
+    type CancellableMessageListener,
+    type MessageEventOptions,
+} from './illustration/messageEvents';
 
 /*
     V3 API for RisuAI Plugins
@@ -90,6 +100,18 @@ const pluginChannels = new InstanceChannelRegistry();
 const pluginInstanceCleanup = new InstanceCleanupRegistry();
 const pluginModelNodeStorage = new NodeStorage();
 const messageMutationRateLimiter = new MessageMutationRateLimiter();
+configurePocketMessageEvents({
+    getDatabase,
+    getCurrentCharacter,
+    listInlayKeys,
+    runExclusiveMutation: (operation) => databasePersistenceCoordinator.runExclusiveMutation(operation),
+    saveChatToServer,
+    requirePermission: (executionContext, permission) => pluginPermissionService.require(
+        executionContext,
+        permission,
+        { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
+    ),
+})
 const pixaiInstallLifecycle = new PixaiInstallLifecycle({
     clientForPrincipal: (principalId) => new PocketPluginModelClient(pluginModelNodeStorage, principalId),
     requirePermission: (executionContext) => pluginPermissionService.require(
@@ -722,6 +744,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
     )
     const deviceCache = new DeviceCacheService(context)
+    const messageEventCleanups = new Map<string, () => Promise<void>>()
     const pixaiLocalModel = new PixaiLocalModel({
         context,
         client: new PocketPluginModelClient(
@@ -1383,6 +1406,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.assets.v1',
                     'context.modules-installed.v1',
                     ...MESSAGE_QUERY_CAPABILITY_IDS,
+                    ...MESSAGE_EVENT_CAPABILITY_IDS,
                     ...MESSAGE_PATCH_CAPABILITY_IDS,
                     ...INLAY_ATOMIC_ATTACH_CAPABILITY_IDS,
                     ...INLAY_LIFECYCLE_CAPABILITY_IDS,
@@ -1408,6 +1432,37 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getMessageSnapshot: (target) => messageQuery.getMessageSnapshot(target),
         getLatestCommittedMessage: (options) => messageQuery.getLatestCommittedMessage(options),
         getRecentCommittedMessages: (options) => messageQuery.getRecentCommittedMessages(options),
+        onMessageCommitted: async (
+            listener: CancellableMessageListener,
+            options?: MessageEventOptions,
+        ) => {
+            if (!canRegisterResource()) {
+                listener?.release?.()
+                throw new PluginApiError('ABORTED', 'Plugin instance is unloaded')
+            }
+            const registered = await pocketCommittedMessageEvents.onMessageCommitted(context, listener, options)
+            let active = true
+            let removeCleanup = () => undefined
+            const cleanup = async () => {
+                if (!active) return
+                active = false
+                messageEventCleanups.delete(registered.subscriptionId)
+                removeCleanup()
+                await pocketCommittedMessageEvents.offMessageCommitted(context, registered.subscriptionId)
+            }
+            removeCleanup = addPluginUnloadCallback(context.instanceId, cleanup)
+            messageEventCleanups.set(registered.subscriptionId, cleanup)
+            if (!canRegisterResource()) {
+                await cleanup()
+                throw new PluginApiError('ABORTED', 'Plugin instance is unloaded')
+            }
+            return registered
+        },
+        offMessageCommitted: async (subscriptionId: string) => {
+            const cleanup = messageEventCleanups.get(subscriptionId)
+            if (cleanup) await cleanup()
+            else await pocketCommittedMessageEvents.offMessageCommitted(context, subscriptionId)
+        },
         patchMessage: (input) => messagePatch.patchMessage(input),
         attachGeneratedInlayToMessage: (input) => inlayAtomicAttach.attachGeneratedInlayToMessage(input),
         //Internal use APIs

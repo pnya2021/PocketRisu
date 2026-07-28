@@ -7,6 +7,10 @@ import {
 } from './group'
 import { collectLorebooksForPrompt } from './lorebook.svelte'
 import { resolveModulesForContext, resolveModulesWithReasonsForContext, type RisuModule } from './modules'
+import {
+    capturePocketMessageBaseline,
+    collectPocketGeneratedCommits,
+} from '../plugins/apiV3/illustration/messageEvents.pocket'
 
 const card = (id: string, name: string): character => ({
     type: 'character',
@@ -165,6 +169,42 @@ describe('runGroupGeneration', () => {
         expect(generate).toHaveBeenCalledWith(alice, expect.objectContaining({
             mode: 'reroll', continue: false, saying: 'alice',
         }))
+    })
+})
+
+describe('outer generation message commit collection', () => {
+    it('emits final group character messages once in stable conversation order', () => {
+        const messages: Message[] = [{ role: 'user', data: 'hello', chatId: 'user-1' }]
+        const before = capturePocketMessageBaseline(messages)
+        messages.push(
+            { role: 'char', data: 'Alice final', saying: 'alice', chatId: 'message-a', generationInfo: { generationId: 'generation-a' } },
+            { role: 'char', data: 'Bob final', saying: 'bob', chatId: 'message-b', generationInfo: { generationId: 'generation-b' } },
+        )
+
+        expect(collectPocketGeneratedCommits({ before, after: messages, mode: 'model' }))
+            .toEqual([
+                { message: messages[1], change: 'created', cause: 'model' },
+                { message: messages[2], change: 'created', cause: 'model' },
+            ])
+    })
+
+    it('collapses auto-continue into one final update and attributes trigger-mutated output truthfully', () => {
+        const messages: Message[] = [{
+            role: 'char', data: 'before', saying: 'alice', chatId: 'message-a',
+            generationInfo: { generationId: 'generation-a' },
+        }]
+        const before = capturePocketMessageBaseline(messages)
+        messages[0] = {
+            ...messages[0], data: 'before plus final continuation', pluginMessageUpdatedAt: 20,
+        }
+        expect(collectPocketGeneratedCommits({
+            before, after: messages, mode: 'continue', continueMessageId: 'message-a',
+        })).toEqual([{ message: messages[0], change: 'updated', cause: 'continue' }])
+
+        expect(collectPocketGeneratedCommits({
+            before, after: messages, mode: 'continue', continueMessageId: 'message-a',
+            triggerMutatedMessageIds: new Set(['message-a']),
+        })).toEqual([{ message: messages[0], change: 'updated', cause: 'trigger' }])
     })
 })
 

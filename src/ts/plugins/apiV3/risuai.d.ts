@@ -1319,6 +1319,28 @@ interface MessageSnapshot extends MessageRef {
     };
 }
 
+type MessageCommitCause = 'user' | 'model' | 'continue' | 'reroll' | 'plugin' | 'trigger' | 'import';
+
+interface MessageCommittedEventBase {
+    eventId: string;
+    change: 'created' | 'updated';
+    cause: MessageCommitCause;
+    durability: 'state' | 'persisted';
+    originPlugin?: { displayName: string; isCaller: boolean };
+}
+
+type MessageCommittedEvent = MessageCommittedEventBase & (
+    | { message: MessageSnapshot; unavailable?: never }
+    | {
+        message?: never;
+        unavailable: MessageRef & {
+            reason: 'resource-limit';
+            contentUtf16: number;
+            callerAttachmentCount: number;
+        };
+    }
+);
+
 interface CurrentMessageMetadataPatchInput {
     target: MessageRef;
     expectedRevision: Revision;
@@ -2314,6 +2336,20 @@ interface RisuaiPluginAPI {
         limit?: number;
         maxTotalUtf16?: number;
     }): Promise<{ items: MessageSnapshot[]; truncatedBefore: boolean }>;
+
+    /** Subscribes to live committed-message delivery with no replay. */
+    onMessageCommitted(
+        listener: (event: MessageCommittedEvent) => void | Promise<void>,
+        options?: {
+            scope?: 'current' | 'all';
+            roles?: Array<'user' | 'char'>;
+            causes?: MessageCommitCause[];
+            durability?: 'state' | 'persisted';
+        },
+    ): Promise<{ subscriptionId: string }>;
+
+    /** Stops future delivery and releases the subscription callback. */
+    offMessageCommitted(subscriptionId: string): Promise<void>;
 
     /** Atomically checkpoints caller-owned metadata on one current committed message. */
     patchMessage(input: CurrentMessageMetadataPatchInput): Promise<MessagePatchResult>;

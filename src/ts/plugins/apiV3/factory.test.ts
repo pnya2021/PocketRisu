@@ -438,6 +438,31 @@ describe('PocketRisu WebKit Response RPC', () => {
 })
 
 describe('SandboxHost callback and teardown lifecycle', () => {
+  it('cancels only pending invocations owned by one callback wrapper', async () => {
+    let callback!: (() => Promise<unknown>) & {
+      cancelPending: (reason?: unknown) => void
+      release: () => void
+    }
+    const { dispatch, host, posted } = createHarness({
+      register: (received: typeof callback) => { callback = received },
+    })
+    dispatch({
+      type: 'CALL_ROOT', reqId: 'register-cancellable', method: 'register',
+      args: [{ __type: 'CALLBACK_REF', id: 'cancellable-callback' }],
+    })
+    await postedMessage(posted, 'RESPONSE', 'register-cancellable')
+
+    const pending = callback()
+    const invocation = await postedMessage(posted, 'INVOKE_CALLBACK')
+    callback.cancelPending(new Error('listener retired'))
+
+    await expect(pending).rejects.toThrow('listener retired')
+    expect((host as any).pendingCallbacks.size).toBe(0)
+    dispatch({ type: 'CALLBACK_RETURN', reqId: invocation.message.reqId, result: 'late' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect((host as any).pendingCallbacks.size).toBe(0)
+  })
+
   it('reference-counts callback registrations and releases only the final host wrapper reference', async () => {
     let callbacks: Array<(() => Promise<unknown>) & { release?: () => void }> = []
     const { dispatch, host, posted } = createHarness({

@@ -36,6 +36,10 @@ import { isMobile } from 'src/ts/platform'
     import { getInlayAsset } from 'src/ts/process/files/inlays';
     import { quickMenu } from 'src/ts/hotkey';
     import { loadChatDraft, scheduleSaveChatDraft, flushChatDraft, removeChatDraft } from 'src/ts/storage/chatDraft';
+    import {
+        commitPocketMessageBatch,
+        correctRerollMessageIdentity,
+    } from 'src/ts/plugins/apiV3/illustration/messageEvents.pocket';
 
     import Chats from './Chats.svelte';
     import Button from '../UI/GUI/Button.svelte';
@@ -450,6 +454,8 @@ import { isMobile } from 'src/ts/platform'
         if($doingChat) return
         const lastMsg = getLastCharMsg()
         if (!lastMsg) return
+        lastMsg.chatId = lastMsg.chatId ?? v4()
+        const rerollIdentity = safeStructuredClone(lastMsg)
 
         // Save existing swipes before clone replaces the array
         const savedSwipes = lastMsg.swipes ? [...lastMsg.swipes] : [lastMsg.data]
@@ -490,7 +496,7 @@ import { isMobile } from 'src/ts/platform'
             }
         }
         DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = cha
-        const generated = await sendChatMain(false, groupMode, rerollSpeakerId)
+        const generated = await sendChatMain(false, groupMode, rerollSpeakerId, rerollIdentity)
 
         const currentMsgs = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message
 
@@ -514,26 +520,48 @@ import { isMobile } from 'src/ts/platform'
         }
     }
 
+    async function applyCachedReroll(lastMsg: Message, nextData: string) {
+        const room = DBState.db.characters[$selectedCharID]
+        const chat = room?.chats?.[room.chatPage]
+        if (!room || !chat) return
+        chat.id = chat.id ?? v4()
+        lastMsg.chatId = lastMsg.chatId ?? v4()
+        const before = safeStructuredClone(lastMsg)
+        const corrected = correctRerollMessageIdentity(before, {
+            ...lastMsg,
+            data: nextData,
+            generationInfo: {
+                ...(lastMsg.generationInfo ?? {}),
+                generationId: v4(),
+            },
+        }) as Message
+        Object.assign(lastMsg, corrected)
+        room.reloadKeys += 1
+        await commitPocketMessageBatch({
+            characterId: room.chaId,
+            conversationId: chat.id,
+            commits: [{ message: lastMsg, change: 'updated', cause: 'reroll' }],
+        })
+    }
+
     async function unReroll() {
         if($doingChat) return
         const lastMsg = getLastCharMsg()
         if (!lastMsg || !lastMsg.swipes || lastMsg.swipeId === undefined) return
 
         lastMsg.swipeId = lastMsg.swipeId <= 0 ? lastMsg.swipes.length - 1 : lastMsg.swipeId - 1
-        lastMsg.data = lastMsg.swipes[lastMsg.swipeId]
-        DBState.db.characters[$selectedCharID].reloadKeys += 1
+        await applyCachedReroll(lastMsg, lastMsg.swipes[lastMsg.swipeId])
     }
 
-    function nextSwipe() {
+    async function nextSwipe() {
         const lastMsg = getLastCharMsg()
         if (!lastMsg || !lastMsg.swipes || lastMsg.swipeId === undefined) return
 
         lastMsg.swipeId = lastMsg.swipeId >= lastMsg.swipes.length - 1 ? 0 : lastMsg.swipeId + 1
-        lastMsg.data = lastMsg.swipes[lastMsg.swipeId]
-        DBState.db.characters[$selectedCharID].reloadKeys += 1
+        await applyCachedReroll(lastMsg, lastMsg.swipes[lastMsg.swipeId])
     }
 
-    function deleteSwipe() {
+    async function deleteSwipe() {
         const lastMsg = getLastCharMsg()
         if (!lastMsg || !lastMsg.swipes || lastMsg.swipes.length <= 1) return
 
@@ -543,13 +571,13 @@ import { isMobile } from 'src/ts/platform'
         if (idx >= lastMsg.swipes.length) {
             lastMsg.swipeId = lastMsg.swipes.length - 1
         }
-        lastMsg.data = lastMsg.swipes[lastMsg.swipeId]
+        const nextData = lastMsg.swipes[lastMsg.swipeId]
 
         if (lastMsg.swipes.length === 1) {
             delete lastMsg.swipes
             delete lastMsg.swipeId
         }
-        DBState.db.characters[$selectedCharID].reloadKeys += 1
+        await applyCachedReroll(lastMsg, nextData)
     }
 
     let abortController:null|AbortController = null
@@ -558,6 +586,7 @@ import { isMobile } from 'src/ts/platform'
         continued:boolean = false,
         groupMode?:GroupGenerationMode,
         rerollSpeakerId?:string,
+        rerollIdentity?:Message,
     ) {
 
         messageInput = ''
@@ -569,6 +598,7 @@ import { isMobile } from 'src/ts/platform'
                 continue:continued,
                 groupMode,
                 rerollSpeakerId,
+                rerollIdentity,
             })
         } catch (error) {
             console.error(error)
