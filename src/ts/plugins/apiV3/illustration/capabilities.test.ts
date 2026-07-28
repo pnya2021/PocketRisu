@@ -109,22 +109,41 @@ describe('V3 capability discovery', () => {
         expect(Object.keys(await getCapabilities(context))).toEqual(CAPABILITY_IDS)
     })
 
-    it('registers only the usable owned Inlay lifecycle and still gates it on inlayWrite', async () => {
+    it('registers owned Inlay reads only with inlayWrite and no current-context dependency', async () => {
         expect(INLAY_LIFECYCLE_CAPABILITY_IDS).toEqual([
             'inlay.create.v1',
+            'inlay.read.v1',
             'inlay.delete-own.v1',
         ])
         expect(INLAY_LIFECYCLE_CAPABILITY_IDS).not.toContain('inlay.atomic-attach.v1')
 
+        const unavailable = await getCapabilities(context, ['inlay.read.v1'], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(), hasCurrentContext: true },
+        })
+        expect(unavailable['inlay.read.v1']).toMatchObject({
+            available: false, reason: 'temporarily-unavailable',
+        })
+
+        const permissionRequired = await getCapabilities(context, ['inlay.read.v1'], {
+            permissionState: async () => 'not-requested',
+            runtime: { registeredServices: new Set(INLAY_LIFECYCLE_CAPABILITY_IDS), hasCurrentContext: true },
+        })
+        expect(permissionRequired['inlay.read.v1']).toMatchObject({
+            available: false, reason: 'permission-required', permission: 'inlayWrite',
+        })
+
         const granted = await getCapabilities(context, [
             'inlay.create.v1',
+            'inlay.read.v1',
             'inlay.delete-own.v1',
             'inlay.atomic-attach.v1',
         ], {
             permissionState: async () => 'granted',
-            runtime: { registeredServices: new Set(INLAY_LIFECYCLE_CAPABILITY_IDS) },
+            runtime: { registeredServices: new Set(INLAY_LIFECYCLE_CAPABILITY_IDS), hasCurrentContext: false },
         })
         expect(granted['inlay.create.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
+        expect(granted['inlay.read.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
         expect(granted['inlay.delete-own.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
         expect(granted['inlay.atomic-attach.v1']).toMatchObject({
             available: false,

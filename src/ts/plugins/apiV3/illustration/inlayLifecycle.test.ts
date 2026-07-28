@@ -1,17 +1,23 @@
 import { describe, expect, it, vi } from 'vitest'
 import { PluginApiError } from './errors'
 import {
+    InlayReadRateLimiter,
     InlayLifecycleService,
+    deterministicAtomicInlayId,
     type InlayCreateOptions,
     type InlayLifecycleAdapter,
     type InlayLifecycleRecord,
+    type InlayReadableRecord,
 } from './inlayLifecycle'
 
-const context = (principalId = '11111111-1111-4111-8111-111111111111') => ({
+const context = (
+    principalId = '11111111-1111-4111-8111-111111111111',
+    signal = new AbortController().signal,
+) => ({
     principalId,
     instanceId: `instance-${principalId}`,
     displayName: 'Illustrator',
-    signal: new AbortController().signal,
+    signal,
 })
 
 const options = (overrides: Partial<InlayCreateOptions> = {}): InlayCreateOptions => ({
@@ -30,10 +36,19 @@ function harness(settings: {
     referenced?: boolean
     write?: InlayLifecycleAdapter['writeImage']
     remove?: InlayLifecycleAdapter['removeInlay']
+    controller?: AbortController
+    readableRecords?: Map<string, InlayReadableRecord>
+    getReadableInlay?: InlayLifecycleAdapter['getReadableInlay']
+    readInlayBytes?: InlayLifecycleAdapter['readInlayBytes']
+    permission?: () => void | Promise<void>
+    now?: () => number
 } = {}) {
     const records = settings.records ?? new Map<string, InlayLifecycleRecord>()
+    const readableRecords = settings.readableRecords ?? new Map<string, InlayReadableRecord>()
+    const controller = settings.controller ?? new AbortController()
     const permissionService = {
         require: vi.fn(async () => {
+            await settings.permission?.()
             if (settings.permissionError) throw settings.permissionError
         }),
     }
@@ -54,13 +69,47 @@ function harness(settings: {
         }),
         hasReference: vi.fn(async () => settings.referenced ?? false),
         removeInlay: settings.remove ?? vi.fn(async (id) => records.delete(id)),
+        getReadableInlay: settings.getReadableInlay
+            ?? vi.fn(async (id) => readableRecords.get(id) ?? null),
+        readInlayBytes: settings.readInlayBytes ?? vi.fn(async (record, maxBytes) => {
+            if (record.blob.size > maxBytes) {
+                throw new PluginApiError('RESOURCE_LIMIT', 'Inlay exceeds maxBytes')
+            }
+            return new Uint8Array(await record.blob.arrayBuffer()).slice()
+        }),
     }
-    const service = new InlayLifecycleService(context(settings.principalId), adapter, permissionService)
-    return { adapter, permissionService, records, service }
+    const service = new InlayLifecycleService(
+        context(settings.principalId, controller.signal),
+        adapter,
+        permissionService,
+        { readRateLimiter: new InlayReadRateLimiter(settings.now ?? (() => 0)) },
+    )
+    return { adapter, controller, permissionService, readableRecords, records, service }
 }
 
 const expectCode = async (operation: Promise<unknown>, code: string) => {
     await expect(operation).rejects.toMatchObject({ name: 'PluginApiError', code })
+}
+
+const revisionOf = async (data: Uint8Array) => {
+    const digest = await crypto.subtle.digest('SHA-256', data.slice().buffer)
+    return `sha256:${[...new Uint8Array(digest)]
+        .map((value) => value.toString(16).padStart(2, '0')).join('')}`
+}
+
+async function seedReadableOwned(
+    setup: ReturnType<typeof harness>,
+    data = Uint8Array.of(1, 2, 3),
+) {
+    const descriptor = await setup.service.createInlay(data, options())
+    const record = setup.records.get(descriptor.id)!
+    const readable: InlayReadableRecord = {
+        ...record,
+        blob: new Blob([data], { type: 'image/png' }),
+        mediaType: 'image/png',
+    }
+    setup.readableRecords.set(descriptor.id, readable)
+    return { data, descriptor, readable }
 }
 
 describe('owned Inlay create lifecycle', () => {
@@ -294,5 +343,242 @@ describe('owned Inlay delete lifecycle', () => {
 
         expect(recreated.id).toBe(original.id)
         expect(setup.adapter.writeImage).toHaveBeenCalledTimes(2)
+    })
+})
+
+describe('owned Inlay byte read lifecycle', () => {
+    it('awaits inlayWrite before touching hostile input or storage', async () => {
+        const denied = new PluginApiError('PERMISSION_DENIED', 'denied')
+        const setup = harness({ permissionError: denied })
+        let touched = false
+        const hostile = Object.defineProperty({}, 'ifRevision', {
+            enumerable: true,
+            get: () => { touched = true; return `sha256:${'a'.repeat(64)}` },
+        })
+
+        await expect(setup.service.readOwnedInlay('inlay', hostile as never)).rejects.toBe(denied)
+
+        expect(touched).toBe(false)
+        expect(setup.permissionService.require).toHaveBeenCalledWith(expect.anything(), 'inlayWrite')
+        expect(setup.adapter.getReadableInlay).not.toHaveBeenCalled()
+    })
+
+    it('returns an owned descriptor, normalized MIME and an isolated byte copy', async () => {
+        const setup = harness()
+        const seeded = await seedReadableOwned(setup)
+
+        const result = await setup.service.readOwnedInlay(seeded.descriptor.id, {
+            ifRevision: seeded.descriptor.revision,
+            maxBytes: seeded.data.byteLength,
+        })
+
+        expect(result).toEqual({
+            ...seeded.descriptor,
+            mediaType: 'image/png',
+            data: seeded.data,
+        })
+        expect(result!.data).not.toBe(seeded.data)
+        result!.data.fill(0)
+        expect(new Uint8Array(await seeded.readable.blob.arrayBuffer())).toEqual(seeded.data)
+    })
+
+    it('returns null for a missing ID after charging one well-formed read', async () => {
+        const setup = harness()
+        await expect(setup.service.readOwnedInlay('missing', {
+            ifRevision: `sha256:${'a'.repeat(64)}`,
+            maxBytes: 1,
+        })).resolves.toBeNull()
+        expect(setup.adapter.getReadableInlay).toHaveBeenCalledOnce()
+    })
+
+    it.each([
+        ['empty ID', '', { ifRevision: `sha256:${'a'.repeat(64)}`, maxBytes: 1 }],
+        ['missing revision', 'id', { maxBytes: 1 }],
+        ['uppercase revision', 'id', { ifRevision: `sha256:${'A'.repeat(64)}`, maxBytes: 1 }],
+        ['short revision', 'id', { ifRevision: `sha256:${'a'.repeat(63)}`, maxBytes: 1 }],
+        ['zero bytes', 'id', { ifRevision: `sha256:${'a'.repeat(64)}`, maxBytes: 0 }],
+        ['fractional bytes', 'id', { ifRevision: `sha256:${'a'.repeat(64)}`, maxBytes: 1.5 }],
+        ['over hard limit', 'id', { ifRevision: `sha256:${'a'.repeat(64)}`, maxBytes: 33_554_433 }],
+        ['unknown field', 'id', { ifRevision: `sha256:${'a'.repeat(64)}`, maxBytes: 1, data: 'bytes' }],
+        ['array options', 'id', [{ ifRevision: `sha256:${'a'.repeat(64)}`, maxBytes: 1 }]],
+        ['null prototype accessor', 'id', Object.defineProperty(Object.create(null), 'ifRevision', {
+            enumerable: true, get: () => `sha256:${'a'.repeat(64)}`,
+        })],
+        ['symbol field', 'id', Object.assign({ ifRevision: `sha256:${'a'.repeat(64)}`, maxBytes: 1 }, {
+            [Symbol('hidden')]: true,
+        })],
+    ])('rejects hostile or invalid %s before storage', async (_label, id, readOptions) => {
+        const setup = harness()
+        await expectCode(setup.service.readOwnedInlay(id as string, readOptions as never),
+            _label === 'over hard limit' ? 'RESOURCE_LIMIT' : 'INVALID_ARGUMENT')
+        expect(setup.adapter.getReadableInlay).not.toHaveBeenCalled()
+    })
+
+    it('accepts the exact maxBytes limit and reads a normalized Blob whose digest differs from the CAS token', async () => {
+        const setup = harness()
+        const seeded = await seedReadableOwned(setup, Uint8Array.of(1, 2, 3))
+        const normalized = Uint8Array.of(9, 8, 7, 6)
+        seeded.readable.blob = new Blob([normalized], { type: 'image/png' })
+
+        expect(await revisionOf(normalized)).not.toBe(seeded.descriptor.revision)
+
+        await expect(setup.service.readOwnedInlay(seeded.descriptor.id, {
+            ifRevision: seeded.descriptor.revision,
+            maxBytes: 33_554_432,
+        })).resolves.toEqual({
+            ...seeded.descriptor,
+            mediaType: 'image/png',
+            data: normalized,
+        })
+        await expectCode(setup.service.readOwnedInlay(seeded.descriptor.id, {
+            ifRevision: `sha256:${'0'.repeat(64)}`,
+            maxBytes: 33_554_432,
+        }), 'CONFLICT')
+    })
+
+    it('accepts complete create and atomic ownership and rejects foreign, legacy, malformed and relocated records', async () => {
+        const setup = harness()
+        const created = await seedReadableOwned(setup)
+        const atomicData = Uint8Array.of(4, 5, 6)
+        const atomicRevision = await revisionOf(atomicData)
+        const atomicKey = 'atomic-read'
+        const atomicId = await deterministicAtomicInlayId(context().principalId, atomicKey)
+        const atomic: InlayReadableRecord = {
+            id: atomicId,
+            name: 'atomic.png',
+            revision: atomicRevision,
+            lifecycle: {
+                version: 1,
+                ownerPrincipalId: context().principalId,
+                operation: 'inlay.atomic-attach.v1',
+                idempotencyKey: atomicKey,
+                argumentDigest: 'b'.repeat(64),
+                revision: atomicRevision,
+                context: {
+                    kind: 'message', characterId: 'character-1',
+                    conversationId: 'conversation-1', messageId: 'message-1',
+                },
+                inputRevision: `sha256:${'c'.repeat(64)}`,
+            },
+            blob: new Blob([atomicData], { type: 'image/png' }),
+            mediaType: 'image/png',
+        }
+        setup.readableRecords.set(atomicId, atomic)
+        await expect(setup.service.readOwnedInlay(atomicId, {
+            ifRevision: atomicRevision, maxBytes: atomicData.byteLength,
+        })).resolves.toMatchObject({ id: atomicId, revision: atomicRevision })
+
+        const foreignPrincipal = '22222222-2222-4222-8222-222222222222'
+        const foreignId = await deterministicAtomicInlayId(foreignPrincipal, atomicKey)
+        setup.readableRecords.set(foreignId, {
+            ...atomic,
+            id: foreignId,
+            lifecycle: { ...atomic.lifecycle!, ownerPrincipalId: foreignPrincipal },
+        } as InlayReadableRecord)
+        setup.readableRecords.set('legacy-id', {
+            ...created.readable, id: 'legacy-id', lifecycle: undefined,
+        })
+        setup.readableRecords.set('malformed-id', {
+            ...created.readable, id: 'malformed-id',
+            lifecycle: { ...created.readable.lifecycle!, idempotencyKey: '' },
+        })
+        const relocatedId = `inlay_${'d'.repeat(64)}`
+        setup.readableRecords.set(relocatedId, { ...created.readable, id: relocatedId })
+
+        for (const id of [foreignId, 'legacy-id', 'malformed-id', relocatedId]) {
+            await expectCode(setup.service.readOwnedInlay(id, {
+                ifRevision: id === foreignId ? atomicRevision : created.descriptor.revision,
+                maxBytes: 33_554_432,
+            }), 'PERMISSION_DENIED')
+        }
+    })
+
+    it('fails with retryable conflict when raw Blob type changes without changing normalized MIME', async () => {
+        const setup = harness()
+        const seeded = await seedReadableOwned(setup)
+        let reads = 0
+        vi.mocked(setup.adapter.getReadableInlay).mockImplementation(async () => {
+            reads++
+            if (reads === 1) return seeded.readable
+            return {
+                ...seeded.readable,
+                blob: new Blob([seeded.data], { type: 'image/png; profile=display-p3' }),
+                mediaType: 'image/png',
+            }
+        })
+
+        await expect(setup.service.readOwnedInlay(seeded.descriptor.id, {
+            ifRevision: seeded.descriptor.revision,
+            maxBytes: 33_554_432,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+    })
+
+    it('maps a post-byte image-shape change to retryable conflict', async () => {
+        const setup = harness()
+        const seeded = await seedReadableOwned(setup)
+        vi.mocked(setup.adapter.getReadableInlay)
+            .mockResolvedValueOnce(seeded.readable)
+            .mockRejectedValueOnce(new PluginApiError('PERMISSION_DENIED', 'Stored Inlay is not an image Blob'))
+
+        await expect(setup.service.readOwnedInlay(seeded.descriptor.id, {
+            ifRevision: seeded.descriptor.revision,
+            maxBytes: 33_554_432,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+    })
+
+    it('prioritizes abort after permission, raw reads and byte allocation boundaries', async () => {
+        const afterPermissionController = new AbortController()
+        const afterPermission = harness({
+            controller: afterPermissionController,
+            permission: () => afterPermissionController.abort(),
+        })
+        await expectCode(afterPermission.service.readOwnedInlay('id', {
+            ifRevision: `sha256:${'a'.repeat(64)}`, maxBytes: 1,
+        }), 'ABORTED')
+        expect(afterPermission.adapter.getReadableInlay).not.toHaveBeenCalled()
+
+        const afterReadController = new AbortController()
+        const afterRead = harness({ controller: afterReadController })
+        const seeded = await seedReadableOwned(afterRead)
+        vi.mocked(afterRead.adapter.getReadableInlay).mockImplementationOnce(async () => {
+            afterReadController.abort()
+            return seeded.readable
+        })
+        await expectCode(afterRead.service.readOwnedInlay(seeded.descriptor.id, {
+            ifRevision: seeded.descriptor.revision, maxBytes: 3,
+        }), 'ABORTED')
+
+        const afterBytesController = new AbortController()
+        const afterBytes = harness({
+            controller: afterBytesController,
+            readInlayBytes: vi.fn(async () => {
+                afterBytesController.abort()
+                return Uint8Array.of(1, 2, 3)
+            }),
+        })
+        const byteSeed = await seedReadableOwned(afterBytes)
+        await expectCode(afterBytes.service.readOwnedInlay(byteSeed.descriptor.id, {
+            ifRevision: byteSeed.descriptor.revision, maxBytes: 3,
+        }), 'ABORTED')
+    })
+
+    it('sanitizes raw adapter failures and allows the 60th read but rejects the 61st', async () => {
+        const failed = harness({
+            getReadableInlay: vi.fn(async () => { throw new Error('secret backend path') }),
+        })
+        await expect(failed.service.readOwnedInlay('id', {
+            ifRevision: `sha256:${'a'.repeat(64)}`, maxBytes: 1,
+        })).rejects.toMatchObject({ code: 'INTERNAL', retryable: true })
+
+        const setup = harness()
+        const seeded = await seedReadableOwned(setup, Uint8Array.of(1))
+        for (let attempt = 0; attempt < 60; attempt++) {
+            await setup.service.readOwnedInlay(seeded.descriptor.id, {
+                ifRevision: seeded.descriptor.revision, maxBytes: 1,
+            })
+        }
+        await expect(setup.service.readOwnedInlay(seeded.descriptor.id, {
+            ifRevision: seeded.descriptor.revision, maxBytes: 1,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT', retryable: true, retryAfterMs: 60_000 })
     })
 })

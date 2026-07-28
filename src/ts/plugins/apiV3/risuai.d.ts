@@ -105,6 +105,11 @@ interface OwnedInlayDescriptor {
     name: string;
 }
 
+interface OwnedInlayRead extends OwnedInlayDescriptor {
+    mediaType: string;
+    data: Uint8Array;
+}
+
 interface OwnedInlayCreateOptions {
     name?: string;
     idempotencyKey: string;
@@ -2134,6 +2139,12 @@ interface RisuaiPluginAPI {
 
     /** Creates an image Inlay owned by this plugin in the current character context. */
     createInlay(data: Uint8Array, options: OwnedInlayCreateOptions): Promise<OwnedInlayDescriptor>;
+
+    /** Reads bounded image bytes from an Inlay owned by this plugin. */
+    readOwnedInlay(
+        id: string,
+        options: { ifRevision: string; maxBytes: number },
+    ): Promise<OwnedInlayRead | null>;
 
     /** Deletes an unreferenced Inlay owned by this plugin. */
     deleteInlay(id: string, options?: { expectedRevision?: string }): Promise<OwnedInlayDeleteResult>;

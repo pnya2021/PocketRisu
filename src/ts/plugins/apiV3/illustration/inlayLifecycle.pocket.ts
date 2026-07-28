@@ -3,7 +3,11 @@ import type {
     InlayLifecycleMetadata as StoredInlayLifecycleMetadata,
 } from 'src/ts/process/files/inlays'
 import { PluginApiError } from './errors'
-import type { InlayLifecycleAdapter, InlayLifecycleMetadata } from './inlayLifecycle'
+import type {
+    InlayLifecycleAdapter,
+    InlayLifecycleMetadata,
+    InlayReadableRecord,
+} from './inlayLifecycle'
 
 type UnknownRecord = Record<string, any>
 
@@ -49,6 +53,17 @@ const messagesContain = (messages: unknown, tokens: readonly string[], strict: b
 }
 
 const storageFailure = (message: string) => new PluginApiError('INTERNAL', message, { retryable: true })
+const unreadableOwnedInlay = () => new PluginApiError(
+    'PERMISSION_DENIED',
+    'Stored Inlay is not a readable owned image',
+)
+const MAX_OUTPUT_BYTES = 33_554_432
+
+const normalizeImageMediaType = (value: string) => {
+    const mediaType = value.split(';', 1)[0]?.trim().toLowerCase()
+    if (!mediaType || !/^image\/[a-z0-9][a-z0-9.+-]*$/u.test(mediaType)) return null
+    return mediaType === 'image/jpg' ? 'image/jpeg' : mediaType
+}
 
 export function createPocketInlayLifecycleAdapter(
     dependencies: PocketInlayLifecycleDependencies,
@@ -73,6 +88,48 @@ export function createPocketInlayLifecycleAdapter(
                 revision: typeof lifecycle?.revision === 'string' ? lifecycle.revision : '',
                 ...(lifecycle ? { lifecycle } : {}),
             }
+        },
+        async getReadableInlay(id) {
+            try {
+                const record = await dependencies.getInlayAssetRecord(id)
+                if (!record) return null
+                if (record.type !== 'image' || !(record.data instanceof Blob)) {
+                    throw unreadableOwnedInlay()
+                }
+                const mediaType = normalizeImageMediaType(record.data.type)
+                if (!mediaType) throw unreadableOwnedInlay()
+                const lifecycle = record.lifecycle as InlayLifecycleMetadata | undefined
+                return {
+                    id,
+                    name: typeof record.name === 'string' ? record.name : '',
+                    revision: typeof lifecycle?.revision === 'string' ? lifecycle.revision : '',
+                    ...(lifecycle ? { lifecycle } : {}),
+                    blob: record.data,
+                    mediaType,
+                }
+            } catch (error) {
+                if (error instanceof PluginApiError) throw error
+                throw storageFailure('Unable to read Inlay storage')
+            }
+        },
+        async readInlayBytes(record: InlayReadableRecord, maxBytes: number) {
+            if (!(record?.blob instanceof Blob)) throw storageFailure('Stored Inlay is not a readable image Blob')
+            if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_OUTPUT_BYTES) {
+                throw new PluginApiError('INVALID_ARGUMENT', 'Invalid owned Inlay byte limit')
+            }
+            if (record.blob.size > maxBytes || record.blob.size > MAX_OUTPUT_BYTES) {
+                throw new PluginApiError('RESOURCE_LIMIT', 'Owned Inlay exceeds maxBytes')
+            }
+            let buffer: ArrayBuffer
+            try {
+                buffer = await record.blob.arrayBuffer()
+            } catch {
+                throw storageFailure('Unable to read Inlay bytes')
+            }
+            if (!(buffer instanceof ArrayBuffer) || buffer.byteLength !== record.blob.size) {
+                throw storageFailure('Inlay byte length changed while reading')
+            }
+            return Uint8Array.from(new Uint8Array(buffer))
         },
         async writeImage(data, request) {
             try {

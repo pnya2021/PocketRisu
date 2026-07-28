@@ -874,6 +874,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         readImage: oldApis.readImage,
         saveAsset: oldApis.saveAsset,
         createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
+        readOwnedInlay: (id, options) => inlayLifecycle.readOwnedInlay(id, options),
         deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
         putDeviceCacheEntry: (input) => deviceCache.putDeviceCacheEntry(input),
         getDeviceCacheEntry: (key) => deviceCache.getDeviceCacheEntry(key),

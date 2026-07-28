@@ -111,4 +111,87 @@ describe('Pocket owned Inlay adapter', () => {
         await expect(adapter.hasReference('inlay_' + 'a'.repeat(64)))
             .rejects.toMatchObject({ name: 'PluginApiError', code: 'INTERNAL', retryable: true })
     })
+
+    it('reads a fresh raw owned image record and normalizes its MIME without exposing storage fields', async () => {
+        const { adapter, stored } = harness()
+        const blob = new Blob([Uint8Array.of(1, 2, 3)], { type: 'IMAGE/JPG; Charset=UTF-8' })
+        stored.set('owned', {
+            data: blob, ext: 'jpg', name: 'portrait.jpg', type: 'image', lifecycle,
+        })
+
+        await expect(adapter.getReadableInlay('owned')).resolves.toEqual({
+            id: 'owned',
+            name: 'portrait.jpg',
+            revision: lifecycle.revision,
+            lifecycle,
+            blob,
+            mediaType: 'image/jpeg',
+        })
+    })
+
+    it('returns null for missing storage and sanitizes raw backend failures', async () => {
+        const missing = harness()
+        await expect(missing.adapter.getReadableInlay('missing')).resolves.toBeNull()
+
+        const failed = harness({
+            getInlayAssetRecord: vi.fn(async () => { throw new Error('C:\\private\\inlay.json') }),
+        })
+        await expect(failed.adapter.getReadableInlay('owned'))
+            .rejects.toMatchObject({ code: 'INTERNAL', retryable: true })
+    })
+
+    it.each([
+        ['string data', { data: 'data:image/png;base64,AA==', type: 'image', name: 'x.png' }],
+        ['non-image record', { data: new Blob(['x'], { type: 'image/png' }), type: 'audio', name: 'x.png' }],
+        ['non-image MIME', { data: new Blob(['x'], { type: 'text/plain' }), type: 'image', name: 'x.png' }],
+        ['empty MIME', { data: new Blob(['x']), type: 'image', name: 'x.png' }],
+    ])('fails closed for %s instead of migrating or returning it', async (_label, partial) => {
+        const { adapter, stored } = harness()
+        stored.set('bad', {
+            ext: 'png', lifecycle, ...partial,
+        } as InlayAssetRecord)
+
+        await expect(adapter.getReadableInlay('bad'))
+            .rejects.toMatchObject({ code: 'PERMISSION_DENIED', retryable: false })
+    })
+
+    it('checks exact and one-over maxBytes before arrayBuffer and returns an isolated byte copy', async () => {
+        const { adapter, stored } = harness()
+        const blob = new Blob([Uint8Array.of(1, 2, 3)], { type: 'image/png' })
+        const arrayBuffer = vi.spyOn(blob, 'arrayBuffer')
+        stored.set('owned', {
+            data: blob, ext: 'png', name: 'portrait.png', type: 'image', lifecycle,
+        })
+        const record = await adapter.getReadableInlay('owned')
+
+        const bytes = await adapter.readInlayBytes(record!, 3)
+        expect(bytes).toEqual(Uint8Array.of(1, 2, 3))
+        bytes.fill(0)
+        expect(new Uint8Array(await blob.arrayBuffer())).toEqual(Uint8Array.of(1, 2, 3))
+
+        arrayBuffer.mockClear()
+        await expect(adapter.readInlayBytes(record!, 2))
+            .rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(arrayBuffer).not.toHaveBeenCalled()
+    })
+
+    it('returns fresh descriptor and Blob race evidence on every raw read', async () => {
+        const { adapter, stored } = harness()
+        stored.set('owned', {
+            data: new Blob(['a'], { type: 'image/png' }), ext: 'png',
+            name: 'before.png', type: 'image', lifecycle,
+        })
+        const before = await adapter.getReadableInlay('owned')
+        stored.set('owned', {
+            data: new Blob(['bb'], { type: 'image/webp' }), ext: 'webp',
+            name: 'after.webp', type: 'image',
+            lifecycle: { ...lifecycle, revision: `sha256:${'c'.repeat(64)}` },
+        })
+        const after = await adapter.getReadableInlay('owned')
+
+        expect(before).toMatchObject({ name: 'before.png', mediaType: 'image/png' })
+        expect(before!.blob.size).toBe(1)
+        expect(after).toMatchObject({ name: 'after.webp', mediaType: 'image/webp' })
+        expect(after!.blob.size).toBe(2)
+    })
 })
