@@ -50,8 +50,8 @@ import { isCurrentPluginRuntimeRecord } from '../pluginRuntimeReplacement';
 import { createOwnedSyncStorageMutations } from '../ownedSyncStorage';
 import { ContextResourceService } from './illustration/contextResources';
 import { createPocketContextResourceAdapter } from './illustration/contextResources.pocket';
-import { ensureCurrentChatReady } from 'src/ts/storage/chatStorage';
-import { getInlayAssetBlob, getInlayAssetRecord, removeInlayAsset, writeInlayImageFromBytes } from 'src/ts/process/files/inlays';
+import { ensureChatHydrated, ensureCurrentChatReady } from 'src/ts/storage/chatStorage';
+import { getInlayAssetBlob, getInlayAssetRecord, listInlayKeys, removeInlayAsset, writeInlayImageFromBytes } from 'src/ts/process/files/inlays';
 import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustration/inlayLifecycle';
 import { createPocketInlayLifecycleAdapter } from './illustration/inlayLifecycle.pocket';
 import { NodeStorage } from 'src/ts/storage/nodeStorage';
@@ -59,6 +59,8 @@ import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/
 import { PixaiInstallLifecycle } from './localModel/pixaiInstallLifecycle';
 import { PocketPluginModelClient } from './localModel/pocketPluginModelClient';
 import { PixaiLocalModel, withPixaiInferenceCapability } from './localModel/pixaiLocalModel';
+import { MESSAGE_QUERY_CAPABILITY_IDS, MessageQueryService } from './illustration/messageQuery';
+import { createPocketMessageQueryAdapter } from './illustration/messageQuery.pocket';
 
 /*
     V3 API for RisuAI Plugins
@@ -640,6 +642,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
     )
     const inlayNodeStorage = new NodeStorage()
+    const messageQuery = new MessageQueryService(
+        context,
+        createPocketMessageQueryAdapter({
+            getDatabase,
+            getCurrentCharacter,
+            ensureChatHydrated,
+            listInlayKeys,
+        }),
+        {
+            requirePermission: (executionContext, permission) => pluginPermissionService.require(
+                executionContext,
+                permission,
+                { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
+            ),
+        },
+    )
     const inlayLifecycle = new InlayLifecycleService(
         context,
         createPocketInlayLifecycleAdapter({
@@ -1316,6 +1334,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.current.v1',
                     'context.assets.v1',
                     'context.modules-installed.v1',
+                    ...MESSAGE_QUERY_CAPABILITY_IDS,
                     ...INLAY_LIFECYCLE_CAPABILITY_IDS,
                     ...DEVICE_CACHE_CAPABILITY_IDS,
                 ],
@@ -1336,6 +1355,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getActiveModules: (options) => contextResources.getActiveModules(options),
         listContextModules: (options) => contextResources.listContextModules(options),
         readContextAsset: (assetId: string, options) => contextResources.readContextAsset(assetId, options),
+        getMessageSnapshot: (target) => messageQuery.getMessageSnapshot(target),
+        getLatestCommittedMessage: (options) => messageQuery.getLatestCommittedMessage(options),
+        getRecentCommittedMessages: (options) => messageQuery.getRecentCommittedMessages(options),
         //Internal use APIs
         _getOldKeys: () => {
             return Object.keys(oldApis)

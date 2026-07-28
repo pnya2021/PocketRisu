@@ -1210,6 +1210,7 @@ interface PluginCapability {
 
 type CharacterId = string;
 type ConversationId = string;
+type MessageId = string;
 type Revision = string;
 
 interface CurrentContextRef {
@@ -1283,6 +1284,34 @@ interface ContextModuleSnapshot extends ActiveModuleSummary {
 interface CursorPage<T> {
     items: T[];
     nextCursor?: string;
+}
+
+interface MessageRef {
+    characterId: CharacterId;
+    conversationId: ConversationId;
+    messageId: MessageId;
+}
+
+interface CallerPluginAttachmentSnapshot {
+    inlayId: string;
+    presentation: 'inline' | 'styled' | 'model-input';
+    utf16Offset: number;
+    metadata?: PluginJsonValue;
+}
+
+interface MessageSnapshot extends MessageRef {
+    role: 'user' | 'char';
+    speakerCharacterId?: CharacterId;
+    /** Logical UTF-16 text with recognized Inlay marker tokens omitted. */
+    content: string;
+    revision: Revision;
+    generationId?: string;
+    createdAt?: number;
+    updatedAt: number;
+    callerPluginState: {
+        metadata: Record<string, PluginJsonValue>;
+        attachments: CallerPluginAttachmentSnapshot[];
+    };
 }
 
 type LocalModelProfileId = 'pixai-tagger-v0.9-onnx';
@@ -2215,6 +2244,24 @@ interface RisuaiPluginAPI {
 
     /** Clears this plugin principal's cache, optionally restricted to a key prefix. */
     clearDeviceCache(options?: { prefix?: string }): Promise<number>;
+
+    /** Returns one complete committed message through stable IDs. */
+    getMessageSnapshot(target: MessageRef): Promise<MessageSnapshot>;
+
+    /** Returns the latest matching committed message, defaulting to current char output. */
+    getLatestCommittedMessage(options?: {
+        characterId?: CharacterId;
+        conversationId?: ConversationId;
+        role?: 'user' | 'char';
+    }): Promise<MessageSnapshot | null>;
+
+    /** Returns complete messages strictly before the target in oldest-to-newest order. */
+    getRecentCommittedMessages(options: {
+        before: MessageRef;
+        roles?: Array<'user' | 'char'>;
+        limit?: number;
+        maxTotalUtf16?: number;
+    }): Promise<{ items: MessageSnapshot[]; truncatedBefore: boolean }>;
 
     /** Returns stable references for the current card and conversation. */
     getCurrentContext(): Promise<CurrentContextRef>;

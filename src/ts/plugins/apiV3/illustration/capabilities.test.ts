@@ -4,6 +4,7 @@ import { getCapabilities } from './capabilities'
 import { INLAY_LIFECYCLE_CAPABILITY_IDS } from './inlayLifecycle'
 import { DEVICE_CACHE_CAPABILITY_IDS } from './deviceCache'
 import { withPixaiInferenceCapability } from '../localModel/pixaiLocalModel'
+import { MESSAGE_QUERY_CAPABILITY_IDS } from './messageQuery'
 
 const context = {
     principalId: '11111111-1111-4111-8111-111111111111',
@@ -144,6 +145,41 @@ describe('V3 capability discovery', () => {
         expect(descriptors['local-model.pixai-v0.9.v1']).toMatchObject({
             available: false,
             reason: 'temporarily-unavailable',
+        })
+    })
+
+    it('makes message query available only after registration, permission, and current context', async () => {
+        expect(MESSAGE_QUERY_CAPABILITY_IDS).toEqual(['chat.message-query.v1'])
+        const unavailable = await getCapabilities(context, MESSAGE_QUERY_CAPABILITY_IDS as unknown as string[], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(), hasCurrentContext: true },
+        })
+        expect(unavailable['chat.message-query.v1']).toMatchObject({
+            available: false, reason: 'temporarily-unavailable',
+        })
+
+        const permissionRequired = await getCapabilities(context, MESSAGE_QUERY_CAPABILITY_IDS as unknown as string[], {
+            permissionState: async () => 'not-requested',
+            runtime: { registeredServices: new Set(MESSAGE_QUERY_CAPABILITY_IDS), hasCurrentContext: true },
+        })
+        expect(permissionRequired['chat.message-query.v1']).toMatchObject({
+            available: false, reason: 'permission-required', permission: 'chatObserve',
+        })
+
+        const noContext = await getCapabilities(context, MESSAGE_QUERY_CAPABILITY_IDS as unknown as string[], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(MESSAGE_QUERY_CAPABILITY_IDS), hasCurrentContext: false },
+        })
+        expect(noContext['chat.message-query.v1']).toMatchObject({
+            available: false, reason: 'no-current-context',
+        })
+
+        const available = await getCapabilities(context, MESSAGE_QUERY_CAPABILITY_IDS as unknown as string[], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(MESSAGE_QUERY_CAPABILITY_IDS), hasCurrentContext: true },
+        })
+        expect(available['chat.message-query.v1']).toMatchObject({
+            available: true, permission: 'chatObserve', permissionState: 'granted',
         })
     })
 
