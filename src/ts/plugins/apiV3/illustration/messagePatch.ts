@@ -18,6 +18,7 @@ export type MessagePatchPlacement =
 
 export type RestrictedMessagePatch =
     | { op: 'setPluginMetadata'; key: string; value: PluginJsonValue }
+    | { op: 'setOwnInlayMetadata'; inlayId: string; value: PluginJsonValue }
     | {
         op: 'attachInlay'
         inlayId: string
@@ -120,6 +121,17 @@ const normalizePatch = (raw: unknown): RestrictedMessagePatch => {
             maxDepth: 32, maxBytes: MAX_METADATA_BYTES,
         })) as PluginJsonValue
         return { op: 'setPluginMetadata', key, value: json }
+    }
+    if (value.op === 'setOwnInlayMetadata') {
+        const patch = ownObject(raw, ['op', 'inlayId', 'value'], 'message patch operation')
+        const json = JSON.parse(validateJsonLimits(patch.value, {
+            maxDepth: 32, maxBytes: MAX_METADATA_BYTES,
+        })) as PluginJsonValue
+        return {
+            op: 'setOwnInlayMetadata',
+            inlayId: inlayId(patch.inlayId, 'inlayId'),
+            value: json,
+        }
     }
     if (value.op === 'attachInlay') {
         const patch = ownObject(

@@ -1353,6 +1353,11 @@ type RestrictedMessagePatch =
         value: PluginJsonValue;
     }
     | {
+        op: 'setOwnInlayMetadata';
+        inlayId: string;
+        value: PluginJsonValue;
+    }
+    | {
         op: 'attachInlay';
         inlayId: string;
         presentation: 'inline';

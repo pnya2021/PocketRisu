@@ -177,6 +177,55 @@ describe('V3 current-message metadata patch', () => {
         }))
     })
 
+    it('normalizes a full own Inlay metadata replacement with both write permissions', async () => {
+        const requirePermission = vi.fn(async (
+            _context: PluginExecutionContext,
+            _permission: PluginPermissionId,
+        ) => undefined)
+        const state = serviceHarness({ requirePermission })
+
+        await state.service.patchMessage(input({
+            patch: {
+                op: 'setOwnInlayMetadata',
+                inlayId: 'inlay-old',
+                value: { locked: true, nested: ['safe'] },
+            },
+            idempotencyKey: 'lock-1',
+        } as never))
+
+        expect(requirePermission.mock.calls.map(([, permission]) => permission)).toEqual([
+            'chatWrite', 'inlayWrite',
+        ])
+        expect(state.adapter.patchCurrentMessage).toHaveBeenCalledWith(expect.objectContaining({
+            input: expect.objectContaining({
+                patch: {
+                    op: 'setOwnInlayMetadata',
+                    inlayId: 'inlay-old',
+                    value: { locked: true, nested: ['safe'] },
+                },
+            }),
+        }))
+    })
+
+    it.each([
+        ['an extraneous metadata-replacement field', {
+            op: 'setOwnInlayMetadata', inlayId: 'inlay-old', value: { locked: true }, extra: true,
+        }],
+        ['oversized replacement metadata', {
+            op: 'setOwnInlayMetadata', inlayId: 'inlay-old', value: 'x'.repeat(65_535),
+        }],
+    ])('rejects %s before permission or adapter calls', async (_label, patch) => {
+        const requirePermission = vi.fn(async () => undefined)
+        const state = serviceHarness({ requirePermission })
+
+        await expect(state.service.patchMessage(input({ patch } as never)))
+            .rejects.toMatchObject({
+                code: _label.startsWith('oversized') ? 'RESOURCE_LIMIT' : 'INVALID_ARGUMENT',
+            })
+        expect(requirePermission).not.toHaveBeenCalled()
+        expect(state.adapter.patchCurrentMessage).not.toHaveBeenCalled()
+    })
+
     it.each([
         ['non-inline presentation', {
             op: 'attachInlay', inlayId: 'inlay-new', presentation: 'styled',

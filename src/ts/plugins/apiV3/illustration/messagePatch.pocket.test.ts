@@ -322,6 +322,166 @@ describe('Pocket current-message metadata persistence', () => {
         expect(state.character.chats[0].message[0].data).toBe('AB')
     })
 
+    it('replaces full metadata on one atomic-owned attachment without moving or rewriting it', async () => {
+        const [inlayId, record] = await ownedAtomicAsset('metadata-atomic-slot')
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char', data: `A{{inlay::${inlayId}}}B{{inlay::other}}C`,
+                chatId: 'message-1', time: 1,
+                pluginMessageState: {
+                    'plugin-a': {
+                        metadata: { ledger: 1 },
+                        attachments: [
+                            { inlayId, presentation: 'inline', metadata: { locked: false, old: true } },
+                            { inlayId: 'other', presentation: 'inline', metadata: { keep: true } },
+                        ],
+                    },
+                    foreign: { metadata: { secret: true }, attachments: [] },
+                },
+            }],
+        } })
+        state.inlayAssets.set(inlayId, record)
+        state.inlayAssets.set('other', { legacy: true })
+        state.dependencies.createRevision.mockImplementation(async (value: any) =>
+            value.pluginMessageState?.['plugin-a']?.attachments?.[0]?.metadata?.locked === true
+                ? 'sha256:locked'
+                : 'sha256:old')
+        const patch = {
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:old',
+                patch: {
+                    op: 'setOwnInlayMetadata' as const,
+                    inlayId,
+                    value: { locked: true, old: false },
+                },
+                idempotencyKey: 'metadata-atomic-1',
+            },
+        }
+
+        const changed = await state.adapter.patchCurrentMessage(patch as never)
+
+        expect(changed).toMatchObject({ changed: true, message: { revision: 'sha256:locked' } })
+        expect(state.character.chats[0].message[0].data)
+            .toBe(`A{{inlay::${inlayId}}}B{{inlay::other}}C`)
+        expect(state.character.chats[0].message[0].pluginMessageState['plugin-a'].attachments).toEqual([
+            { inlayId, presentation: 'inline', metadata: { locked: true, old: false } },
+            { inlayId: 'other', presentation: 'inline', metadata: { keep: true } },
+        ])
+        expect(state.character.chats[0].message[0].pluginMessageState.foreign)
+            .toEqual({ metadata: { secret: true }, attachments: [] })
+
+        await expect(state.adapter.patchCurrentMessage({
+            ...patch,
+            argumentDigest: 'b'.repeat(64),
+            input: {
+                ...patch.input,
+                expectedRevision: 'sha256:locked',
+                idempotencyKey: 'metadata-atomic-2',
+            },
+        } as never)).resolves.toMatchObject({ changed: false, message: { revision: 'sha256:locked' } })
+    })
+
+    it.each([
+        ['missing attachment', [{ inlayId: 'other', presentation: 'inline' }], 'NOT_FOUND'],
+        ['duplicate attachment', [
+            { inlayId: 'target', presentation: 'inline' },
+            { inlayId: 'target', presentation: 'inline' },
+        ], 'CONFLICT'],
+        ['non-inline attachment', [{ inlayId: 'target', presentation: 'styled' }], 'CONFLICT'],
+    ])('rejects a %s metadata target without saving', async (_label, attachments, code) => {
+        const [inlayId, record] = await ownedAsset('metadata-target')
+        const normalized = attachments.map((attachment) => ({
+            ...attachment,
+            inlayId: attachment.inlayId === 'target' ? inlayId : attachment.inlayId,
+        }))
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char',
+                data: `A{{inlay::${inlayId}}}B`,
+                chatId: 'message-1', time: 1,
+                pluginMessageState: { 'plugin-a': { metadata: {}, attachments: normalized } },
+            }],
+        } })
+        state.inlayAssets.set(inlayId, record)
+        state.dependencies.createRevision.mockResolvedValue('sha256:after')
+
+        await expect(state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:after',
+                patch: { op: 'setOwnInlayMetadata', inlayId, value: { locked: true } },
+                idempotencyKey: `metadata-${_label}`,
+            },
+        } as never)).rejects.toMatchObject({ code })
+        expect(state.dependencies.saveChatToServer).not.toHaveBeenCalled()
+    })
+
+    it('rejects duplicate raw markers for one metadata attachment', async () => {
+        const [inlayId, record] = await ownedAsset('metadata-duplicate-marker')
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char',
+                data: `A{{inlay::${inlayId}}}B{{inlay::${inlayId}}}C`,
+                chatId: 'message-1', time: 1,
+                pluginMessageState: { 'plugin-a': {
+                    metadata: {},
+                    attachments: [{
+                        inlayId,
+                        presentation: 'inline',
+                        metadata: { locked: false },
+                    }],
+                } },
+            }],
+        } })
+        state.inlayAssets.set(inlayId, record)
+        state.dependencies.createRevision.mockResolvedValue('sha256:duplicate-marker')
+
+        await expect(state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:duplicate-marker',
+                patch: { op: 'setOwnInlayMetadata', inlayId, value: { locked: true } },
+                idempotencyKey: 'metadata-duplicate-marker-1',
+            },
+        } as never)).rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(state.chat.message[0].pluginMessageState['plugin-a'].attachments[0].metadata)
+            .toEqual({ locked: false })
+        expect(state.dependencies.saveChatToServer).not.toHaveBeenCalled()
+    })
+
+    it('rejects foreign ownership for metadata replacement without changing the live message', async () => {
+        const [inlayId, record] = await ownedAsset('metadata-foreign', 'foreign-plugin')
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char', data: `A{{inlay::${inlayId}}}B`, chatId: 'message-1', time: 1,
+                pluginMessageState: { 'plugin-a': {
+                    metadata: {},
+                    attachments: [{ inlayId, presentation: 'inline', metadata: { locked: false } }],
+                } },
+            }],
+        } })
+        state.inlayAssets.set(inlayId, record)
+        state.dependencies.createRevision.mockResolvedValue('sha256:after')
+
+        await expect(state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:after',
+                patch: { op: 'setOwnInlayMetadata', inlayId, value: { locked: true } },
+                idempotencyKey: 'metadata-foreign-1',
+            },
+        } as never)).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+        expect(state.character.chats[0]).toBe(state.chat)
+        expect(state.chat.message[0].pluginMessageState['plugin-a'].attachments[0].metadata)
+            .toEqual({ locked: false })
+        expect(state.dependencies.saveChatToServer).not.toHaveBeenCalled()
+    })
+
     it('does not expose a replacement marker when the acknowledged save rejects', async () => {
         const [oldId, oldRecord] = await ownedAsset('rollback-old')
         const [newId, newRecord] = await ownedAsset('rollback-new')

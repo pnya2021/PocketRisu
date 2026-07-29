@@ -353,9 +353,11 @@ const managedAttachment = (
     if (matches.length !== 1 || matches[0].attachment.presentation !== 'inline') {
         conflict('Caller-owned Inlay attachment is ambiguous')
     }
-    const marker = projectLogicalContent(data, recognized).markers.find((candidate) => candidate.id === inlayId)
-    if (!marker) conflict('Caller-owned Inlay marker is missing')
-    return { ...matches[0], marker }
+    const markers = projectLogicalContent(data, recognized).markers
+        .filter((candidate) => candidate.id === inlayId)
+    if (markers.length === 0) conflict('Caller-owned Inlay marker is missing')
+    if (markers.length !== 1) conflict('Caller-owned Inlay marker is ambiguous')
+    return { ...matches[0], marker: markers[0] }
 }
 
 const attachedDescriptor = (patch: Extract<RestrictedMessagePatch, { op: 'attachInlay' }>) => ({
@@ -587,6 +589,7 @@ export function createPocketMessagePatchAdapter(
 
                 const patch = request.input.patch
                 const mutationInlayIds = patch.op === 'detachOwnInlay'
+                    || patch.op === 'setOwnInlayMetadata'
                     ? [patch.inlayId]
                     : patch.op === 'attachInlay'
                         ? [
@@ -596,6 +599,7 @@ export function createPocketMessagePatchAdapter(
                         ]
                         : []
                 const ownershipChecks = patch.op === 'detachOwnInlay'
+                    || patch.op === 'setOwnInlayMetadata'
                     ? [{ id: patch.inlayId, allowAtomicMessageLifecycle: true }]
                     : patch.op === 'attachInlay'
                         ? [
@@ -662,6 +666,22 @@ export function createPocketMessagePatchAdapter(
                             + nextData.slice(insertionOffset)
                     }
                     changed = true
+                } else if (patch.op === 'setOwnInlayMetadata') {
+                    const existing = managedAttachment(
+                        nextData,
+                        recognized,
+                        attachments,
+                        patch.inlayId,
+                    )
+                    const previous = Object.hasOwn(existing.attachment, 'metadata')
+                        ? canonicalJson(existing.attachment.metadata)
+                        : undefined
+                    const next = canonicalJson(patch.value)
+                    attachments.splice(existing.index, 1, {
+                        ...existing.attachment,
+                        metadata: cloneJson(patch.value),
+                    })
+                    changed = previous !== next
                 } else {
                     const existing = managedAttachment(
                         nextData,
