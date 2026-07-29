@@ -22,6 +22,7 @@ vi.mock(import('./stores.svelte'), () => ({
 } as any))
 vi.mock(import('./storage/database.svelte'), () => ({
     getDatabase: () => mocks.dbRef.db,
+    getCurrentCharacter: () => null,
 } as any))
 
 import { getPersonaPrompt } from './util'

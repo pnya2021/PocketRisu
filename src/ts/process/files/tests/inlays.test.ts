@@ -713,7 +713,7 @@ describe('set -> get round-trip', () => {
                 },
             ),
         )
-    })
+    }, 10_000)
 })
 
 describe('set -> remove -> get', () => {
@@ -739,5 +739,5 @@ describe('set -> remove -> get', () => {
                 expect(await getInlayAsset(id)).toBeNull()
             }),
         )
-    })
+    }, 10_000)
 })

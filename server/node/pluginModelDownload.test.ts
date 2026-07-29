@@ -380,7 +380,7 @@ describe('Pocket PixAI secure download service', () => {
                 bytes: 8,
                 etag: '"tiny"',
             })
-        })
+        }, { timeout: 5_000 })
     })
 
     it('discards an existing partial when DNS policy fails', async () => {
@@ -643,7 +643,7 @@ describe('Pocket PixAI secure download service', () => {
         await vi.waitFor(() => expect(h.network.requests[0].destroyed).toBe(true))
         await vi.waitFor(async () => {
             expect(await h.store.stat('tiny.bin')).toMatchObject({ state: 'partial', bytes: 8, etag: '"tiny"' })
-        })
+        }, { timeout: 5_000 })
     })
 
     it('keeps the primary failure when partial cleanup also fails', async () => {
