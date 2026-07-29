@@ -159,6 +159,24 @@ describe('Pocket context resource adapter', () => {
         expect(JSON.stringify(state)).not.toContain('apiKey')
     })
 
+    it('keeps the current blank-name character addressable for V3 context reads', async () => {
+        const character = makeCharacter({ name: '' })
+        const deps = dependencies({
+            getDatabase: () => ({ characters: [character], modules: [] }),
+            getCurrentCharacter: () => character,
+            hydrateCurrentChat: async () => character.chats[0],
+            getActiveModulesWithReasons: () => [],
+        })
+
+        const state = await createPocketContextResourceAdapter(deps).getState()
+
+        expect(state.current?.characterId).toBe('char-1')
+        expect(state.characters).toContainEqual(expect.objectContaining({
+            id: 'char-1',
+            name: '',
+        }))
+    })
+
     it('hydrates a lazy current chat before projecting lore, modules, and message membership', async () => {
         const placeholder = {
             ...makeChat(),

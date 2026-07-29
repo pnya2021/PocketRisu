@@ -151,7 +151,7 @@ const mapCharacterAssets = (character: UnknownRecord, id: string): ContextAssetS
 }
 
 const mapCharacter = (character: UnknownRecord): ContextCharacterSource | null => {
-    if (!nonEmptyString(character?.chaId) || !nonEmptyString(character?.name)) return null
+    if (!nonEmptyString(character?.chaId) || typeof character?.name !== 'string') return null
     const type = character.type === 'group' ? 'group' : 'character'
     return {
         id: character.chaId,
