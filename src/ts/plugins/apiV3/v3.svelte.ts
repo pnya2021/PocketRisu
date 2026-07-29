@@ -695,6 +695,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             saveChatToServer,
             runExclusiveMutation: (operation) => databasePersistenceCoordinator.runExclusiveMutation(operation),
             listInlayKeys,
+            getInlayAssetRecord,
         }),
         {
             requirePermission: (executionContext, permission) => pluginPermissionService.require(
@@ -732,7 +733,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 databasePersistenceCoordinator.runFailClosedExclusiveMutation(operation),
             listInlayKeys,
             stageAtomicInlay: (data, request) => inlayLifecycle.stageAtomicInlay(data, request),
-            deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
+            deleteInlay: (id, options) => databasePersistenceCoordinator.runExclusiveMutation(
+                () => inlayLifecycle.deleteInlay(id, options),
+            ),
         }),
         {
             requirePermission: (executionContext, permission) => pluginPermissionService.require(
@@ -898,7 +901,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         saveAsset: oldApis.saveAsset,
         createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
         readOwnedInlay: (id, options) => inlayLifecycle.readOwnedInlay(id, options),
-        deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
+        deleteInlay: (id, options) => databasePersistenceCoordinator.runExclusiveMutation(
+            () => inlayLifecycle.deleteInlay(id, options),
+        ),
         putDeviceCacheEntry: (input) => deviceCache.putDeviceCacheEntry(input),
         getDeviceCacheEntry: (key) => deviceCache.getDeviceCacheEntry(key),
         listDeviceCacheEntries: (options) => deviceCache.listDeviceCacheEntries(options),

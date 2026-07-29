@@ -4,11 +4,13 @@ import type {
     MessagePatchHostAdapter,
     MessagePatchResult,
     PreparedMessagePatch,
+    RestrictedMessagePatch,
 } from './messagePatch'
 import {
     MAX_CALLER_ATTACHMENTS,
     projectCallerAttachments,
     projectLogicalContent,
+    resolveLogicalInsertionOffset,
     type MessageSnapshot,
     type PluginJsonValue,
 } from './messageQuery'
@@ -25,6 +27,7 @@ const MAX_METADATA_BYTES = 65_536
 const MAX_METADATA_KEYS = 16
 const MAX_SNAPSHOT_UTF16 = 262_144
 const MAX_SNAPSHOT_JSON_BYTES = 2_097_152
+const encoder = new TextEncoder()
 
 export interface PocketMessagePatchDependencies {
     getDatabase(): { characters?: UnknownRecord[] }
@@ -33,6 +36,7 @@ export interface PocketMessagePatchDependencies {
     saveChatToServer(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void>
     runExclusiveMutation<T>(operation: () => T | Promise<T>): Promise<T>
     listInlayKeys(): Promise<string[]>
+    getInlayAssetRecord(id: string): Promise<unknown | null>
     createRevision?(value: unknown): Promise<string>
     createId?(): string
     now?(): number
@@ -249,6 +253,116 @@ const plainRecord = (value: unknown): value is UnknownRecord => {
 }
 
 const cloneJson = <T>(value: T): T => JSON.parse(canonicalJson(value)) as T
+
+const ownedInlayFailure = () => new PluginApiError(
+    'PERMISSION_DENIED',
+    'Inlay is not owned by the current plugin',
+)
+
+const deterministicInlayId = async (
+    principalId: string,
+    operation: 'inlay.create.v1' | 'inlay.atomic-attach.v1',
+    idempotencyKey: string,
+) => {
+    const bytes = encoder.encode(JSON.stringify([principalId, operation, idempotencyKey]))
+    const digest = await crypto.subtle.digest('SHA-256', bytes)
+    return `inlay_${[...new Uint8Array(digest)]
+        .map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
+}
+
+const assertOwnedInlay = async (
+    dependencies: PocketMessagePatchDependencies,
+    request: PreparedMessagePatch,
+    capture: LiveCapture,
+    inlayId: string,
+    allowAtomicMessageLifecycle: boolean,
+) => {
+    let record: unknown
+    try {
+        record = await dependencies.getInlayAssetRecord(inlayId)
+    } catch (error) {
+        return rejectAfterCaptureFailure(dependencies, request, capture, error, 'Inlay ownership')
+    }
+    ensureCaptureCurrent(dependencies, request, capture)
+    if (record === null) throw new PluginApiError('NOT_FOUND', 'Owned Inlay was not found')
+    const lifecycle = plainRecord(record) && plainRecord(record.lifecycle)
+        ? record.lifecycle
+        : undefined
+    const context = lifecycle && plainRecord(lifecycle.context) ? lifecycle.context : undefined
+    const validCreateContext = lifecycle?.operation === 'inlay.create.v1'
+        && context?.kind === 'character'
+        && context.characterId === request.input.target.characterId
+    const validAtomicContext = allowAtomicMessageLifecycle
+        && lifecycle?.operation === 'inlay.atomic-attach.v1'
+        && context?.kind === 'message'
+        && context.characterId === request.input.target.characterId
+        && context.conversationId === request.input.target.conversationId
+        && context.messageId === request.input.target.messageId
+        && nonEmptyString(lifecycle.inputRevision)
+    if (!lifecycle
+        || lifecycle.version !== 1
+        || lifecycle.ownerPrincipalId !== request.principalId
+        || !nonEmptyString(lifecycle.idempotencyKey)
+        || encoder.encode(lifecycle.idempotencyKey).byteLength > 256
+        || typeof lifecycle.argumentDigest !== 'string'
+        || !/^[0-9a-f]{64}$/u.test(lifecycle.argumentDigest)
+        || typeof lifecycle.revision !== 'string'
+        || !/^sha256:[0-9a-f]{64}$/u.test(lifecycle.revision)
+        || (!validCreateContext && !validAtomicContext)) throw ownedInlayFailure()
+    let expectedId: string
+    try {
+        expectedId = await deterministicInlayId(
+            request.principalId,
+            lifecycle.operation,
+            lifecycle.idempotencyKey,
+        )
+    } catch (error) {
+        return rejectAfterCaptureFailure(dependencies, request, capture, error, 'Inlay ownership')
+    }
+    ensureCaptureCurrent(dependencies, request, capture)
+    if (expectedId !== inlayId) throw ownedInlayFailure()
+    let confirmed: unknown
+    try {
+        confirmed = await dependencies.getInlayAssetRecord(inlayId)
+    } catch (error) {
+        return rejectAfterCaptureFailure(dependencies, request, capture, error, 'Inlay ownership')
+    }
+    ensureCaptureCurrent(dependencies, request, capture)
+    const confirmedLifecycle = plainRecord(confirmed) && plainRecord(confirmed.lifecycle)
+        ? confirmed.lifecycle
+        : undefined
+    if (!confirmedLifecycle || canonicalJson(confirmedLifecycle) !== canonicalJson(lifecycle)) {
+        conflict('Owned Inlay changed before message staging')
+    }
+}
+
+const storedAttachmentIndexes = (attachments: unknown[], inlayId: string) => attachments
+    .flatMap((attachment, index) => plainRecord(attachment) && attachment.inlayId === inlayId
+        ? [{ attachment, index }] : [])
+
+const managedAttachment = (
+    data: string,
+    recognized: ReadonlySet<string>,
+    attachments: unknown[],
+    inlayId: string,
+) => {
+    const matches = storedAttachmentIndexes(attachments, inlayId)
+    if (matches.length === 0) {
+        throw new PluginApiError('NOT_FOUND', 'Caller-owned Inlay attachment was not found')
+    }
+    if (matches.length !== 1 || matches[0].attachment.presentation !== 'inline') {
+        conflict('Caller-owned Inlay attachment is ambiguous')
+    }
+    const marker = projectLogicalContent(data, recognized).markers.find((candidate) => candidate.id === inlayId)
+    if (!marker) conflict('Caller-owned Inlay marker is missing')
+    return { ...matches[0], marker }
+}
+
+const attachedDescriptor = (patch: Extract<RestrictedMessagePatch, { op: 'attachInlay' }>) => ({
+    inlayId: patch.inlayId,
+    presentation: 'inline' as const,
+    ...(patch.metadata === undefined ? {} : { metadata: cloneJson(patch.metadata) }),
+})
 
 const validReceipt = (value: unknown): value is PersistedReceipt => {
     if (!plainRecord(value)) return false
@@ -471,20 +585,100 @@ export function createPocketMessagePatchAdapter(
                     throw new PluginApiError('INTERNAL', 'Unable to enumerate Inlays', { retryable: true })
                 }
 
+                const patch = request.input.patch
+                const mutationInlayIds = patch.op === 'detachOwnInlay'
+                    ? [patch.inlayId]
+                    : patch.op === 'attachInlay'
+                        ? [
+                            patch.inlayId,
+                            ...(patch.placement.kind === 'replace-own-inlay'
+                                ? [patch.placement.inlayId] : []),
+                        ]
+                        : []
+                const ownershipChecks = patch.op === 'detachOwnInlay'
+                    ? [{ id: patch.inlayId, allowAtomicMessageLifecycle: true }]
+                    : patch.op === 'attachInlay'
+                        ? [
+                            { id: patch.inlayId, allowAtomicMessageLifecycle: false },
+                            ...(patch.placement.kind === 'replace-own-inlay'
+                                ? [{
+                                    id: patch.placement.inlayId,
+                                    allowAtomicMessageLifecycle: true,
+                                }] : []),
+                        ]
+                        : []
+                if (patch.op === 'attachInlay'
+                    && patch.placement.kind === 'replace-own-inlay'
+                    && patch.inlayId === patch.placement.inlayId) {
+                    conflict('Replacement Inlay must be different')
+                }
+                const recognized = new Set([...keys, ...mutationInlayIds])
+
                 const staged = safeStructuredClone(capture.conversation)
                 const stagedMessage = staged.message[capture.messageIndex]
                 const state = callerState(stagedMessage, request.principalId)
-                const previous = Object.hasOwn(state.metadata, request.input.patch.key)
-                    ? canonicalJson(state.metadata[request.input.patch.key])
-                    : undefined
-                Object.defineProperty(state.metadata, request.input.patch.key, {
-                    value: cloneJson(request.input.patch.value), enumerable: true, configurable: true, writable: true,
-                })
+                const metadata = state.metadata
+                const attachments = state.attachments
+                let nextData = stagedMessage.data
+                let changed = false
+                if (patch.op === 'setPluginMetadata') {
+                    const previous = Object.hasOwn(metadata, patch.key)
+                        ? canonicalJson(metadata[patch.key])
+                        : undefined
+                    Object.defineProperty(metadata, patch.key, {
+                        value: cloneJson(patch.value), enumerable: true, configurable: true, writable: true,
+                    })
+                    changed = previous !== canonicalJson(patch.value)
+                } else if (patch.op === 'attachInlay') {
+                    const projection = projectLogicalContent(nextData, recognized)
+                    if (storedAttachmentIndexes(attachments, patch.inlayId).length > 0
+                        || projection.markers.some((marker) => marker.id === patch.inlayId)) {
+                        conflict('Inlay is already attached to this message')
+                    }
+                    const descriptor = attachedDescriptor(patch)
+                    if (patch.placement.kind === 'replace-own-inlay') {
+                        const existing = managedAttachment(
+                            nextData,
+                            recognized,
+                            attachments,
+                            patch.placement.inlayId,
+                        )
+                        attachments.splice(existing.index, 1, descriptor)
+                        nextData = nextData.slice(0, existing.marker.rawStart)
+                            + `{{inlay::${patch.inlayId}}}`
+                            + nextData.slice(existing.marker.rawEnd)
+                    } else {
+                        const insertionOffset = resolveLogicalInsertionOffset(
+                            nextData,
+                            recognized,
+                            patch.placement,
+                        )
+                        if (insertionOffset === null) {
+                            throw new PluginApiError('INVALID_ARGUMENT', 'Invalid logical UTF-16 placement')
+                        }
+                        attachments.push(descriptor)
+                        nextData = nextData.slice(0, insertionOffset)
+                            + `{{inlay::${patch.inlayId}}}`
+                            + nextData.slice(insertionOffset)
+                    }
+                    changed = true
+                } else {
+                    const existing = managedAttachment(
+                        nextData,
+                        recognized,
+                        attachments,
+                        patch.inlayId,
+                    )
+                    attachments.splice(existing.index, 1)
+                    nextData = nextData.slice(0, existing.marker.rawStart)
+                        + nextData.slice(existing.marker.rawEnd)
+                    changed = true
+                }
                 validateCallerMetadata(state)
-                const changed = previous !== canonicalJson(request.input.patch.value)
                 const completedAt = now()
                 if (changed) {
                     state.updatedAt = completedAt
+                    stagedMessage.data = nextData
                     stagedMessage.pluginMessageState = {
                         ...(stagedMessage.pluginMessageState ?? {}),
                         [request.principalId]: state,
@@ -493,10 +687,20 @@ export function createPocketMessagePatchAdapter(
                 }
                 let message: MessageSnapshot
                 try {
-                    message = await snapshot(capture, stagedMessage, request, new Set(keys), revision)
+                    message = await snapshot(capture, stagedMessage, request, recognized, revision)
                 } catch (error) {
                     return rejectAfterCaptureFailure(
                         dependencies, request, capture, error, 'Message snapshot',
+                    )
+                }
+                ensureCaptureCurrent(dependencies, request, capture)
+                for (const check of ownershipChecks) {
+                    await assertOwnedInlay(
+                        dependencies,
+                        request,
+                        capture,
+                        check.id,
+                        check.allowAtomicMessageLifecycle,
                     )
                 }
                 ensureCaptureCurrent(dependencies, request, capture)

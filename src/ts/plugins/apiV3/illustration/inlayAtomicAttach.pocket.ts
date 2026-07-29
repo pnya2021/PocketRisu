@@ -423,9 +423,9 @@ export function createPocketInlayAtomicAttachAdapter(
         },
 
         async attachCurrentMessage(request) {
+            let staged: InlayDescriptor | undefined
+            let persistenceRequested = false
             const outcome = await dependencies.runFailClosedExclusiveMutation<LeaseOutcome>(async () => {
-                let staged: InlayDescriptor | undefined
-                let persistenceRequested = false
                 try {
                     ensureRequestActive(request)
                     ensureCurrentTarget(dependencies, request)
@@ -597,17 +597,19 @@ export function createPocketInlayAtomicAttachAdapter(
                     return { ok: true, result: cloneJson(result) }
                 } catch (error) {
                     if (persistenceRequested) throw error
-                    if (staged) {
-                        try {
-                            await dependencies.deleteInlay(staged.id, { expectedRevision: staged.revision })
-                        } catch {
-                            // Preserve the primary known failure; deterministic staging remains retryable.
-                        }
-                    }
                     return { ok: false, error }
                 }
             })
-            if (outcome.ok === false) throw outcome.error
+            if (outcome.ok === false) {
+                if (staged && !persistenceRequested) {
+                    try {
+                        await dependencies.deleteInlay(staged.id, { expectedRevision: staged.revision })
+                    } catch {
+                        // Preserve the primary known failure; deterministic staging remains retryable.
+                    }
+                }
+                throw outcome.error
+            }
             return outcome.result
         },
     }
