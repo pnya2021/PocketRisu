@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'v*'
+      - 'pnya-v*'
 
 env:
   REGISTRY: ghcr.io
@@ -104,14 +104,14 @@ jobs:
         id: version
         shell: bash
         run: |
-          if [[ "${{ github.ref }}" =~ ^refs/tags/v(.+)$ ]]; then
+          if [[ "${{ github.ref }}" =~ ^refs/tags/pnya-v(.+)$ ]]; then
             VERSION="${BASH_REMATCH[1]}"
             MINOR="${VERSION%.*}"
             echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "minor=$MINOR" >> $GITHUB_OUTPUT
             echo "is_tag=true" >> $GITHUB_OUTPUT
           else
-            echo "version=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+            echo "version=pnya-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
             echo "is_tag=false" >> $GITHUB_OUTPUT
           fi
 
@@ -122,9 +122,9 @@ jobs:
           IMAGE="${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}"
           TAGS=""
           if [[ "${{ steps.version.outputs.is_tag }}" == "true" ]]; then
-            TAGS="-t ${IMAGE}:latest"
-            TAGS="$TAGS -t ${IMAGE}:v${{ steps.version.outputs.version }}"
-            TAGS="$TAGS -t ${IMAGE}:v${{ steps.version.outputs.minor }}"
+            TAGS="-t ${IMAGE}:pnya-latest"
+            TAGS="$TAGS -t ${IMAGE}:pnya-v${{ steps.version.outputs.version }}"
+            TAGS="$TAGS -t ${IMAGE}:pnya-v${{ steps.version.outputs.minor }}"
           else
             TAGS="-t ${IMAGE}:${{ steps.version.outputs.version }}"
           fi
@@ -133,7 +133,7 @@ jobs:
 
   cleanup-old-images:
     needs: merge
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/pnya-v')
     runs-on: ubuntu-latest
     permissions:
       packages: write
