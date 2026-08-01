@@ -1,5 +1,5 @@
 <script lang="ts">
-    import type { character, groupChat, Message } from 'src/ts/storage/database.svelte';
+    import type { character, groupChat, Message, StreamingDisplayOptimizationMode } from 'src/ts/storage/database.svelte';
     import { mount, onDestroy, unmount } from 'svelte';
     import Chat from './Chat.svelte';
     import { getCharImage } from 'src/ts/characters';
@@ -45,7 +45,14 @@
 
     let chatBody: HTMLDivElement;
     let hashes: Set<number> = new Set();
-    let mountInstances: Map<number, {}> = new Map();
+    type ChatInstance = {
+        updateStreamingDisplay?: (state: {
+            isOptimizedStreamingMessage: boolean
+            streamingOptimizationMode: StreamingDisplayOptimizationMode
+            rawStreamingText: string
+        }) => void
+    }
+    let mountInstances: Map<number, ChatInstance> = new Map();
 
     //Non-cryptographic hash function to generate a unique hash for each message
     function hashCode(str:string):number {
@@ -71,6 +78,14 @@
         const userImage = getCharImage(userIcon, 'css')
         let loadStart = messages.length - 1
         let loadEnd = messages.length - loadPages
+        const currentChat = currentCharacter.chats?.[currentCharacter.chatPage]
+        const configuredPerformanceMode = DBState.db.streamingDisplayOptimizationMode ?? 'off';
+        const performanceMode = currentChat?.isStreaming
+            ? currentChat.activeStreamingDisplayOptimizationMode ?? configuredPerformanceMode
+            : configuredPerformanceMode
+        const activeStreamingIndex = performanceMode !== 'off' && currentChat?.isStreaming
+            ? messages.length - 1
+            : -1
 
         // Find the last real (non-comment, non-disabled) char message index
         // Only show reroll if it's the actual last non-disabled message
@@ -123,7 +138,9 @@
                     : `group:${currentCharacter.chaId}`
             const reloadPointer = reloadPointerMap[i] ?? 0;
             const isRerollTarget = i === lastRealCharIdx;
-            let hashd = message.data + (message.chatId ?? '') + (message.saying ?? '') + renderIdentity + renderName + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString() + (message.swipeId ?? 0).toString() + (message.swipes?.length ?? 0).toString() + isRerollTarget.toString();
+            const activeStreamingMessage = i === activeStreamingIndex && message.role === 'char';
+            const hashMessageData = activeStreamingMessage ? '' : message.data;
+            let hashd = hashMessageData + (message.chatId ?? '') + (message.saying ?? '') + renderIdentity + renderName + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString() + (message.swipeId ?? 0).toString() + (message.swipes?.length ?? 0).toString() + isRerollTarget.toString();
             const currentHash = hashCode(hashd);
             currentHashes.add(currentHash);
             if(!hashes.has(currentHash)){
@@ -154,6 +171,9 @@
                         name: renderName,
                         isComment: message.isComment ?? false,
                         disabled: message.disabled ?? false,
+                        isOptimizedStreamingMessage: activeStreamingMessage,
+                        streamingOptimizationMode: performanceMode,
+                        rawStreamingText: message.data,
                         ...(i === lastRealCharIdx ? {
                             currentPage: (swipeId ?? 0) + 1,
                             totalPages: swipes?.length ?? 1,
@@ -169,6 +189,13 @@
                 else{
                     chatBody.prepend(b);
                 }
+            }
+            else{
+                mountInstances.get(currentHash)?.updateStreamingDisplay?.({
+                    isOptimizedStreamingMessage: activeStreamingMessage,
+                    streamingOptimizationMode: performanceMode,
+                    rawStreamingText: message.data,
+                })
             }
             nextHash = currentHash;
 

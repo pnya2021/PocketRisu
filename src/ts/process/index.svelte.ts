@@ -1,5 +1,5 @@
-import { get, writable } from "svelte/store";
-import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat } from "../storage/database.svelte";
+import { get } from "svelte/store";
+import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -36,6 +36,8 @@ import {
     correctRerollMessageIdentity,
     pocketMessageRevisionKey,
 } from "../plugins/apiV3/illustration/messageEvents.pocket";
+import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
+import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -61,9 +63,7 @@ export interface requestTokenPart{
     tokens:number
 }
 
-export const doingChat = writable(false)
-export const chatProcessStage = writable(0)
-export const abortChat = writable(false)
+export { doingChat, chatProcessStage } from "./generationState"
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
@@ -83,13 +83,13 @@ export interface SendChatArgs {
 }
 
 export async function sendChat(chatProcessIndex = -1, arg:SendChatArgs = {}):Promise<boolean> {
-    if (get(doingChat)) return false
     const selected = get(selectedCharID)
     const room = DBState.db.characters[selected]
     if (!room) return false
     const currentChat = room.chats[room.chatPage]
     if (!currentChat || currentChat._placeholder) return false
     currentChat.id = currentChat.id ?? v4()
+    if (isChatGenerating(chatGenKey(currentChat.id))) return false
     for (const message of currentChat.message) message.chatId = message.chatId ?? v4()
     const before = capturePocketMessageBaseline(currentChat.message)
     if (arg.rerollIdentity?.chatId) {
@@ -317,9 +317,14 @@ export async function generateResolvedSpeaker(
         }
     }
 
-    let isDoing = get(doingChat)
+    // Concurrency guard, per chat: block a new send only when THIS chat is
+    // already generating. Keyed by the real chat id (chat.id); legacy chats
+    // without an id share one fallback key. See generationState.ts.
+    const guardChar = DBState.db.characters[get(selectedCharID)]
+    const realChatId = guardChar?.chats?.[guardChar.chatPage]?.id
+    const genKey = chatGenKey(realChatId)
 
-    if(isDoing){
+    if(isChatGenerating(genKey)){
         if(chatProcessIndex === -1){
             return false
         }
@@ -329,7 +334,16 @@ export async function generateResolvedSpeaker(
     if(!nowChatroom || nowChatroom !== expectedRoom){
         return false
     }
-    doingChat.set(true)
+    const generationId = v4()
+    startGeneration(genKey, generationId)
+    // Resumable-send tombstone (pendingSends.ts): registered BEFORE the
+    // pipeline so a tab death anywhere in it (translate → memory → request)
+    // leaves the marker; cleared on every conclude path. Previews never
+    // register (they end without a message, which would read as resumable).
+    // No-op unless the server-side requests toggle is on.
+    if (realChatId && !arg.preview && !arg.previewPrompt) {
+        registerPendingSend(realChatId, generationId)
+    }
 
     if(chatProcessIndex === -1 && DBState.db.presetChain){
         const names = DBState.db.presetChain.split(',').map((v) => v.trim())
@@ -354,7 +368,8 @@ export async function generateResolvedSpeaker(
     // Block send if chat is still a placeholder (hydration not complete)
     if (nowChatroom.chats[nowChatroom.chatPage]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
-        doingChat.set(false)
+        endGeneration(genKey)
+        if (realChatId) clearPendingSend(realChatId)
         return false
     }
     nowChatroom.chats[nowChatroom.chatPage].message = nowChatroom.chats[nowChatroom.chatPage].message.map((v) => {
@@ -428,7 +443,7 @@ export async function generateResolvedSpeaker(
         }
     }
 
-    chatProcessStage.set(1)
+    setGenerationStage(genKey, 1)
     stageTimings.stage1Start = Date.now()
     let unformated = {
         'main':([] as OpenAIChat[]),
@@ -523,6 +538,10 @@ export async function generateResolvedSpeaker(
         unformated.globalNote.push(...formatPrompt(risuChatParser(currentChar.replaceGlobalNote?.replaceAll('{{original}}', DBState.db.globalNote) || DBState.db.globalNote, {chara:currentChar})))
     }
 
+    let baseDescriptionPrompt:OpenAIChat|null = null
+    let beforeDescriptionPrompts:OpenAIChat[] = []
+    let afterDescriptionPrompts:OpenAIChat[] = []
+
     if(currentChat.note){
         unformated.authorNote.push({
             role: 'system',
@@ -560,10 +579,11 @@ export async function generateResolvedSpeaker(
             description += risuChatParser("\n\nCircumstances and context of the dialogue: " + currentChar.scenario, {chara: currentChar})
         }
 
-        unformated.description.push({
+        baseDescriptionPrompt = {
             role: 'system',
             content: description
-        })
+        }
+        unformated.description.push(baseDescriptionPrompt)
 
     }
 
@@ -624,9 +644,11 @@ export async function generateResolvedSpeaker(
             content: risuChatParser(resolvePosition(lorebook.prompt), {chara: currentChar})
         }
         if(lorebook.pos === 'before_desc'){
+            beforeDescriptionPrompts.unshift(c)
             unformated.description.unshift(c)
         }
         else{
+            afterDescriptionPrompts.push(c)
             unformated.description.push(c)
         }
     }
@@ -727,6 +749,34 @@ export async function generateResolvedSpeaker(
     }
 
     let hasCachePoint = false
+    const convertPromptRole = {
+        "system": "system",
+        "user": "user",
+        "bot": "assistant",
+    } as const
+
+    function applyPromptBlockRole(chats:OpenAIChat[], role?: 'user'|'bot'|'system'){
+        console.log("Applying ", chats, role)
+        if(!role){
+            return
+        }
+        for(const chat of chats){
+            chat.role = convertPromptRole[role]
+        }
+    }
+
+    function getDescriptionPrompts(role?: 'user'|'bot'|'system'){
+        const pmt = [
+            ...safeStructuredClone(beforeDescriptionPrompts),
+            ...(baseDescriptionPrompt ? [safeStructuredClone(baseDescriptionPrompt)] : []),
+            ...safeStructuredClone(afterDescriptionPrompts)
+        ]
+        if(baseDescriptionPrompt){
+            applyPromptBlockRole([pmt[beforeDescriptionPrompts.length]], role)
+        }
+        return pmt
+    }
+
     if(promptTemplate){
         const template = promptTemplate
 
@@ -741,6 +791,7 @@ export async function generateResolvedSpeaker(
             switch(card.type){
                 case 'persona':{
                     let pmt = safeStructuredClone(unformated.personaPrompt)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -751,7 +802,7 @@ export async function generateResolvedSpeaker(
                     break
                 }
                 case 'description':{
-                    let pmt = safeStructuredClone(unformated.description)
+                    let pmt = getDescriptionPrompts(card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -763,6 +814,7 @@ export async function generateResolvedSpeaker(
                 }
                 case 'authornote':{
                     let pmt = safeStructuredClone(unformated.authorNote)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content || card.defaultText || '')
@@ -796,12 +848,6 @@ export async function generateResolvedSpeaker(
                         continue
                     }
 
-                    const convertRole = {
-                        "system": "system",
-                        "user": "user",
-                        "bot": "assistant"
-                    } as const
-
                     const posType = card.type === 'plain' ? card.type2 : card.type
                     let content = positionParser(card.text, posType)
 
@@ -823,7 +869,7 @@ export async function generateResolvedSpeaker(
                     }
 
                     const prompt:OpenAIChat ={
-                        role: convertRole[card.role],
+                        role: convertPromptRole[card.role],
                         content: content
                     }
 
@@ -950,7 +996,8 @@ export async function generateResolvedSpeaker(
         ms = makeMs(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            doingChat.set(false)
+            endGeneration(genKey)
+            if (realChatId) clearPendingSend(realChatId)
             return false
         }
     }
@@ -1128,7 +1175,7 @@ export async function generateResolvedSpeaker(
     
     if((currentChat.supaMemory ?? nowChatroom.supaMemory) && DBState.db.hypaV3){
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
-        chatProcessStage.set(2)
+        setGenerationStage(genKey, 2)
         stageTimings.stage2Start = Date.now()
         console.log("Current chat's hypaV3 Data: ", currentChat.hypaV3Data)
         const sp = await hypaMemoryV3(chats, currentTokens, maxContextTokens, currentChat, currentChar, tokenizer)
@@ -1140,6 +1187,7 @@ export async function generateResolvedSpeaker(
             }
             console.log(sp)
             throwError(sp.error)
+            if (realChatId) clearPendingSend(realChatId)
             return false
         }
         chats = sp.chats
@@ -1150,7 +1198,7 @@ export async function generateResolvedSpeaker(
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat];
         console.log("[Expected to be updated] chat's HypaV3Data: ", currentChat.hypaV3Data)
         stageTimings.stage2Duration = Date.now() - stageTimings.stage2Start
-        chatProcessStage.set(1)
+        setGenerationStage(genKey, 1)
     }
     else{
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
@@ -1158,6 +1206,7 @@ export async function generateResolvedSpeaker(
             if(chats.length <= 1){
                 throwError(language.errors.toomuchtoken + "\n\nRequired Tokens: " + currentTokens)
 
+                if (realChatId) clearPendingSend(realChatId)
                 return false
             }
 
@@ -1288,6 +1337,7 @@ export async function generateResolvedSpeaker(
             switch(card.type){
                 case 'persona':{
                     let pmt = safeStructuredClone(unformated.personaPrompt)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -1302,7 +1352,7 @@ export async function generateResolvedSpeaker(
                     break
                 }
                 case 'description':{
-                    let pmt = safeStructuredClone(unformated.description)
+                    let pmt = getDescriptionPrompts(card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -1318,6 +1368,7 @@ export async function generateResolvedSpeaker(
                 }
                 case 'authornote':{
                     let pmt = safeStructuredClone(unformated.authorNote)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content || card.defaultText || '')
@@ -1355,12 +1406,6 @@ export async function generateResolvedSpeaker(
                         continue
                     }
 
-                    const convertRole = {
-                        "system": "system",
-                        "user": "user",
-                        "bot": "assistant"
-                    } as const
-
                     const posType = card.type === 'plain' ? card.type2 : card.type
                     let content = positionParser(card.text, posType)
 
@@ -1381,7 +1426,7 @@ export async function generateResolvedSpeaker(
                     }
 
                     const prompt:OpenAIChat ={
-                        role: convertRole[card.role],
+                        role: convertPromptRole[card.role],
                         content: content
                     }
 
@@ -1445,6 +1490,7 @@ export async function generateResolvedSpeaker(
                 }
                 case 'memory':{
                     let pmt = safeStructuredClone(memories)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(card.innerFormat, {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -1525,6 +1571,7 @@ export async function generateResolvedSpeaker(
         while(inputTokens > maxContextTokens){
             if(pointer >= formated.length){
                 throwError(language.errors.toomuchtoken + "\n\nAt token rechecking. Required Tokens: " + inputTokens)
+                if (realChatId) clearPendingSend(realChatId)
                 return false
             }
             if(formated[pointer].removable){
@@ -1543,7 +1590,8 @@ export async function generateResolvedSpeaker(
     if(inputTokens + outputTokens > maxContextTokens){
         outputTokens = maxContextTokens - inputTokens
     }
-    const generationId = v4()
+    // generationId minted at the top of sendChat (registered in the
+    // generation-state map alongside the real chat id).
     const generationModel = getGenerationModelString()
 
     generationInfo = {
@@ -1560,7 +1608,17 @@ export async function generateResolvedSpeaker(
         }
     }
 
-    chatProcessStage.set(3)
+    // Continue writes into the previous reply: stamp it with THIS
+    // generation's id up front so recovery attributes a mid-continue death to
+    // the continued message (fill/skip) instead of inserting a duplicate.
+    if(arg.continue && !arg.preview && !arg.previewPrompt){
+        const contMsgs = DBState.db.characters[selectedChar].chats[selectedChat].message
+        if(contMsgs.length > 0){
+            contMsgs[contMsgs.length - 1].generationInfo = generationInfo
+        }
+    }
+
+    setGenerationStage(genKey, 3)
     stageTimings.stage3Start = Date.now()
     if(arg.preview){
         previewFormated = formated
@@ -1576,6 +1634,7 @@ export async function generateResolvedSpeaker(
         bias: {},
         continue: arg.continue,
         chatId: generationId,
+        realChatId: realChatId,
         imageResponse: DBState.db.outputImageModal,
         previewBody: arg.previewPrompt,
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
@@ -1598,10 +1657,12 @@ export async function generateResolvedSpeaker(
     let resendChat = false
     
     if(abortSignal.aborted === true){
+        if (realChatId) clearPendingSend(realChatId)
         return false
     }
     if(req.type === 'fail'){
         throwError(req.result)
+        if (realChatId) clearPendingSend(realChatId)
         return false
     }
     else if(req.type === 'streaming'){
@@ -1628,10 +1689,76 @@ export async function generateResolvedSpeaker(
                     : generatedMessage,
             )
         }
+        const performanceMode: StreamingDisplayOptimizationMode = DBState.db.streamingDisplayOptimizationMode ?? 'balanced'
         DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = true
+        DBState.db.characters[selectedChar].chats[selectedChat].activeStreamingDisplayOptimizationMode = performanceMode
         DBState.db.characters[selectedChar].reloadKeys += 1
         let lastResponseChunk:{[key:string]:string} = {}
         let streamAborted:boolean = abortSignal.aborted
+        let receivedStreamingResult = false
+        const deferStreamingPostProcessing = performanceMode === 'strong'
+        const coalesceStreamingDisplay = performanceMode === 'balanced' || performanceMode === 'strong'
+        const streamingDisplayFlushDelay = 125
+        let pendingStreamingResult: string | null = null
+        let streamingFlushTimer: ReturnType<typeof setTimeout> | null = null
+        let streamingFlushFrame: number | null = null
+        let streamingFlushPromise: Promise<void> | null = null
+        let streamingFlushQueued = false
+        let streamingFlushError: unknown = null
+        const clearStreamingFlushSchedule = () => {
+            if(streamingFlushTimer !== null){
+                clearTimeout(streamingFlushTimer)
+                streamingFlushTimer = null
+            }
+            if(streamingFlushFrame !== null){
+                cancelAnimationFrame(streamingFlushFrame)
+                streamingFlushFrame = null
+            }
+        }
+        const flushStreamingDisplay = async () => {
+            clearStreamingFlushSchedule()
+            if(streamingFlushPromise){
+                streamingFlushQueued = true
+                return streamingFlushPromise
+            }
+            streamingFlushPromise = (async () => {
+                do {
+                    streamingFlushQueued = false
+                    const nextResult = pendingStreamingResult
+                    pendingStreamingResult = null
+                    if(nextResult === null){
+                        continue
+                    }
+                    if(deferStreamingPostProcessing){
+                        DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = reformatContent(prefix + nextResult)
+                        DBState.db.characters[selectedChar].reloadKeys += 1
+                        continue
+                    }
+                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + nextResult), 'editoutput', msgIndex)
+                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                    emoChanged = result2.emoChanged
+                    DBState.db.characters[selectedChar].reloadKeys += 1
+                } while(streamingFlushQueued || pendingStreamingResult !== null)
+            })().finally(() => {
+                streamingFlushPromise = null
+            })
+            return streamingFlushPromise
+        }
+        const scheduleStreamingDisplayFlush = () => {
+            if(streamingFlushTimer !== null || streamingFlushFrame !== null){
+                return
+            }
+            streamingFlushTimer = setTimeout(() => {
+                streamingFlushTimer = null
+                streamingFlushFrame = requestAnimationFrame(() => {
+                    streamingFlushFrame = null
+                    void flushStreamingDisplay().catch((error) => {
+                        streamingFlushError ??= error
+                        void reader.cancel().catch(() => {})
+                    })
+                })
+            }, streamingDisplayFlushDelay)
+        }
         const abortReader = () => {
             streamAborted = true
             void reader.cancel().catch(() => {})
@@ -1651,6 +1778,7 @@ export async function generateResolvedSpeaker(
                     throw error
                 }
                 if(readed.value){
+                    receivedStreamingResult = true
                     lastResponseChunk = readed.value
                     const firstChunkKey = Object.keys(lastResponseChunk)[0]
                     result = lastResponseChunk[firstChunkKey]
@@ -1660,10 +1788,16 @@ export async function generateResolvedSpeaker(
                     if(DBState.db.removeIncompleteResponse){
                         result = trimUntilPunctuation(result)
                     }
-                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
-                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
-                    emoChanged = result2.emoChanged
-                    DBState.db.characters[selectedChar].reloadKeys += 1
+                    if(coalesceStreamingDisplay){
+                        pendingStreamingResult = result
+                        scheduleStreamingDisplayFlush()
+                    }
+                    else{
+                        let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                        DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                        emoChanged = result2.emoChanged
+                        DBState.db.characters[selectedChar].reloadKeys += 1
+                    }
                 }
                 if(readed.done){
                     break
@@ -1672,12 +1806,34 @@ export async function generateResolvedSpeaker(
         }
         finally {
             abortSignal.removeEventListener('abort', abortReader)
-            DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = false
-            DBState.db.characters[selectedChar].reloadKeys += 1
-            void reader.cancel().catch(() => {})
+            try {
+                if(coalesceStreamingDisplay){
+                    try {
+                        await flushStreamingDisplay()
+                    }
+                    catch(error){
+                        streamingFlushError ??= error
+                    }
+                }
+                if(streamingFlushError !== null){
+                    throw streamingFlushError
+                }
+                if(deferStreamingPostProcessing && receivedStreamingResult){
+                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                    emoChanged = result2.emoChanged
+                }
+            }
+            finally {
+                DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = false
+                DBState.db.characters[selectedChar].chats[selectedChat].activeStreamingDisplayOptimizationMode = undefined
+                DBState.db.characters[selectedChar].reloadKeys += 1
+                void reader.cancel().catch(() => {})
+            }
         }
 
         if(streamAborted || abortSignal.aborted){
+            if (realChatId) clearPendingSend(realChatId)
             return false
         }
 
@@ -1745,7 +1901,9 @@ export async function generateResolvedSpeaker(
                     time: Date.now(),
                     generationInfo,
                     promptInfo,
-                    chatId: generationId,
+                    // Keep the original message identity for durable job recovery
+                    // and the V3 message API's stable caller-owned state.
+                    chatId: DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId ?? generationId,
                 }
                 DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex] = continueIdentity
                     ? correctContinueMessageIdentity(continueIdentity, replacement) as Message
@@ -1824,7 +1982,7 @@ export async function generateResolvedSpeaker(
     }
 
     if(needsAutoContinue){
-        doingChat.set(false)
+        endGeneration(genKey, { keepPendingAbort: true })
         return await generateResolvedSpeaker(nowChatroom, currentChar, chatProcessIndex, {
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
@@ -1855,7 +2013,7 @@ export async function generateResolvedSpeaker(
     if(generationInfo.stageTiming) {
         generationInfo.stageTiming.stage3 = stageTimings.stage3Duration
     }
-    chatProcessStage.set(4)
+    setGenerationStage(genKey, 4)
     stageTimings.stage4Start = Date.now()
 
     if(resendChat){
@@ -1872,7 +2030,7 @@ export async function generateResolvedSpeaker(
             ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
         setFinalGenerationInfo(lastMessageIndex)
         
-        doingChat.set(false)
+        endGeneration(genKey, { keepPendingAbort: true })
         return await generateResolvedSpeaker(nowChatroom, currentChar, chatProcessIndex, {
             signal: abortSignal,
             messageEventTriggerIds: arg.messageEventTriggerIds,
@@ -1980,6 +2138,7 @@ export async function generateResolvedSpeaker(
 
                 
 
+                if (realChatId) clearPendingSend(realChatId)
                 return true
             }
 
@@ -2041,6 +2200,7 @@ export async function generateResolvedSpeaker(
             }, 'emotion', abortSignal)
 
             if(rq.type === 'fail'){
+                if (realChatId) clearPendingSend(realChatId)
                 if(abortSignal.aborted){
                     return true
                 }
@@ -2048,6 +2208,7 @@ export async function generateResolvedSpeaker(
                 return true
             }
             if(rq.type === 'streaming' || rq.type === 'multiline'){
+                if (realChatId) clearPendingSend(realChatId)
                 if(abortSignal.aborted){
                     return true
                 }
@@ -2093,10 +2254,12 @@ export async function generateResolvedSpeaker(
                     }
                 } catch (error) {
                     throwError(language.errors.httpError + `${error}`)
+                    if (realChatId) clearPendingSend(realChatId)
                     return true
                 }
             }
             
+            if (realChatId) clearPendingSend(realChatId)
             return true
 
 
@@ -2132,6 +2295,7 @@ export async function generateResolvedSpeaker(
         ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
     setFinalGenerationInfo(lastMessageIndex)
 
+    if (realChatId) clearPendingSend(realChatId)
     return true
 }
 

@@ -79,7 +79,6 @@ export function collectRpcTransferables(value: unknown): Transferable[] {
     if (
       transferableInstance(candidate, 'MessagePort')
       || transferableInstance(candidate, 'ImageBitmap')
-      || transferableInstance(candidate, 'ReadableStream')
       || transferableInstance(candidate, 'WritableStream')
       || transferableInstance(candidate, 'TransformStream')
       || transferableInstance(candidate, 'OffscreenCanvas')
@@ -183,7 +182,7 @@ export const GUEST_RPC_CODEC_SCRIPT = String.raw`
                 if (candidate.buffer instanceof ArrayBuffer) transferables.add(candidate.buffer);
                 return;
             }
-            if (['MessagePort', 'ImageBitmap', 'ReadableStream', 'WritableStream', 'TransformStream', 'OffscreenCanvas']
+            if (['MessagePort', 'ImageBitmap', 'WritableStream', 'TransformStream', 'OffscreenCanvas']
                 .some((name) => isInstance(candidate, name))) {
                 transferables.add(candidate);
                 return;

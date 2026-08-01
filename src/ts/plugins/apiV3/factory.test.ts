@@ -9,6 +9,7 @@ vi.stubGlobal('ImageBitmap', class ImageBitmap {})
 type PostedMessage = {
   message: any
   transferCount: number
+  transferables: Transferable[]
 }
 
 const cleanups: Array<() => void> = []
@@ -57,6 +58,7 @@ function createHarness(
         ? structuredClone(message, { transfer })
         : message,
       transferCount: transfer.length,
+      transferables: [...transfer],
     })
   }) as typeof contentWindow.postMessage)
 
@@ -374,7 +376,7 @@ describe('SandboxHost binary RPC safety', () => {
 })
 
 describe('PocketRisu WebKit Response RPC', () => {
-  it('buffers an active WebKit Response with exact bytes and response metadata', async () => {
+  it('streams an active WebKit Response through a MessagePort with exact bytes and metadata', async () => {
     vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
       'Mozilla/5.0 Version/17.4 Mobile/15E148 Safari/604.1',
     )
@@ -384,9 +386,10 @@ describe('PocketRisu WebKit Response RPC', () => {
       statusText: 'Partial Content',
       headers: { 'x-risu-response': 'buffered' },
     })
+    const arrayBuffer = vi.spyOn(response, 'arrayBuffer')
     const { dispatch, posted } = createHarness({
       webkitResponse: () => response,
-    }, true)
+    })
 
     dispatch({ type: 'CALL_ROOT', reqId: 'webkit-response', method: 'webkitResponse', args: [] })
 
@@ -395,45 +398,48 @@ describe('PocketRisu WebKit Response RPC', () => {
     expect(postedResponse.message.result).toMatchObject({
       __type: 'CALLBACK_STREAMS',
       __specialType: 'Response',
+      value: { __type: 'STREAM_PORT', portIndex: 0 },
       init: {
         status: 206,
         statusText: 'Partial Content',
         headers: [['x-risu-response', 'buffered']],
       },
     })
-    expect(Array.from(new Uint8Array(postedResponse.message.result.value))).toEqual(Array.from(bytes))
+    expect(arrayBuffer).not.toHaveBeenCalled()
+
+    const port = postedResponse.transferables[0] as MessagePort
+    const streamedChunk = new Promise<Uint8Array>((resolve, reject) => {
+      port.onmessage = (event) => {
+        if (event.data?.error) reject(new Error(event.data.error))
+        else if (!event.data?.done) resolve(event.data.value)
+      }
+    })
+    port.postMessage({ pull: true })
+    await expect(streamedChunk).resolves.toEqual(bytes)
+    port.postMessage({ cancel: true })
   })
 
-  it('does not serialize a WebKit Response after terminate during deferred buffering', async () => {
+  it('cancels an active WebKit Response source when the sandbox terminates', async () => {
     vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
       'Mozilla/5.0 Version/17.4 Mobile/15E148 Safari/604.1',
     )
-    let rejectBuffer!: (reason?: unknown) => void
-    const deferredBuffer = new Promise<ArrayBuffer>((_resolve, reject) => { rejectBuffer = reject })
-    const response = new Response(new Uint8Array([1, 2, 3]))
-    Object.defineProperty(response, '__classType', { value: 'REMOTE_REQUIRED' })
-    const arrayBuffer = vi.spyOn(response, 'arrayBuffer').mockReturnValue(deferredBuffer)
+    const cancel = vi.fn()
+    const response = new Response(new ReadableStream<Uint8Array>({ cancel }))
     const { dispatch, host, posted } = createHarness({
-      deferredWebKitResponse: () => response,
+      activeWebKitResponse: () => response,
     })
-    const serialize = vi.spyOn(host as any, 'serialize')
 
     dispatch({
       type: 'CALL_ROOT',
-      reqId: 'deferred-webkit-response',
-      method: 'deferredWebKitResponse',
+      reqId: 'active-webkit-response',
+      method: 'activeWebKitResponse',
       args: [],
     })
-    await vi.waitFor(() => expect(arrayBuffer).toHaveBeenCalledOnce())
+    await postedMessage(posted, 'RESPONSE', 'active-webkit-response')
+    expect((host as any).activeStreamCleanups.size).toBe(1)
     host.terminate()
-    rejectBuffer(new Error('buffering stopped'))
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    expect(serialize).not.toHaveBeenCalled()
-    expect((host as any).instanceRegistry.size).toBe(0)
-    expect(posted.filter((entry) =>
-      entry.message.type === 'RESPONSE' && entry.message.reqId === 'deferred-webkit-response',
-    )).toHaveLength(0)
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce())
+    expect((host as any).activeStreamCleanups.size).toBe(0)
   })
 })
 

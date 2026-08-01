@@ -14,8 +14,10 @@ import { checkCharOrder, forageStorage, getAssetStorageRevision, getFetchLogs, r
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { get } from "svelte/store";
 import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
+import { getInlayAsset } from "src/ts/process/files/inlays";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
+import { endAllGenerations } from "src/ts/process/generationState";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
@@ -815,7 +817,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         getChar: oldApis.getChar,
         setChar: oldApis.setChar,
-        addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV3ProviderOptions) => {
+        addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>, options?: PluginV3ProviderOptions) => {
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             const providerCallback = async (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => {
                 return invokePermissionCheckedProvider(
@@ -898,6 +900,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             await oldApis.loadPlugins()
         },
         readImage: oldApis.readImage,
+        readInlay: async (id: string) => {
+            return await getInlayAsset(id);
+        },
         saveAsset: oldApis.saveAsset,
         createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
         readOwnedInlay: (id, options) => inlayLifecycle.readOwnedInlay(id, options),
@@ -1342,19 +1347,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             addPluginUnloadCallback(context.instanceId, () => invokeSandboxCleanupCallback(callback));
         },
         getFetchLogs: async () => {
-            const unsafeFetchLog = getFetchLogs()
             const conf = await getPluginPermission(context, 'fetchLogs');
             if(!conf){
                 return null;
             }
+            // Reads the server request log; the shape returned to plugins is
+            // unchanged from when this came from the in-memory fetch log.
+            const unsafeFetchLog = await getFetchLogs()
             return unsafeFetchLog.map(log => {
 
                 const url = new URL(log.url);
                 return {
                     url: url.origin + url.pathname,
-                    body: log.body,
+                    body: log.requestBody ?? '',
                     status: log.status,
-                    response: log.response,
+                    response: log.responseBody,
+                    timestamp: log.timestamp,
                 }
             })
         },
@@ -1603,6 +1611,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 // Plugin API path does not pass through the UI unlock logic,
                 // so release doingChat here on both success and failure.
                 doingChat.set(false);
+                endAllGenerations();
             }
 
             return true;

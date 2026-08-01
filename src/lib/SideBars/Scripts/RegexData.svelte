@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { onDestroy } from "svelte";
     import { XIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { ReloadGUIPointer } from "src/ts/stores.svelte";
@@ -79,6 +80,16 @@ interface Props {
     ]
 
     let open = $state(false)
+
+    // Single point that balances onOpen. Covers every way this row can go away:
+    // deletion, the parent's array being swapped wholesale (character/preset/module
+    // switch), and parent unmount. Without it an open row leaks the list's counter
+    // and drag reordering stays dead with no UI left to close.
+    onDestroy(() => {
+        if(open){
+            onClose()
+        }
+    })
 </script>
 
 <div class="w-full flex flex-col pt-2 mt-2 border-t border-t-selected first:pt-0 first:mt-0 first:border-0" data-risu-idx={idx}>
@@ -97,9 +108,8 @@ interface Props {
         <button class="valuer" onclick={async () => {
             const d = await alertConfirm(language.removeConfirm + value.comment)
             if(d){
-                if(!open){
-                    onClose()
-                }
+                // The each block is keyed, so this removes exactly this row and
+                // onDestroy above settles the counter.
                 onRemove()
             }
         }}>

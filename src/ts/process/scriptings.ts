@@ -31,6 +31,13 @@ interface BasicScriptingEngineState {
     chat?: Chat;
     setVar?: (key:string, value:string) => void,
     getVar?: (key:string) => string,
+    /**
+     * Module that owns the currently running script, for per-module model
+     * binding (db.moduleModelBindings). Engines are cached per `mode`, so this
+     * is re-assigned on every run alongside chat/setVar/getVar — safe because
+     * the whole run is held under `mutex.runExclusive`.
+     */
+    moduleId?: string,
 }
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
@@ -58,7 +65,8 @@ export async function runScripted(code:string, arg:{
     lowLevelAccess?: boolean,
     meta?: object,
     mode?: string,
-    type?: 'lua'|'py'
+    type?: 'lua'|'py',
+    moduleId?: string
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
     const char = arg.char ?? getCurrentCharacter()
@@ -78,6 +86,7 @@ export async function runScripted(code:string, arg:{
     let ScriptingEngineState = await getOrCreateEngineState(mode, type);
     
     return await ScriptingEngineState.mutex.runExclusive(async () => {
+        ScriptingEngineState.moduleId = arg.moduleId
         ScriptingEngineState.chat = chat
         ScriptingEngineState.setVar = setVar
         ScriptingEngineState.getVar = getVar
@@ -547,6 +556,7 @@ export async function runScripted(code:string, arg:{
                     useStreaming: options.streaming === true,
                     forceStreaming: options.streaming === true,
                     noMultiGen: true,
+                    moduleId: ScriptingEngineState.moduleId,
                 }, 'model')
 
                 if(result.type === 'fail'){
@@ -595,6 +605,7 @@ export async function runScripted(code:string, arg:{
                     bias: {},
                     useStreaming: false,
                     noMultiGen: true,
+                    moduleId: ScriptingEngineState.moduleId,
                 }, 'model')
 
                 if(result.type === 'fail'){
@@ -913,6 +924,7 @@ export async function runScripted(code:string, arg:{
                     useStreaming: options.streaming === true,
                     forceStreaming: options.streaming === true,
                     noMultiGen: true,
+                    moduleId: ScriptingEngineState.moduleId,
                 }, 'otherAx')
 
                 if(result.type === 'fail'){
@@ -1427,7 +1439,8 @@ export async function runLuaButtonTrigger(char:character|groupChat|simpleCharact
                     char: char,
                     lowLevelAccess: trigger.lowLevelAccess,
                     mode: 'onButtonClick',
-                    data: data
+                    data: data,
+                    moduleId: trigger.moduleId,
                 })
             }
         }

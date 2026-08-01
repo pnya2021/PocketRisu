@@ -30,8 +30,9 @@ const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
+const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatch } = require('fast-json-patch');
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
+const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, normalizeForwardHeaders, hasRemoteBlocks } = require('./utils.cjs');
 const { repairDuplicateCharacterIds, repairChatIdsBeforeIndexing } = require('./groupPersistence.cjs');
 const { createPluginModelStore } = require('./pluginModelStore.cjs');
 const { createPluginModelDownloadService, registerPluginModelRoutes } = require('./pluginModelDownload.cjs');
@@ -1462,15 +1463,24 @@ async function checkDiskSpace(requiredBytes) {
 
 // ── Active writer session (single-writer lock) ────────────────────────────────
 // Mirrors the BroadcastChannel-based tab lock on the server side so that the
-// same protection extends across devices. The last client to call /api/session
-// becomes the active writer; older sessions receive 423 on write attempts.
-let activeSessionId = null // string | null
+// same protection extends across devices. Lock rules live in session-lock.cjs:
+// page loads REGISTER but never steal the lock (an OS-restored phone tab must
+// not kick a PC mid-session); ownership moves on the first WRITE from a
+// freshly-booted session, and only stale sessions get 423.
+const { createSessionLock } = require('./session-lock.cjs');
+const sessionLock = createSessionLock();
 
 function checkActiveSession(req, res) {
     const clientSessionId = req.headers['x-session-id']
-    if (!clientSessionId) return true  // client without session support
-    if (!activeSessionId) return true  // no session registered yet
-    if (clientSessionId === activeSessionId) return true
+    // The client attaches x-user-active only when a real user gesture happened
+    // recently — automatic writes (boot housekeeping, flush-on-hide) carry no
+    // gesture and must never move the lock (session-lock.cjs rules).
+    const userActive = req.headers['x-user-active'] === '1'
+    const result = sessionLock.checkWrite(typeof clientSessionId === 'string' ? clientSessionId : '', userActive)
+    if (result.tookOver) {
+        console.log('[Session] Write lock taken over by a freshly-booted session')
+    }
+    if (result.ok) return true
     res.status(423).json({ error: 'Session deactivated' })
     return false
 }
@@ -1645,25 +1655,7 @@ function sanitizeTargetUrl(raw) {
 }
 
 // --- Proxy Stream: request/response helpers ---
-
-function normalizeForwardHeaders(input) {
-    if (!input || typeof input !== 'object' || Array.isArray(input)) {
-        return {};
-    }
-    const normalized = {};
-    for (const [key, value] of Object.entries(input)) {
-        if (typeof key !== 'string') continue;
-        if (typeof value === 'string') {
-            normalized[key] = value;
-        }
-    }
-    delete normalized['risu-auth'];
-    delete normalized['risu-timeout-ms'];
-    delete normalized['host'];
-    delete normalized['connection'];
-    delete normalized['content-length'];
-    return normalized;
-}
+// normalizeForwardHeaders (the shared security strip-list) lives in utils.cjs.
 
 function normalizeProxyResponseHeaders(headers) {
     const normalized = {};
@@ -1989,10 +1981,21 @@ function parseInlaySidecarBackupName(name) {
     return { id };
 }
 
+// Upstream (#1484) writes cold storage backup entries as flat
+// coldstorage_<uuid>.json names; older backups and the runtime KV use
+// coldstorage/<uuid>. Match upstream's UUID pattern for the flat form so
+// ordinary assets that merely start with "coldstorage_" are not captured.
+const COLD_STORAGE_FLAT_NAME_RE = /^coldstorage_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\.json)?$/;
+
 function normalizeColdStorageStorageKey(nameOrKey) {
     let key = nameOrKey;
     if (key.startsWith('coldstorage/')) {
         key = key.slice('coldstorage/'.length);
+    } else {
+        const flat = COLD_STORAGE_FLAT_NAME_RE.exec(key);
+        if (flat) {
+            key = flat[1];
+        }
     }
     if (key.endsWith('.json')) {
         key = key.slice(0, -'.json'.length);
@@ -2127,9 +2130,10 @@ function resolveBackupStorageKey(name) {
         return name;
     }
 
-    // Upstream backups transport cold storage as coldstorage/<uuid>.json.
+    // Upstream backups transport cold storage as coldstorage/<uuid>.json
+    // (pre-#1484) or flat coldstorage_<uuid>.json (#1484 onwards).
     // Normalize back to the runtime KV key: coldstorage/<uuid>.
-    if (name.startsWith('coldstorage/')) {
+    if (name.startsWith('coldstorage/') || COLD_STORAGE_FLAT_NAME_RE.test(name)) {
         return normalizeColdStorageStorageKey(name);
     }
 
@@ -2979,6 +2983,15 @@ app.delete('/proxy-stream-jobs/:jobId', async (req, res) => {
     res.send({ success: true });
 });
 
+// --- Model Job endpoints (durable server-side model-preset relay) ---
+// Recorder pattern: the server makes the provider request, streams the bytes
+// to the client unchanged, and journals the same bytes to disk so a client
+// that disconnects mid-generation can recover the response. All logic lives
+// in model-jobs.cjs; registers /api/model-jobs* with /proxy2-level auth.
+const { createModelJobs } = require('./model-jobs.cjs');
+const modelJobs = createModelJobs({ saveDir: savePath, logger });
+modelJobs.registerRoutes(app, { auth: checkProxyAuth });
+
 // app.get('/api/password', async(req, res)=> {
 //     if(password === ''){
 //         res.send({status: 'unset'})
@@ -3029,15 +3042,25 @@ app.post('/api/token/refresh', async (req, res) => {
     res.json({ token: createServerJwt() })
 })
 
+// Reload-on-return check: side-effect-free writer-lock state for this session.
+// The client calls it when the tab regains visibility/focus and reloads ONLY
+// on 'stale' — before the user has done anything, so nothing is lost.
+app.get('/api/session/lock-status', async (req, res) => {
+    if (!await checkAuth(req, res)) return
+    const id = req.headers['x-session-id']
+    res.json({ state: sessionLock.peek(typeof id === 'string' ? id : '') })
+})
+
 // ── Session cookie issuance (F-0) ──────────────────────────────────────────
 // Called once after JWT auth succeeds. Issues a long-lived cookie so that
 // <img src="/api/asset/..."> requests can be authenticated without JS.
 app.post('/api/session', async (req, res) => {
     if (!await checkAuth(req, res)) return
     const clientSessionId = req.headers['x-session-id']
-    if (clientSessionId) {
-        activeSessionId = clientSessionId
-        console.log('[Session] Active writer session updated')
+    if (typeof clientSessionId === 'string') {
+        // Registers the boot; takes the lock only if nobody holds it.
+        sessionLock.register(clientSessionId)
+        console.log('[Session] Session boot registered')
     }
     const token = nodeCrypto.randomBytes(32).toString('hex')
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000
@@ -3476,6 +3499,13 @@ app.delete('/api/logs', async (req, res, next) => {
     }
 });
 
+// ─── /api/request-logs — provider request log + token usage statistics ───────
+// Own SQLite file (save/request-logs.db) with its own rotation policy; see
+// server/node/request-logs.cjs. Registered with the same auth the /api/logs
+// endpoints use.
+const requestLogs = createRequestLogs({ saveDir: savePath });
+requestLogs.registerRoutes(app, { auth: checkAuth, activeSession: checkActiveSession });
+
 app.post('/api/write', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
@@ -3597,8 +3627,11 @@ app.post('/api/write', async (req, res, next) => {
     }
 });
 
+// NOT session-locked: flush carries no data — it only asks the server to
+// fsync what it already has. It fires automatically on tab-hide from EVERY
+// device, so gating it on the write lock made a phone going to background
+// steal (or trip over) the lock without any user action.
 app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
-    if (!checkActiveSession(req, res)) return;
     try {
         await queueStorageOperation(async () => {
             await flushPendingDb();
@@ -3873,6 +3906,103 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
     } catch(error){ next(error); }
 });
 
+// ── Settings-only export ────────────────────────────────────────────────────
+//
+// Multi-instance setups are a common PocketRisu pattern, and re-entering every
+// setting by hand on each new instance is the pain this removes. A settings-only
+// backup is the full backup minus characters, chats and inlay images: modules,
+// plugins, prompt presets, personas, lorebooks, theme and API keys all travel.
+//
+// Restore stays the ordinary full-replace import — the target is a fresh
+// instance, so there is no merge path involved.
+
+/**
+ * Trims a decoded database object down to settings only.
+ *
+ * Chats live inside `characters[].chats`, so dropping characters drops chats
+ * with them. `characterOrder` has to go too, or the restored instance keeps
+ * folders pointing at character ids that no longer exist.
+ */
+function stripToSettingsOnly(dbObj) {
+    return {
+        ...dbObj,
+        characters: [],
+        characterOrder: [],
+    };
+}
+
+/**
+ * Works out what a settings-only export would ship.
+ *
+ * Shared by the export endpoint and the estimate endpoint so the number shown
+ * in the confirm dialog can't drift from the file the user actually gets.
+ *
+ * Module assets are reported separately because they dominate the size for
+ * anyone using asset-pack modules — several GB against a handful of MB for
+ * everything else — and that is the one call worth putting to the user.
+ * Note the marginal cost is computed as (all − withoutModules), so an asset a
+ * module shares with, say, a persona icon is never billed to the module and
+ * never dropped when module assets are excluded.
+ */
+async function buildSettingsOnlyPlan({ includeModuleAssets = true } = {}) {
+    const raw = kvGet('database/database.bin');
+    if (!raw) return null;
+
+    // Plain decodeRisuSave, not decodeDatabaseWithPersistentChatIds: that
+    // variant runs chat-id and cold-storage migrations and can persist. Both
+    // concern data we are about to drop anyway.
+    const trimmed = stripToSettingsOnly(await decodeRisuSave(raw));
+    const dbValue = Buffer.from(encodeRisuSaveLegacy(trimmed, 'compression'));
+
+    const withModules = buildUncleanableSet(trimmed);
+    const withoutModules = buildUncleanableSet(trimmed, { includeModuleAssets: false });
+    const keepNames = includeModuleAssets ? withModules : withoutModules;
+
+    let baseCount = 0, baseBytes = 0, moduleCount = 0, moduleBytes = 0;
+    for (const entry of kvListWithSizes('assets/')) {
+        const name = path.basename(entry.key);
+        if (withoutModules.has(name)) {
+            baseCount++;
+            baseBytes += entry.size;
+        } else if (withModules.has(name)) {
+            moduleCount++;
+            moduleBytes += entry.size;
+        }
+    }
+
+    const modulesWithAssets = (trimmed.modules ?? [])
+        .filter((m) => Array.isArray(m?.assets) && m.assets.length > 0).length;
+
+    return {
+        trimmed,
+        dbValue,
+        keepNames,
+        breakdown: {
+            dbBytes: dbValue.length,
+            baseAssets: { count: baseCount, bytes: baseBytes },
+            moduleAssets: { count: moduleCount, bytes: moduleBytes, moduleCount: modulesWithAssets },
+        },
+    };
+}
+
+// Size breakdown for the settings-only confirm dialog. Kept separate from
+// /api/db/stats because it has to decode and re-encode the DB, which that
+// dashboard poll should not pay for on every load.
+app.get('/api/backup/export/settings-estimate', async (req, res, next) => {
+    if (!await checkAuth(req, res)) { return; }
+    try {
+        await flushPendingDb();
+        const plan = await buildSettingsOnlyPlan({ includeModuleAssets: true });
+        if (!plan) {
+            res.status(500).json({ error: 'database.bin missing' });
+            return;
+        }
+        res.json(plan.breakdown);
+    } catch (error) {
+        next(error);
+    }
+});
+
 app.get('/api/backup/export', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
     try {
@@ -3882,9 +4012,34 @@ app.get('/api/backup/export', async (req, res, next) => {
         // fails with ENOENT. The export becomes lossy on inlay images but
         // imports cleanly into upstream.
         const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
+        // ?mode=settings drops characters, chats and inlay images — see
+        // buildSettingsOnlyPlan above. &moduleAssets=0 additionally leaves out
+        // asset-pack module images, which is where the bulk usually lives.
+        const settingsOnly = req.query.mode === 'settings';
+        const includeModuleAssets = req.query.moduleAssets !== '0';
         // Flush any pending patches to ensure export includes latest data
         await flushPendingDb();
-        const inlayFiles = target === 'upstream' ? [] : await listInlayFiles();
+
+        // Settings-only re-encodes a trimmed DB up front: its byte length is
+        // needed for content-length, and the trimmed object drives the asset
+        // filter below. Safe to hold in memory — with characters gone this is
+        // orders of magnitude smaller than the live blob.
+        let settingsDbValue = null;
+        let settingsAssetNames = null;
+        if (settingsOnly) {
+            const plan = await buildSettingsOnlyPlan({ includeModuleAssets });
+            if (!plan) {
+                res.status(500).json({ error: 'database.bin missing' });
+                return;
+            }
+            settingsDbValue = plan.dbValue;
+            settingsAssetNames = plan.keepNames;
+        }
+
+        // Inlay images only ever attach to chat messages, so a settings-only
+        // export skips those namespaces for the same reason upstream does.
+        const skipInlay = settingsOnly || target === 'upstream';
+        const inlayFiles = skipInlay ? [] : await listInlayFiles();
         const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
             const stat = await fs.stat(entry.filePath);
             return {
@@ -3910,7 +4065,7 @@ app.get('/api/backup/export', async (req, res, next) => {
                 return null;
             }
         }));
-        const inlayMetaEntries = target === 'upstream' ? [] : kvListWithSizes('inlay_meta/').map((entry) => ({
+        const inlayMetaEntries = skipInlay ? [] : kvListWithSizes('inlay_meta/').map((entry) => ({
             kind: 'kv',
             key: entry.key,
             backupName: entry.key,
@@ -3918,26 +4073,38 @@ app.get('/api/backup/export', async (req, res, next) => {
             size: entry.size,
         }));
         const namespacedEntries = [
-            ...kvListWithSizes('assets/').map((entry) => ({
-                kind: 'kv',
-                key: entry.key,
-                backupName: path.basename(entry.key),
-                sortKey: entry.key,
-                size: entry.size,
-            })),
-            ...listColdStorageBackupEntries(),
+            ...kvListWithSizes('assets/')
+                // Settings-only keeps just the assets the trimmed DB still
+                // points at — persona icons, theme background, notification
+                // sounds, module assets. Character art falls out here, which is
+                // what actually shrinks the file.
+                .filter((entry) => !settingsAssetNames || settingsAssetNames.has(path.basename(entry.key)))
+                .map((entry) => ({
+                    kind: 'kv',
+                    key: entry.key,
+                    backupName: path.basename(entry.key),
+                    sortKey: entry.key,
+                    size: entry.size,
+                })),
+            // Cold storage holds character payloads only — nothing left to carry
+            // once characters are stripped.
+            ...(settingsOnly ? [] : listColdStorageBackupEntries()),
             ...inlayMetaEntries,
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
-        const dbSize = kvSize('database/database.bin');
+        const dbSize = settingsOnly ? settingsDbValue.length : kvSize('database/database.bin');
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
         }, 0) + (dbSize ? 8 + Buffer.byteLength('database.risudat', 'utf-8') + dbSize : 0);
 
-        const filenameSuffix = target === 'upstream' ? '-upstream' : '';
+        // Settings-only files get their own name — they are kept around and
+        // reused across instances, so they have to be tellable apart from a full
+        // backup months later.
+        const filenameBase = settingsOnly ? 'risu-settings' : 'risu-backup';
+        const filenameSuffix = settingsOnly ? '' : target === 'upstream' ? '-upstream' : '';
         res.setHeader('content-type', 'application/octet-stream');
-        res.setHeader('content-disposition', `attachment; filename="risu-backup-${Date.now()}${filenameSuffix}.bin"`);
+        res.setHeader('content-disposition', `attachment; filename="${filenameBase}-${Date.now()}${filenameSuffix}.bin"`);
         res.setHeader('content-length', totalBytes);
         res.setHeader('x-risu-backup-assets', namespacedEntries.length);
 
@@ -3975,7 +4142,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         }
 
         if (!closed && dbSize) {
-            const dbValue = kvGet('database/database.bin');
+            const dbValue = settingsOnly ? settingsDbValue : kvGet('database/database.bin');
             if (dbValue) {
                 const ok = res.write(encodeBackupEntry('database.risudat', dbValue));
                 if (!ok) {
@@ -4692,6 +4859,10 @@ function clearExistingData() {
     // stitch in stale cross-user data. Wiping here ensures only payloads
     // that arrived in this import survive.
     kvDelPrefix('remotes/');
+    // Cold-storage rows belong to the previous user's chats. The .bin import path
+    // (importBackupFromSource) already clears these; the save-folder path did not,
+    // leaving orphans that no dashboard or Optimize pass ever reclaims.
+    kvDelPrefix('coldstorage/');
     // Clear remote-block migration marker — newly imported database.bin may
     // contain REMOTE blocks (it usually does, since save-folder imports
     // preserve upstream's split-character format) and we want the migration
@@ -4929,8 +5100,24 @@ function statsBasename(s) {
     return String(s).replace(/\\/g, '/').split('/').pop();
 }
 
-// Mirrors src/ts/globalApi.svelte.ts:getUncleanables — every asset reference reachable from the DB.
-function buildUncleanableSet(dbObj) {
+// Every asset reference reachable from the DB. Mirrors
+// src/ts/globalApi.svelte.ts:getUncleanables, plus the settings-level image-gen
+// references that walker misses (NAIImgConfig, wavespeedImage).
+//
+// Two consumers: dashboard orphan stats, and picking which assets a
+// settings-only backup carries. A miss here silently drops an asset from the
+// seed backup, so err toward including a field.
+//
+// Deliberately absent: botPresets[].image and modules[].backgroundEmbedding.
+// The former is an inline data URI (canvas.toDataURL), the latter is HTML —
+// neither is a stored asset, so both ride along inside database.bin.
+//
+// `includeModuleAssets: false` omits modules[].assets (and the same array on a
+// persona's embedded module). Asset-pack modules routinely carry thousands of
+// images — several GB is normal — so a settings-only export offers to leave
+// them behind. Module *icons* are not gated: they are tiny and part of the
+// module's identity in the list UI.
+function buildUncleanableSet(dbObj, { includeModuleAssets = true } = {}) {
     const set = new Set();
     const add = (v) => {
         const bn = statsBasename(v);
@@ -4939,6 +5126,15 @@ function buildUncleanableSet(dbObj) {
     if (!dbObj) return set;
     add(dbObj.customBackground);
     add(dbObj.userIcon);
+    // Notification sounds. Bundled-preset values (e.g. "bell") are not asset
+    // paths and just add a basename that matches no stored asset.
+    add(dbObj.messageSound);
+    add(dbObj.translateSound);
+    if (Array.isArray(dbObj.customSounds)) for (const s of dbObj.customSounds) add(s?.path);
+    // Image-gen reference images hang off settings, not off a character.
+    add(dbObj.NAIImgConfig?.character_image);
+    add(dbObj.NAIImgConfig?.image);
+    add(dbObj.wavespeedImage?.reference_image);
     if (Array.isArray(dbObj.characters)) {
         for (const cha of dbObj.characters) {
             if (!cha) continue;
@@ -4950,9 +5146,19 @@ function buildUncleanableSet(dbObj) {
         }
     }
     if (Array.isArray(dbObj.modules)) {
-        for (const m of dbObj.modules) if (Array.isArray(m?.assets)) for (const a of m.assets) add(a?.[1]);
+        for (const m of dbObj.modules) {
+            if (includeModuleAssets && Array.isArray(m?.assets)) for (const a of m.assets) add(a?.[1]);
+            add(m?.icon);
+        }
     }
-    if (Array.isArray(dbObj.personas)) for (const p of dbObj.personas) add(p?.icon);
+    if (Array.isArray(dbObj.personas)) {
+        for (const p of dbObj.personas) {
+            add(p?.icon);
+            const embedded = p?.embeddedModule;
+            if (includeModuleAssets && Array.isArray(embedded?.assets)) for (const a of embedded.assets) add(a?.[1]);
+            add(embedded?.icon);
+        }
+    }
     if (Array.isArray(dbObj.characterOrder)) {
         for (const item of dbObj.characterOrder) {
             if (item && typeof item === 'object' && 'imgFile' in item) add(item.imgFile);
