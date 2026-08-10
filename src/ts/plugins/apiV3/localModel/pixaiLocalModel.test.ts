@@ -267,6 +267,7 @@ describe('PixaiLocalModel facade', () => {
             ifRevision: assetRevision,
             variant: 'original',
             maxBytes: 33_554_432,
+            signal: expect.any(AbortSignal),
         })
         expect(modelClient.run).toHaveBeenCalledWith(
             SESSION_A,

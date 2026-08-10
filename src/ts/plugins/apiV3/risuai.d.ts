@@ -1234,7 +1234,15 @@ interface PluginCapability {
         | 'disabled' | 'permission-required' | 'no-current-context' | 'not-configured'
         | 'consent-required' | 'insufficient-storage' | 'insufficient-memory'
         | 'temporarily-unavailable';
-    limits?: Record<string, string | number | boolean>;
+    limits?: PluginCapabilityLimits;
+}
+
+interface PluginCapabilityLimits extends Record<string, string | number | boolean> {
+    assetReadPolicy?: 'backpressure';
+    maxConcurrentAssetReadsPerPrincipal?: 4;
+    maxConcurrentOriginalAssetReadsPerPrincipal?: 1;
+    maxQueuedAssetReadsPerPrincipal?: 128;
+    assetReadCancellation?: true;
 }
 
 type CharacterId = string;
@@ -2449,6 +2457,7 @@ interface RisuaiPluginAPI {
         mediaTypes?: string[];
         cursor?: string;
         limit?: number;
+        signal?: AbortSignal;
     }): Promise<{
         contextRevision: Revision;
         assets: ContextAssetRef[];
@@ -2475,6 +2484,7 @@ interface RisuaiPluginAPI {
         ifRevision?: Revision;
         variant?: 'original' | 'thumbnail';
         maxBytes?: number;
+        signal?: AbortSignal;
     }): Promise<{
         data: Uint8Array;
         revision: Revision;

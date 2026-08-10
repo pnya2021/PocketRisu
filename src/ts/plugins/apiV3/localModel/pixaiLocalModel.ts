@@ -535,11 +535,15 @@ export class PixaiLocalModel {
         }
     }
 
-    private async resolveContextAsset(source: Extract<NormalizedImageSource, { kind: 'context-asset' }>) {
+    private async resolveContextAsset(
+        source: Extract<NormalizedImageSource, { kind: 'context-asset' }>,
+        signal: AbortSignal,
+    ) {
         const value = await this.contextResources.readContextAsset(source.assetId, {
             ifRevision: source.revision,
             variant: 'original',
             maxBytes: MAX_INPUT_BYTES,
+            signal,
         })
         return validateImageBytes(value.data, value.mediaType)
     }
@@ -592,7 +596,7 @@ export class PixaiLocalModel {
 
     private async resolveImage(source: NormalizedImageSource, signal: AbortSignal) {
         if (source.kind === 'bytes') return { data: source.data.slice(), mediaType: source.mediaType }
-        if (source.kind === 'context-asset') return this.resolveContextAsset(source)
+        if (source.kind === 'context-asset') return this.resolveContextAsset(source, signal)
         return this.resolveInlay(source, signal)
     }
 

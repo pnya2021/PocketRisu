@@ -671,6 +671,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }),
         },
     )
+    addPluginUnloadCallback(context.instanceId, () => contextResources.dispose())
     const inlayNodeStorage = new NodeStorage()
     const messageQuery = new MessageQueryService(
         context,
