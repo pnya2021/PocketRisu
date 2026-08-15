@@ -1176,6 +1176,176 @@ describe('Pocket context resource adapter', () => {
         service.dispose()
     })
 
+    it('rejects first-page installed-module publication when a null-hydrated raw chat slot is replaced', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const character = makeCharacter()
+        character.chats[0] = undefined as any
+        const modules = [makeModule('module-first'), makeModule('module-second')]
+        const captures = new QueryCaptureCache()
+        const cursors = new CursorRegistry()
+        const unrelatedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'null-chat-first-page-unrelated',
+        }
+        const unrelatedQuery = { kind: 'null-chat-first-page-unrelated-query' }
+        const unrelatedCapture = await captures.create(
+            unrelatedOwner, unrelatedQuery, [{ id: 'unrelated-module' }],
+        )
+        const unrelatedCursor = await cursors.create(
+            principalId, 'context-modules', unrelatedOwner.instanceId,
+            unrelatedQuery, { offset: 1 },
+        )
+        const commitCapture = vi.spyOn(captures, 'commitPrepared')
+        const commitCursor = vi.spyOn(cursors, 'commitPrepared')
+        const publicationGate = deferred<void>()
+        let publicationEntered = false
+        let permissionCalls = 0
+        const service = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'null-chat-first-page-fence',
+                displayName: 'Null chat first-page fence',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules }),
+                getCurrentCharacter: () => character,
+                hydrateCurrentChat: async () => undefined,
+                getActiveModulesWithReasons: () => [],
+            })),
+            {
+                requirePermission: async () => {
+                    permissionCalls += 1
+                    if (permissionCalls === 2) {
+                        publicationEntered = true
+                        await publicationGate.promise
+                    }
+                },
+                cursorRegistry: cursors,
+                queryCaptureCache: captures,
+            },
+        )
+
+        const listing = service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        await waitFor(() => publicationEntered)
+        character.chats[0] = makeChat()
+        publicationGate.resolve()
+
+        await expect(listing).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(commitCapture).not.toHaveBeenCalled()
+        expect(commitCursor).not.toHaveBeenCalled()
+        expect(cursors.activeCount(principalId)).toBe(1)
+        service.dispose()
+        await expect(captures.read(
+            unrelatedOwner, unrelatedQuery, unrelatedCapture.captureRevision,
+        )).resolves.toMatchObject({ items: [{ id: 'unrelated-module' }] })
+        await expect(cursors.read(
+            unrelatedCursor,
+            principalId,
+            'context-modules',
+            unrelatedOwner.instanceId,
+            unrelatedQuery,
+        )).resolves.toEqual({ offset: 1 })
+    })
+
+    it.each(['cursor', 'captureRevision'] as const)(
+        'rejects a later %s request when a null-hydrated raw chat slot is replaced',
+        async (mode) => {
+            const principalId = '11111111-1111-4111-8111-111111111111'
+            const character = makeCharacter()
+            character.chats[0] = undefined as any
+            const modules = [
+                makeModule('module-first'),
+                makeModule('module-second'),
+                makeModule('module-third'),
+            ]
+            const captures = new QueryCaptureCache()
+            const cursors = new CursorRegistry()
+            const unrelatedOwner = {
+                principalId,
+                service: 'context-modules' as const,
+                instanceId: `null-chat-later-${mode}-unrelated`,
+            }
+            const unrelatedQuery = { kind: `null-chat-later-${mode}-unrelated-query` }
+            const unrelatedCapture = await captures.create(
+                unrelatedOwner, unrelatedQuery, [{ id: 'unrelated-module' }],
+            )
+            const unrelatedCursor = await cursors.create(
+                principalId, 'context-modules', unrelatedOwner.instanceId,
+                unrelatedQuery, { offset: 1 },
+            )
+            const publicationGate = deferred<void>()
+            let publicationArmed = false
+            let publicationEntered = false
+            let permissionCalls = 0
+            const service = new ContextResourceService(
+                {
+                    principalId,
+                    instanceId: `null-chat-later-${mode}-fence`,
+                    displayName: `Null chat later ${mode} fence`,
+                    signal: new AbortController().signal,
+                },
+                createPocketContextResourceAdapter(dependencies({
+                    getDatabase: () => ({ characters: [character], modules }),
+                    getCurrentCharacter: () => character,
+                    hydrateCurrentChat: async () => undefined,
+                    getActiveModulesWithReasons: () => [],
+                })),
+                {
+                    requirePermission: async () => {
+                        if (!publicationArmed) return
+                        permissionCalls += 1
+                        if (permissionCalls === 2) {
+                            publicationEntered = true
+                            await publicationGate.promise
+                        }
+                    },
+                    cursorRegistry: cursors,
+                    queryCaptureCache: captures,
+                },
+            )
+            const first = await service.listContextModules({
+                scope: 'installed', captureScope: 'query', limit: 1,
+            })
+            expect(first.nextCursor).toBeTypeOf('string')
+            const commitCapture = vi.spyOn(captures, 'commitPrepared')
+            const commitCursor = vi.spyOn(cursors, 'commitPrepared')
+            publicationArmed = true
+
+            const listing = service.listContextModules(mode === 'cursor'
+                ? {
+                    scope: 'installed', captureScope: 'query',
+                    cursor: first.nextCursor, limit: 1,
+                }
+                : {
+                    scope: 'installed', captureScope: 'query',
+                    captureRevision: first.captureRevision, limit: 1,
+                })
+            await waitFor(() => publicationEntered)
+            character.chats[0] = makeChat()
+            publicationGate.resolve()
+
+            await expect(listing).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+            expect(commitCapture).not.toHaveBeenCalled()
+            expect(commitCursor).not.toHaveBeenCalled()
+            expect(cursors.activeCount(principalId)).toBe(mode === 'cursor' ? 1 : 2)
+            service.dispose()
+            await expect(captures.read(
+                unrelatedOwner, unrelatedQuery, unrelatedCapture.captureRevision,
+            )).resolves.toMatchObject({ items: [{ id: 'unrelated-module' }] })
+            await expect(cursors.read(
+                unrelatedCursor,
+                principalId,
+                'context-modules',
+                unrelatedOwner.instanceId,
+                unrelatedQuery,
+            )).resolves.toEqual({ offset: 1 })
+        },
+    )
+
     it.each([
         ['append', (modules: Record<string, any>[]) => modules.push(makeModule('module-appended'))],
         ['delete', (modules: Record<string, any>[]) => modules.splice(2, 1)],

@@ -374,6 +374,7 @@ export function createPocketContextResourceAdapter(
     const stableHydrations = new WeakMap<UnknownRecord, {
         chatPage: string | number
         chat: UnknownRecord | undefined
+        rawChatSlot: unknown
     }>()
     const hydrateStableCurrent = async (signal?: AbortSignal) => {
         for (let attempt = 0; attempt < 4; attempt++) {
@@ -386,10 +387,11 @@ export function createPocketContextResourceAdapter(
             const chatPage = currentCharacter.chatPage as string | number
             const currentChat = await dependencies.hydrateCurrentChat(currentCharacter)
             assertNotAborted(signal)
+            const rawChatSlot = currentCharacter.chats?.[chatPage]
             if (dependencies.getCurrentCharacter() === currentCharacter
                 && currentCharacter.chatPage === chatPage
-                && (!currentChat || currentCharacter.chats?.[chatPage] === currentChat)) {
-                stableHydrations.set(currentCharacter, { chatPage, chat: currentChat })
+                && (!currentChat || rawChatSlot === currentChat)) {
+                stableHydrations.set(currentCharacter, { chatPage, chat: currentChat, rawChatSlot })
                 return { currentCharacter, currentChat }
             }
         }
@@ -406,7 +408,7 @@ export function createPocketContextResourceAdapter(
         const stable = stableHydrations.get(currentCharacter)
         if (!stable
             || currentCharacter.chatPage !== stable.chatPage
-            || (stable.chat && currentCharacter.chats?.[stable.chatPage] !== stable.chat)) throw changed()
+            || currentCharacter.chats?.[stable.chatPage] !== stable.rawChatSlot) throw changed()
         return { currentCharacter, currentChat: stable.chat }
     }
     const selectorsFrom = (
