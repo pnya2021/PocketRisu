@@ -178,6 +178,10 @@ export class PluginPermissionService {
         return (await this.persistence.get(principalId, permission))?.state ?? 'not-requested'
     }
 
+    generation(principalId: string) {
+        return `${this.globalGeneration}:${this.generations.get(principalId) ?? 0}`
+    }
+
     private async waitForResets(principalId: string) {
         const globalReset = this.globalReset
         if (globalReset) await globalReset

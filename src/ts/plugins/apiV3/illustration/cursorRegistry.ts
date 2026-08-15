@@ -10,6 +10,21 @@ interface CursorRecord<T = unknown> {
     expiresAt: number
 }
 
+export interface CursorPreparation {
+    readonly principalId: string
+    readonly service: string
+    readonly instanceId: string
+    readonly queryDigest: string
+    readonly lifecycle: readonly (readonly [string, number])[]
+}
+
+export interface CursorCommitPreparation<T> {
+    readonly preparation: CursorPreparation
+    readonly cursor: string
+    readonly value: T
+    readonly expiresAt: number
+}
+
 export class CursorRegistry {
     private records = new Map<string, CursorRecord>()
     private ttlMs: number
@@ -31,23 +46,75 @@ export class CursorRegistry {
     }
 
     async create<T>(principalId: string, service: string, instanceId: string, query: unknown, value: T) {
+        const preparation = await this.prepareCreate(principalId, service, instanceId, query)
+        return this.commitPrepared(preparation, value)
+    }
+
+    async prepareCreate(
+        principalId: string,
+        service: string,
+        instanceId: string,
+        query: unknown,
+    ): Promise<CursorPreparation> {
         const lifecycle = this.captureLifecycle(principalId, service, instanceId)
         const queryDigest = await this.digest(query)
         if (!this.isLifecycleCurrent(lifecycle)) {
             throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
         }
+        return { principalId, service, instanceId, queryDigest, lifecycle }
+    }
+
+    prepareCommit<T>(preparation: CursorPreparation, value: T): CursorCommitPreparation<T> {
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) {
+            throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
+        }
         this.removeExpired()
-        if (this.activeCount(principalId) >= this.maxPerPrincipal) {
+        if (this.activeCount(preparation.principalId) >= this.maxPerPrincipal) {
             throw new PluginApiError('RESOURCE_LIMIT', 'Too many active cursors', { retryable: true })
         }
         let cursor: string
         do cursor = `${crypto.randomUUID()}.${crypto.randomUUID()}`
         while (this.records.has(cursor))
-        this.records.set(cursor, {
-            principalId, service, instanceId, queryDigest, value,
-            expiresAt: this.now() + this.ttlMs,
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) {
+            throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
+        }
+        const expiresAt = this.now() + this.ttlMs
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) {
+            throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
+        }
+        return Object.freeze({
+            preparation,
+            cursor,
+            value,
+            expiresAt,
         })
-        return cursor
+    }
+
+    commitPrepared<T>(
+        preparation: CursorPreparation,
+        value: T,
+        commit = this.prepareCommit(preparation, value),
+    ) {
+        if (commit.preparation !== preparation || commit.value !== value) {
+            throw new PluginApiError('INVALID_ARGUMENT', 'Cursor commit does not match its preparation')
+        }
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) {
+            throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
+        }
+        if (this.records.has(commit.cursor)
+            || [...this.records.values()].filter((record) =>
+                record.principalId === preparation.principalId).length >= this.maxPerPrincipal) {
+            throw new PluginApiError('RESOURCE_LIMIT', 'Too many active cursors', { retryable: true })
+        }
+        this.records.set(commit.cursor, {
+            principalId: preparation.principalId,
+            service: preparation.service,
+            instanceId: preparation.instanceId,
+            queryDigest: preparation.queryDigest,
+            value,
+            expiresAt: commit.expiresAt,
+        })
+        return commit.cursor
     }
 
     async read<T>(cursor: string, principalId: string, service: string, instanceId: string, query: unknown): Promise<T> {

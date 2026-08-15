@@ -12,6 +12,7 @@ import {
     type ContextResourceAdapter,
 } from './contextResources'
 import { resolveModuleActivations } from './moduleActivation'
+import { QueryCaptureCache } from './queryCaptureCache'
 
 const encoder = new TextEncoder()
 
@@ -173,6 +174,9 @@ function harness(options: {
     readAsset?: ContextResourceAdapter['readAsset']
     readCoordinator?: ContextAssetReadCoordinator
     instanceId?: string
+    queryCaptureCache?: QueryCaptureCache
+    getPermissionGeneration?: () => number
+    adapterOverrides?: Partial<ContextResourceAdapter>
 } = {}) {
     let state = options.state ?? makeState()
     const bytes = defaultBytes()
@@ -198,6 +202,7 @@ function harness(options: {
             height: constraints.longEdge,
             decodedPixels: constraints.maxPixels,
         })),
+        ...options.adapterOverrides,
     }
     const granted = new Set(options.grants ?? ['contextAssets', 'installedModulesRead'])
     const permissionCalls: string[] = []
@@ -220,6 +225,8 @@ function harness(options: {
             },
             cursorRegistry: options.cursorRegistry ?? new CursorRegistry({ now: options.now }),
             readCoordinator: options.readCoordinator,
+            queryCaptureCache: options.queryCaptureCache,
+            getPermissionGeneration: options.getPermissionGeneration,
         },
     )
     return {
@@ -1547,5 +1554,996 @@ describe('snapshot hard ceilings', () => {
         }
         expect(() => assertContextSnapshotLimits(nested(32))).not.toThrow()
         expect(() => assertContextSnapshotLimits(nested(33))).toThrowError(expect.objectContaining({ code: 'RESOURCE_LIMIT' }))
+    })
+})
+
+describe('opt-in query capture public shape', () => {
+    it('keeps no-option module and asset response keys and legacy cursor records byte-for-byte unchanged', async () => {
+        const cursors = new CursorRegistry()
+        const createCursor = vi.spyOn(cursors, 'create')
+        const h = harness({ cursorRegistry: cursors, instanceId: 'legacy-cursor-instance' })
+
+        const modules = await h.service.listContextModules({ scope: 'installed', limit: 1 })
+        expect(Object.keys(modules).sort()).toEqual(['items', 'nextCursor'])
+        expect(Object.keys(modules.items[0]).sort()).toEqual([
+            'activatedBy', 'description', 'id', 'lorebook', 'name', 'namespace', 'revision',
+        ])
+        expect(createCursor.mock.calls[0]?.slice(1)).toEqual([
+            'context-modules',
+            'legacy-cursor-instance',
+            {
+                kind: 'modules', scope: 'installed', characterId: 'char-1',
+                conversationId: 'conversation-1', limit: 1,
+            },
+            { offset: 1 },
+        ])
+
+        const assets = await h.service.listContextAssets({ moduleScope: 'none', limit: 1 })
+        expect(Object.keys(assets).sort()).toEqual(['assets', 'contextRevision', 'nextCursor'])
+        expect(createCursor.mock.calls[1]?.slice(1)).toEqual([
+            'context-assets',
+            'legacy-cursor-instance',
+            {
+                kind: 'assets', characterId: 'char-1', conversationId: 'conversation-1',
+                include: ['portrait', 'emotion', 'additional', 'module'], moduleScope: 'none',
+                mediaTypes: null, limit: 1,
+            },
+            { offset: 1 },
+        ])
+    })
+
+    it('adds only the approved opt-in module count and capture fields', async () => {
+        const h = harness()
+        const page = await h.service.listContextModules({
+            scope: 'installed',
+            includeAssetCount: true,
+            captureScope: 'query',
+            limit: 100,
+        })
+
+        expect(Object.keys(page).sort()).toEqual(['captureRevision', 'items'])
+        expect(page.captureRevision).toMatch(/^sha256:[0-9a-f]{64}$/)
+        expect(page.items.map((item) => ({
+            id: item.id,
+            assetCount: item.assetCount,
+            assetCollectionRevision: item.assetCollectionRevision,
+        }))).toEqual([
+            {
+                id: 'module-active',
+                assetCount: 1,
+                assetCollectionRevision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+            },
+            {
+                id: 'module-installed',
+                assetCount: 1,
+                assetCollectionRevision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+            },
+        ])
+    })
+
+    it('adds only captureRevision to an opted-in asset page and filters installed modules by normalized IDs', async () => {
+        const h = harness()
+        const page = await h.service.listContextAssets({
+            moduleScope: 'installed',
+            moduleIds: [' module-installed ', 'module-active', 'module-installed'],
+            captureScope: 'query',
+            include: ['module'],
+            limit: 100,
+        })
+
+        expect(Object.keys(page).sort()).toEqual(['assets', 'captureRevision', 'contextRevision'])
+        expect(page.captureRevision).toMatch(/^sha256:[0-9a-f]{64}$/)
+        expect(page.assets.map((item) => item.origin)).toEqual([
+            { kind: 'module', moduleId: 'module-active' },
+            { kind: 'module', moduleId: 'module-installed' },
+        ])
+    })
+})
+
+describe('captured context count, filter, and fence security', () => {
+    it('rejects module counts outside installed scope and reports exact and zero counts with ordered metadata revisions', async () => {
+        const invalid = harness()
+        await expect(invalid.service.listContextModules({ scope: 'active', includeAssetCount: true }))
+            .rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+        expect(invalid.getState).not.toHaveBeenCalled()
+        expect(invalid.permissionCalls).toEqual([])
+
+        const state = makeState()
+        state.installedModules[0].assets.push(asset('second', 'second', 'module'))
+        state.installedModules[1].assets = []
+        const first = harness({ state })
+        const page = await first.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        expect(page.items.map((item) => [item.id, item.assetCount])).toEqual([
+            ['module-active', 2], ['module-installed', 0],
+        ])
+        expect(page.items[0].assetCollectionRevision).not.toBe(page.items[1].assetCollectionRevision)
+
+        const reordered = structuredClone(state)
+        reordered.installedModules[0].assets.reverse()
+        const second = harness({ state: reordered })
+        const reorderedPage = await second.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        expect(reorderedPage.items[0].assetCollectionRevision).not.toBe(page.items[0].assetCollectionRevision)
+    })
+
+    it('uses installedModulesRead then contextAssets at admission and publication, but degrades to legacy items when contextAssets is denied', async () => {
+        const granted = harness()
+        await granted.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        expect(granted.permissionCalls).toEqual([
+            'installedModulesRead', 'contextAssets', 'installedModulesRead', 'contextAssets',
+        ])
+
+        const denied = harness({ grants: ['installedModulesRead'] })
+        const page = await denied.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        expect(denied.permissionCalls).toEqual([
+            'installedModulesRead', 'contextAssets', 'installedModulesRead', 'contextAssets',
+        ])
+        expect(page.items).toHaveLength(2)
+        expect(page.items.every((item) => !('assetCount' in item) && !('assetCollectionRevision' in item))).toBe(true)
+    })
+
+    it('keeps no-count and denied-count capture revisions independent of module asset metadata', async () => {
+        const baseline = makeState()
+        const changed = structuredClone(baseline)
+        changed.installedModules[1].assets[0].storageRevision = 'storage:installed-ref:changed'
+
+        const firstNoCount = harness({ state: baseline })
+        const secondNoCount = harness({ state: changed })
+        const firstNoCountPage = await firstNoCount.service.listContextModules({
+            scope: 'installed', includeAssetCount: false, captureScope: 'query', limit: 100,
+        })
+        const secondNoCountPage = await secondNoCount.service.listContextModules({
+            scope: 'installed', includeAssetCount: false, captureScope: 'query', limit: 100,
+        })
+        expect(firstNoCount.permissionCalls).toEqual(['installedModulesRead', 'installedModulesRead'])
+        expect(secondNoCount.permissionCalls).toEqual(['installedModulesRead', 'installedModulesRead'])
+        expect(secondNoCountPage.captureRevision).toBe(firstNoCountPage.captureRevision)
+
+        const firstDenied = harness({ state: baseline, grants: ['installedModulesRead'] })
+        const secondDenied = harness({ state: changed, grants: ['installedModulesRead'] })
+        const firstDeniedPage = await firstDenied.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        const secondDeniedPage = await secondDenied.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        expect(firstDenied.permissionCalls).toEqual([
+            'installedModulesRead', 'contextAssets', 'installedModulesRead', 'contextAssets',
+        ])
+        expect(secondDenied.permissionCalls).toEqual(firstDenied.permissionCalls)
+        expect(secondDeniedPage.captureRevision).toBe(firstDeniedPage.captureRevision)
+        expect(secondDeniedPage.items.every((item) =>
+            !('assetCount' in item) && !('assetCollectionRevision' in item))).toBe(true)
+    })
+
+    it('downgrades to an asset-independent capture when count permission is revoked at publication', async () => {
+        const state = makeState()
+        const baseline = harness({ state })
+        const noCount = await baseline.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 100,
+        })
+
+        let countPermissionCalls = 0
+        const revoked = harness({
+            state,
+            onPermission(permission) {
+                if (permission !== 'contextAssets') return
+                countPermissionCalls += 1
+                if (countPermissionCalls === 2) {
+                    throw new PluginApiError('PERMISSION_DENIED', 'Count permission revoked')
+                }
+            },
+        })
+        const page = await revoked.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+
+        expect(revoked.permissionCalls).toEqual([
+            'installedModulesRead', 'contextAssets',
+            'installedModulesRead', 'contextAssets',
+        ])
+        expect(page.captureRevision).toBe(noCount.captureRevision)
+        expect(page.items.every((item) =>
+            !('assetCount' in item) && !('assetCollectionRevision' in item))).toBe(true)
+    })
+
+    it('returns zero module assets for unknown installed module IDs after the exact permission sequence', async () => {
+        const h = harness()
+        const page = await h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['missing'], include: ['module'],
+            captureScope: 'query', limit: 100,
+        })
+
+        expect(page.assets).toEqual([])
+        expect(h.permissionCalls).toEqual([
+            'contextAssets', 'installedModulesRead', 'contextAssets',
+            'contextAssets', 'installedModulesRead', 'contextAssets',
+        ])
+        expect(h.reads).not.toHaveBeenCalled()
+    })
+
+    it('normalizes module IDs and rejects empty, over-limit, and non-installed filters before storage reads', async () => {
+        const h = harness()
+        const omitted = await h.service.listContextAssets({
+            moduleScope: 'installed', captureScope: 'query', include: ['module'], limit: 100,
+        })
+        const explicitEmpty = await h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: [], captureScope: 'query', include: ['module'], limit: 100,
+        })
+        expect(omitted.assets.map((item) => item.origin)).toEqual([
+            { kind: 'module', moduleId: 'module-active' },
+            { kind: 'module', moduleId: 'module-installed' },
+        ])
+        expect(explicitEmpty.assets).toEqual([])
+
+        const filtered = await h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: [' module-installed ', 'module-active', 'module-installed'],
+            captureScope: 'query', include: ['portrait', 'module'], limit: 100,
+        })
+        expect(filtered.assets.map((item) => item.origin)).toEqual([
+            { kind: 'character', characterId: 'char-1' },
+            { kind: 'module', moduleId: 'module-active' },
+            { kind: 'module', moduleId: 'module-installed' },
+        ])
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: [' '], captureScope: 'query',
+        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed',
+            moduleIds: Array.from({ length: 101 }, (_, index) => `module-${index}`),
+            captureScope: 'query',
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed',
+            moduleIds: Array.from({ length: 101 }, () => ' module-installed '),
+            captureScope: 'query', include: ['module'], limit: 100,
+        })).resolves.toMatchObject({
+            assets: [{ origin: { kind: 'module', moduleId: 'module-installed' } }],
+        })
+        await expect(h.service.listContextAssets({
+            moduleScope: 'active', moduleIds: ['module-active'], captureScope: 'query',
+        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    })
+
+    it('runs the full installed permission sequence for an explicit empty module filter', async () => {
+        const h = harness()
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: [], include: ['module'], captureScope: 'query', limit: 100,
+        })).resolves.toMatchObject({ assets: [] })
+        expect(h.permissionCalls).toEqual([
+            'contextAssets', 'installedModulesRead', 'contextAssets',
+            'contextAssets', 'installedModulesRead', 'contextAssets',
+        ])
+    })
+
+    it('keeps omitted and explicit-empty module filters in distinct captured cursor identities', async () => {
+        const h = harness()
+        const omitted = await h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query', limit: 1,
+        })
+        expect(omitted.nextCursor).toBeTypeOf('string')
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: [], include: ['module'], captureScope: 'query',
+            cursor: omitted.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    })
+
+    it('stores only offset and capture revision, accepts a changed page limit, and rejects cursor query mismatch', async () => {
+        const state = makeState()
+        state.installedModules.push(moduleSource({
+            id: 'module-third', name: 'Third', assets: [asset('third', 'third', 'module')], activatedBy: [],
+        }))
+        const cursors = new CursorRegistry()
+        const commitCursor = vi.spyOn(cursors, 'commitPrepared')
+        const h = harness({ state, cursorRegistry: cursors })
+        const first = await h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(commitCursor.mock.calls[0]?.[1]).toEqual({
+            offset: 1,
+            captureRevision: first.captureRevision,
+        })
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 2, cursor: first.nextCursor,
+        })).resolves.toMatchObject({ items: [{ id: 'module-installed' }, { id: 'module-third' }] })
+
+        const mismatch = await h.service.listContextModules({ scope: 'installed', captureScope: 'query', limit: 1 })
+        await expect(h.service.listContextModules({
+            scope: 'active', captureScope: 'query', limit: 1, cursor: mismatch.nextCursor,
+        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    })
+
+    it('rejects a later module page when its capture expires during publication permission', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.installedModules.push(moduleSource({
+            id: 'module-third', name: 'Third', assets: [], activatedBy: [],
+        }))
+        let now = 0
+        let publicationGateArmed = false
+        let publicationPermissionCalls = 0
+        const captures = new QueryCaptureCache({ now: () => now, ttlMs: 10 })
+        const cursors = new CursorRegistry({ now: () => now, ttlMs: 100 })
+        const h = harness({
+            state,
+            principalId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            onPermission() {
+                if (!publicationGateArmed) return
+                publicationPermissionCalls += 1
+                if (publicationPermissionCalls === 2) now = 11
+            },
+        })
+        const first = await h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+        publicationGateArmed = true
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(publicationPermissionCalls).toBe(2)
+        expect(cursors.activeCount(principalId)).toBe(0)
+    })
+
+    it('preserves an unrelated capture when a later module page loses LRU residency', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.installedModules.push(moduleSource({
+            id: 'module-third', name: 'Third', assets: [], activatedBy: [],
+        }))
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry()
+        const unrelatedOwner = {
+            principalId,
+            service: 'context-assets' as const,
+            instanceId: 'unrelated-resident-capture',
+        }
+        const unrelatedQuery = { kind: 'unrelated-resident-query' }
+        let unrelatedRevision: string | undefined
+        let publicationGateArmed = false
+        let publicationPermissionCalls = 0
+        const h = harness({
+            state,
+            principalId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            async onPermission() {
+                if (!publicationGateArmed) return
+                publicationPermissionCalls += 1
+                if (publicationPermissionCalls === 2) {
+                    unrelatedRevision = (await captures.create(
+                        unrelatedOwner, unrelatedQuery, [{ id: 'unrelated-resident-item' }],
+                    )).captureRevision
+                }
+            },
+        })
+        const first = await h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+        publicationGateArmed = true
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(publicationPermissionCalls).toBe(2)
+        expect(cursors.activeCount(principalId)).toBe(0)
+        expect(unrelatedRevision).toBeTypeOf('string')
+        await expect(captures.read(
+            unrelatedOwner, unrelatedQuery, unrelatedRevision!,
+        )).resolves.toMatchObject({ items: [{ id: 'unrelated-resident-item' }] })
+    })
+
+    it('uses a cursorless final probe, performs no new asset reads, and fails closed on collection drift', async () => {
+        const h = harness()
+        const first = await h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['module-active'], captureScope: 'query', limit: 1,
+        })
+        const readsAfterCapture = h.reads.mock.calls.length
+        const probe = await h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['module-active'], captureScope: 'query',
+            captureRevision: first.captureRevision, limit: 1,
+        })
+        expect(probe.captureRevision).toBe(first.captureRevision)
+        expect(probe.assets).toHaveLength(1)
+        expect(h.reads).toHaveBeenCalledTimes(readsAfterCapture)
+
+        h.state.activeModules[0].assets[0].storageRevision = 'storage:module-ref:changed'
+        h.state.installedModules[0].assets[0].storageRevision = 'storage:module-ref:changed'
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['module-active'], captureScope: 'query',
+            captureRevision: first.captureRevision, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(h.reads).toHaveBeenCalledTimes(readsAfterCapture)
+    })
+
+    it('keeps an expected-revision final probe ephemeral and preserves unrelated module captures', async () => {
+        const state = makeState()
+        const secondActive = moduleSource({
+            id: 'module-second-active', name: 'Second active module', activatedBy: ['chat'],
+        })
+        state.activeModules.push(secondActive)
+        state.installedModules.splice(1, 0, secondActive)
+        const captures = new QueryCaptureCache()
+        const cursors = new CursorRegistry()
+        const h = harness({ state, queryCaptureCache: captures, cursorRegistry: cursors })
+
+        const expected = await h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 100,
+        })
+        const retained = await h.service.listContextModules({
+            scope: 'active', captureScope: 'query', limit: 1,
+        })
+        expect(retained.nextCursor).toBeTypeOf('string')
+
+        state.installedModules[2].name = 'Changed installed-only module'
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', captureRevision: expected.captureRevision, limit: 100,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+
+        await expect(h.service.listContextModules({
+            scope: 'active', captureScope: 'query', cursor: retained.nextCursor, limit: 1,
+        })).resolves.toMatchObject({ items: [{ id: 'module-second-active' }] })
+    })
+
+    it.each(['expired', 'evicted', 'wrong-owner'] as const)(
+        'rejects an %s module capture revision instead of returning an empty successful final probe',
+        async (scenario) => {
+            let now = 0
+            const state = makeState()
+            const captures = new QueryCaptureCache({
+                maxCapturesPerPrincipal: scenario === 'evicted' ? 1 : 64,
+                ttlMs: 10,
+                now: () => now,
+            })
+            const first = harness({
+                state,
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'final-probe-owner',
+                queryCaptureCache: captures,
+            })
+            const expected = await first.service.listContextModules({
+                scope: 'active', captureScope: 'query', limit: 1,
+            })
+
+            let probe = first
+            if (scenario === 'expired') {
+                now = 11
+            } else if (scenario === 'evicted') {
+                await first.service.listContextModules({
+                    scope: 'installed', captureScope: 'query', limit: 100,
+                })
+            } else {
+                probe = harness({
+                    state,
+                    principalId: '22222222-2222-4222-8222-222222222222',
+                    instanceId: 'wrong-final-probe-owner',
+                    queryCaptureCache: captures,
+                })
+            }
+
+            await expect(probe.service.listContextModules({
+                scope: 'active', captureScope: 'query', captureRevision: expected.captureRevision, limit: 1,
+            })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        },
+    )
+
+    it('returns the retained nonempty page for a valid matching module final probe', async () => {
+        const h = harness()
+        const expected = await h.service.listContextModules({
+            scope: 'active', captureScope: 'query', limit: 1,
+        })
+        await expect(h.service.listContextModules({
+            scope: 'active', captureScope: 'query', captureRevision: expected.captureRevision, limit: 1,
+        })).resolves.toMatchObject({
+            captureRevision: expected.captureRevision,
+            items: [{ id: 'module-active' }],
+        })
+    })
+
+    it('keeps an expected-revision asset probe ephemeral and preserves unrelated asset captures', async () => {
+        const captures = new QueryCaptureCache()
+        const cursors = new CursorRegistry()
+        const createCapture = vi.spyOn(captures, 'create')
+        const createCursor = vi.spyOn(cursors, 'create')
+        const h = harness({ queryCaptureCache: captures, cursorRegistry: cursors })
+
+        const expected = await h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['module-active'], captureScope: 'query', limit: 1,
+        })
+        const retained = await h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait', 'emotion', 'additional'],
+            captureScope: 'query', limit: 1,
+        })
+        expect(retained.nextCursor).toBeTypeOf('string')
+        const capturesBeforeProbe = createCapture.mock.calls.length
+        const cursorsBeforeProbe = createCursor.mock.calls.length
+        const handlesBeforeProbe = (h.service as any).issuedHandles.size
+
+        h.state.activeModules[0].assets[0].storageRevision = 'storage:module-ref:changed'
+        h.state.installedModules[0].assets[0].storageRevision = 'storage:module-ref:changed'
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['module-active'], captureScope: 'query',
+            captureRevision: expected.captureRevision, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+
+        expect(createCapture).toHaveBeenCalledTimes(capturesBeforeProbe)
+        expect(createCursor).toHaveBeenCalledTimes(cursorsBeforeProbe)
+        expect((h.service as any).issuedHandles.size).toBe(handlesBeforeProbe)
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait', 'emotion', 'additional'],
+            captureScope: 'query', cursor: retained.nextCursor, limit: 1,
+        })).resolves.toMatchObject({ assets: [{ role: 'emotion' }] })
+    })
+
+    it.each(['expired', 'evicted'] as const)(
+        'rejects a later asset page when its capture is %s during final permission without publishing staged state',
+        async (scenario) => {
+            const principalId = '11111111-1111-4111-8111-111111111111'
+            let now = 0
+            let publicationGateArmed = false
+            let publicationPermissionCalls = 0
+            const captures = new QueryCaptureCache({
+                now: () => now,
+                ttlMs: 10,
+                maxCapturesPerPrincipal: scenario === 'evicted' ? 1 : 64,
+            })
+            const cursors = new CursorRegistry({ now: () => now, ttlMs: 100 })
+            const unrelatedOwner = {
+                principalId,
+                service: 'context-modules' as const,
+                instanceId: 'unrelated-asset-resident-capture',
+            }
+            const unrelatedQuery = { kind: 'unrelated-asset-resident-query' }
+            let unrelatedRevision: string | undefined
+            const h = harness({
+                principalId,
+                queryCaptureCache: captures,
+                cursorRegistry: cursors,
+                async onPermission() {
+                    if (!publicationGateArmed) return
+                    publicationPermissionCalls += 1
+                    if (publicationPermissionCalls !== 5) return
+                    if (scenario === 'expired') now = 11
+                    else {
+                        unrelatedRevision = (await captures.create(
+                            unrelatedOwner, unrelatedQuery, [{ id: 'unrelated-resident-item' }],
+                        )).captureRevision
+                    }
+                },
+            })
+            const first = await h.service.listContextAssets({
+                moduleScope: 'installed', include: ['module'], captureScope: 'query', limit: 1,
+            })
+            const handlesBefore = (h.service as any).issuedHandles.size
+            publicationGateArmed = true
+
+            await expect(h.service.listContextAssets({
+                moduleScope: 'installed', include: ['module'], captureScope: 'query',
+                cursor: first.nextCursor, limit: 1,
+            })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+            expect(publicationPermissionCalls).toBe(9)
+            expect(cursors.activeCount(principalId)).toBe(0)
+            expect((h.service as any).issuedHandles.size).toBe(handlesBefore)
+            if (scenario === 'evicted') {
+                await expect(captures.read(unrelatedOwner, unrelatedQuery, unrelatedRevision!))
+                    .resolves.toMatchObject({ items: [{ id: 'unrelated-resident-item' }] })
+            }
+        },
+    )
+
+    it('prioritizes an expired later asset capture over final cursor saturation without clearing unrelated state', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.installedModules.push(moduleSource({
+            id: 'module-third',
+            name: 'Third installed module',
+            assets: [asset('third-ref', 'module-ref', 'module')],
+            activatedBy: [],
+        }))
+        let now = 0
+        let publicationGateArmed = false
+        let publicationPermissionCalls = 0
+        const captures = new QueryCaptureCache({ now: () => now, ttlMs: 10 })
+        const cursors = new CursorRegistry({ now: () => now, ttlMs: 100, maxPerPrincipal: 1 })
+        const unrelatedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'still-live-unrelated-capture',
+        }
+        const unrelatedQuery = { kind: 'still-live-unrelated-query' }
+        let unrelatedRevision: string | undefined
+        let unrelatedCursor: string | undefined
+        const h = harness({
+            state,
+            principalId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            async onPermission() {
+                if (!publicationGateArmed) return
+                publicationPermissionCalls += 1
+                if (publicationPermissionCalls !== 5) return
+                now = 11
+                unrelatedRevision = (await captures.create(
+                    unrelatedOwner, unrelatedQuery, [{ id: 'still-live-unrelated-item' }],
+                )).captureRevision
+                unrelatedCursor = await cursors.create(
+                    principalId, 'context-assets', unrelatedOwner.instanceId,
+                    unrelatedQuery, { offset: 1 },
+                )
+            },
+        })
+        const first = await h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query', limit: 1,
+        })
+        const handlesBefore = (h.service as any).issuedHandles.size
+        publicationGateArmed = true
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query',
+            cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(publicationPermissionCalls).toBe(9)
+        expect(cursors.activeCount(principalId)).toBe(1)
+        expect((h.service as any).issuedHandles.size).toBe(handlesBefore)
+        await expect(captures.read(unrelatedOwner, unrelatedQuery, unrelatedRevision!))
+            .resolves.toMatchObject({ items: [{ id: 'still-live-unrelated-item' }] })
+        await expect(cursors.read(
+            unrelatedCursor!, principalId, 'context-assets', unrelatedOwner.instanceId, unrelatedQuery,
+        )).resolves.toEqual({ offset: 1 })
+    })
+
+    it('prioritizes an evicted later asset capture over an oversized response without clearing unrelated state', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.installedModules[1].assets[0].name = 'x'.repeat(524_289)
+        let publicationGateArmed = false
+        let publicationPermissionCalls = 0
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry()
+        const unrelatedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'oversized-unrelated-capture',
+        }
+        const unrelatedQuery = { kind: 'oversized-unrelated-query' }
+        let unrelatedRevision: string | undefined
+        const h = harness({
+            state,
+            principalId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            async onPermission() {
+                if (!publicationGateArmed) return
+                publicationPermissionCalls += 1
+                if (publicationPermissionCalls !== 5) return
+                unrelatedRevision = (await captures.create(
+                    unrelatedOwner, unrelatedQuery, [{ id: 'oversized-unrelated-item' }],
+                )).captureRevision
+            },
+        })
+        const first = await h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query', limit: 1,
+        })
+        const handlesBefore = (h.service as any).issuedHandles.size
+        publicationGateArmed = true
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query',
+            cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(publicationPermissionCalls).toBe(9)
+        expect(cursors.activeCount(principalId)).toBe(0)
+        expect((h.service as any).issuedHandles.size).toBe(handlesBefore)
+        await expect(captures.read(unrelatedOwner, unrelatedQuery, unrelatedRevision!))
+            .resolves.toMatchObject({ items: [{ id: 'oversized-unrelated-item' }] })
+    })
+
+    it('rejects an asset page when permission generation resets after the final async collection probe', async () => {
+        const cursors = new CursorRegistry()
+        let permissionGeneration = 0
+        let reset = false
+        const h = harness({
+            cursorRegistry: cursors,
+            getPermissionGeneration: () => permissionGeneration,
+            adapterOverrides: {
+                revalidateAssetCollection: async () => {
+                    if (!reset) {
+                        reset = true
+                        permissionGeneration += 1
+                    }
+                },
+            },
+        })
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'ABORTED', retryable: false })
+        expect(reset).toBe(true)
+        expect(cursors.activeCount((h.service as any).context.principalId)).toBe(0)
+        expect((h.service as any).issuedHandles.size).toBe(0)
+    })
+
+    it('publishes no module cache or cursor when the aggregate first-page result exceeds its limit', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.activeModules = [
+            moduleSource({ id: 'active-first', name: 'Active first', assets: [] }),
+            moduleSource({ id: 'active-second', name: 'Active second', assets: [] }),
+        ]
+        const largeDescription = 'x'.repeat(500_000)
+        state.installedModules = Array.from({ length: 6 }, (_, index) => moduleSource({
+            id: `large-${index}`,
+            name: `Large ${index}`,
+            description: largeDescription,
+            assets: [],
+            activatedBy: [],
+        }))
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry({ maxPerPrincipal: 4 })
+        const h = harness({ state, principalId, queryCaptureCache: captures, cursorRegistry: cursors })
+        const retained = await h.service.listContextModules({
+            scope: 'active', captureScope: 'query', limit: 1,
+        })
+        expect(retained.nextCursor).toBeTypeOf('string')
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 5,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+
+        expect(cursors.activeCount(principalId)).toBe(1)
+        await expect(h.service.listContextModules({
+            scope: 'active', captureScope: 'query', cursor: retained.nextCursor, limit: 1,
+        })).resolves.toMatchObject({ items: [{ id: 'active-second' }] })
+    })
+
+    it('preserves unrelated module state when first-page cursor capacity rejects publication', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.activeModules = [
+            moduleSource({ id: 'active-first', name: 'Active first', assets: [] }),
+            moduleSource({ id: 'active-second', name: 'Active second', assets: [] }),
+        ]
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry({ maxPerPrincipal: 1 })
+        const h = harness({ state, principalId, queryCaptureCache: captures, cursorRegistry: cursors })
+        const retained = await h.service.listContextModules({
+            scope: 'active', captureScope: 'query', limit: 1,
+        })
+        expect(retained.nextCursor).toBeTypeOf('string')
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT', retryable: true })
+
+        expect(cursors.activeCount(principalId)).toBe(1)
+        await expect(h.service.listContextModules({
+            scope: 'active', captureScope: 'query', cursor: retained.nextCursor, limit: 1,
+        })).resolves.toMatchObject({ items: [{ id: 'active-second' }] })
+    })
+
+    it('preserves unrelated module state when cursor lifecycle invalidates first-page publication', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const instanceId = 'transaction-lifecycle-instance'
+        const state = makeState()
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry({ maxPerPrincipal: 4 })
+        const retainedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'retained-instance',
+        }
+        const retainedQuery = { kind: 'retained-module-query' }
+        const retainedCapture = await captures.create(
+            retainedOwner, retainedQuery, [{ id: 'retained-module' }],
+        )
+        const retainedCursor = await cursors.create(
+            principalId, 'context-modules', retainedOwner.instanceId,
+            retainedQuery, { offset: 1 },
+        )
+        const h = harness({
+            state,
+            principalId,
+            instanceId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            adapterOverrides: {
+                captureModuleSourcesSynchronously(input) {
+                    cursors.clearInstance(principalId, instanceId)
+                    return {
+                        selectors: { characterId: 'char-1', conversationId: 'conversation-1' },
+                        modules: structuredClone(
+                            input.scope === 'installed' ? state.installedModules : state.activeModules,
+                        ),
+                    }
+                },
+            },
+        })
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'ABORTED' })
+
+        await expect(captures.read(
+            retainedOwner, retainedQuery, retainedCapture.captureRevision,
+        )).resolves.toMatchObject({ items: [{ id: 'retained-module' }] })
+        await expect(cursors.read(
+            retainedCursor,
+            principalId,
+            'context-modules',
+            retainedOwner.instanceId,
+            retainedQuery,
+        )).resolves.toEqual({ offset: 1 })
+    })
+
+    it('rejects module publication when permission generation resets after authorize resolves', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const instanceId = 'post-authorize-generation-instance'
+        const state = makeState()
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry({ maxPerPrincipal: 4 })
+        const retainedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'retained-generation-instance',
+        }
+        const retainedQuery = { kind: 'retained-generation-query' }
+        const retainedCapture = await captures.create(
+            retainedOwner, retainedQuery, [{ id: 'retained-module' }],
+        )
+        const retainedCursor = await cursors.create(
+            principalId, 'context-modules', retainedOwner.instanceId,
+            retainedQuery, { offset: 1 },
+        )
+        let permissionGeneration = 0
+        let generationReads = 0
+        const h = harness({
+            state,
+            principalId,
+            instanceId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            getPermissionGeneration() {
+                generationReads += 1
+                const observed = permissionGeneration
+                if (generationReads === 6) {
+                    queueMicrotask(() => { permissionGeneration += 1 })
+                }
+                return observed
+            },
+        })
+
+        const outcome = await h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        }).then(
+            () => ({ code: 'RESOLVED' }),
+            (error: PluginApiError) => ({ code: error.code, retryable: error.retryable }),
+        )
+
+        expect(permissionGeneration).toBe(1)
+        expect(outcome).toEqual({ code: 'ABORTED', retryable: false })
+        expect(cursors.activeCount(principalId)).toBe(1)
+        await expect(captures.read(
+            retainedOwner, retainedQuery, retainedCapture.captureRevision,
+        )).resolves.toMatchObject({ items: [{ id: 'retained-module' }] })
+        await expect(cursors.read(
+            retainedCursor,
+            principalId,
+            'context-modules',
+            retainedOwner.instanceId,
+            retainedQuery,
+        )).resolves.toEqual({ offset: 1 })
+    })
+
+    it('clears instance captures and cursors on permission-generation change and dispose', async () => {
+        let permissionGeneration = 0
+        const captures = new QueryCaptureCache()
+        const cursors = new CursorRegistry()
+        const h = harness({
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            getPermissionGeneration: () => permissionGeneration,
+        })
+        const first = await h.service.listContextModules({ scope: 'installed', captureScope: 'query', limit: 1 })
+        permissionGeneration += 1
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1, cursor: first.nextCursor,
+        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+
+        const second = await h.service.listContextModules({ scope: 'installed', captureScope: 'query', limit: 1 })
+        h.service.dispose()
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1, cursor: second.nextCursor,
+        })).rejects.toMatchObject({ code: 'ABORTED' })
+        await expect(captures.read(
+            { principalId: (h.service as any).context.principalId, service: 'context-modules', instanceId: (h.service as any).context.instanceId },
+            {
+                kind: 'modules-capture', scope: 'installed', characterId: null, conversationId: null,
+                includeAssetCount: false, serviceGeneration: 1,
+            },
+            second.captureRevision,
+        )).rejects.toMatchObject({ code: 'CONFLICT' })
+    })
+
+    it('rolls back staged asset handles and captures when first-capture materialization fails or is cancelled', async () => {
+        let fail = true
+        let probes = 0
+        const state = makeState()
+        const located = state.characters[0].assets.map((source) => ({
+            source: { ...source },
+            origin: { kind: 'character' as const, characterId: 'char-1' },
+        }))
+        const abortController = new AbortController()
+        const h = harness({
+            state,
+            abortController,
+            adapterOverrides: {
+                captureAssetSources: async () => ({
+                    selectors: { characterId: 'char-1', conversationId: 'conversation-1' },
+                    assets: located.map(({ source, origin }) => ({ source: { ...source }, origin: { ...origin } })),
+                }),
+                revalidateAssetSource: async ({ located: candidate }) => {
+                    probes += 1
+                    if (fail && probes > 3) {
+                        throw new PluginApiError('PERMISSION_DENIED', 'Injected permission drift')
+                    }
+                    return candidate.source
+                },
+            },
+        })
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+        expect((h.service as any).issuedHandles.size).toBe(0)
+
+        fail = false
+        probes = 0
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })).resolves.toMatchObject({ assets: [expect.any(Object)] })
+        expect((h.service as any).issuedHandles.size).toBeGreaterThan(0)
+
+        const cancelled = harness({
+            abortController: new AbortController(),
+            readAsset: async () => {
+                cancelled.service.dispose()
+                return new Uint8Array([1])
+            },
+        })
+        await expect(cancelled.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'ABORTED' })
+        expect((cancelled.service as any).issuedHandles.size).toBe(0)
+    })
+
+    it('fails a queued capture on permission-generation drift before physical I/O', async () => {
+        const coordinator = new ContextAssetReadCoordinator()
+        const blockers = await occupyAllReadPermits(coordinator, 'queued-generation-principal')
+        let permissionGeneration = 0
+        const h = harness({
+            principalId: 'queued-generation-principal',
+            readCoordinator: coordinator,
+            getPermissionGeneration: () => permissionGeneration,
+        })
+        const pending = h.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        permissionGeneration += 1
+        blockers.releaseOne()
+
+        await expect(pending).rejects.toMatchObject({ code: 'ABORTED' })
+        expect(h.reads).not.toHaveBeenCalled()
+        await blockers.releaseAll()
     })
 })

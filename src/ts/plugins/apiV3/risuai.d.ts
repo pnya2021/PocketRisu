@@ -1316,6 +1316,8 @@ interface ContextModuleSnapshot extends ActiveModuleSummary {
     revision: Revision;
     description: string;
     lorebook: ContextLoreSnapshot[];
+    assetCount?: number;
+    assetCollectionRevision?: Revision;
 }
 
 interface CursorPage<T> {
@@ -2455,6 +2457,9 @@ interface RisuaiPluginAPI {
         include?: ContextAssetRole[];
         moduleScope?: 'active' | 'installed' | 'none';
         mediaTypes?: string[];
+        moduleIds?: string[];
+        captureScope?: 'query';
+        captureRevision?: Revision;
         cursor?: string;
         limit?: number;
         signal?: AbortSignal;
@@ -2462,6 +2467,7 @@ interface RisuaiPluginAPI {
         contextRevision: Revision;
         assets: ContextAssetRef[];
         nextCursor?: string;
+        captureRevision?: Revision;
     }>;
 
     /** Returns unpaged summaries for the modules active in the authorized context. */
@@ -2475,9 +2481,12 @@ interface RisuaiPluginAPI {
         characterId?: CharacterId;
         conversationId?: ConversationId;
         scope?: 'active' | 'installed';
+        includeAssetCount?: boolean;
+        captureScope?: 'query';
+        captureRevision?: Revision;
         cursor?: string;
         limit?: number;
-    }): Promise<CursorPage<ContextModuleSnapshot>>;
+    }): Promise<CursorPage<ContextModuleSnapshot> & { captureRevision?: Revision }>;
 
     /** Reads an opaque context resource after re-authorizing its current origin. */
     readContextAsset(assetId: string, options?: {

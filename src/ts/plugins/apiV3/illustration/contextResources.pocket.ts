@@ -4,15 +4,45 @@ import type {
     BoundedThumbnailResult,
     CharacterTextSection,
     ContextAssetSource,
+    ContextAssetCollectionInput,
+    ContextAssetCollectionProbe,
+    ContextAssetSourceProbe,
     ContextCharacterSource,
     ContextHostState,
     ContextLoreSnapshot,
+    ContextModuleCollection,
     ContextModuleSource,
+    ContextModuleCollectionInput,
+    ContextModuleCollectionProbe,
+    ContextModulePageProbe,
+    ContextModuleSourceProbe,
     ContextResourceAdapter,
 } from './contextResources'
 import type { ModuleActivationReason } from './moduleActivation'
 
 type UnknownRecord = Record<string, any>
+
+interface ModuleSourceLocator {
+    scope: 'active' | 'installed'
+    ownerId: string
+    rawSlotIndex: number
+    lorebookFingerprint?: string
+}
+
+interface AssetSourceLocator {
+    ownerKind: 'character' | 'module'
+    ownerId: string
+    ownerRawSlotIndex: number
+    rawCollection: 'image' | 'emotionImages' | 'additionalAssets' | 'ccAssets' | 'assets'
+    rawSlotIndex: number
+    storageKey: string
+    storageRevision: string
+}
+
+interface ProjectionContext {
+    getStorageRevision(storageKey: string): string
+    attachAsset(source: ContextAssetSource, locator: Omit<AssetSourceLocator, 'storageKey' | 'storageRevision'>): void
+}
 
 export interface PocketContextAdapterDependencies {
     getDatabase(): { characters?: UnknownRecord[]; modules?: UnknownRecord[] }
@@ -100,6 +130,7 @@ const makeAsset = (
     storageKey: string,
     name: string,
     explicitExtension?: string,
+    storageRevision = storageKey,
 ): ContextAssetSource | null => {
     if (!isCanonicalLocalAssetStorageKey(storageKey)) return null
     const declaredExtension = explicitExtension?.replace(/^\./, '').toLowerCase()
@@ -108,7 +139,7 @@ const makeAsset = (
     return {
         identity: `${ownerKind}:${ownerId}:${storageKey}`,
         storageKey,
-        storageRevision: storageKey,
+        storageRevision,
         name,
         ...(extension ? { extension } : {}),
         ...(mediaTypeOf(extension) ? { mediaType: mediaTypeOf(extension) } : {}),
@@ -116,18 +147,40 @@ const makeAsset = (
     }
 }
 
-const mapCharacterAssets = (character: UnknownRecord, id: string): ContextAssetSource[] => {
+const mapCharacterAssets = (
+    character: UnknownRecord,
+    id: string,
+    ownerRawSlotIndex = -1,
+    context?: ProjectionContext,
+): ContextAssetSource[] => {
     const assets: ContextAssetSource[] = []
+    const retain = (
+        asset: ContextAssetSource | null,
+        rawCollection: AssetSourceLocator['rawCollection'],
+        rawSlotIndex: number,
+    ) => {
+        if (!asset) return
+        context?.attachAsset(asset, {
+            ownerKind: 'character', ownerId: id, ownerRawSlotIndex, rawCollection, rawSlotIndex,
+        })
+        assets.push(asset)
+    }
     if (nonEmptyString(character.image)) {
-        const asset = makeAsset('character', id, 'portrait', character.image, `${character.name || id}.${extensionOf(character.image) || 'png'}`)
-        if (asset) assets.push(asset)
+        retain(makeAsset(
+            'character', id, 'portrait', character.image,
+            `${character.name || id}.${extensionOf(character.image) || 'png'}`,
+            undefined,
+            context?.getStorageRevision(character.image),
+        ), 'image', 0)
     }
     if (Array.isArray(character.emotionImages)) {
         character.emotionImages.forEach((entry: unknown, index: number) => {
             if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return
             const name = nonEmptyString(entry[0]) ? entry[0] : `emotion-${index}`
-            const asset = makeAsset('character', id, 'emotion', entry[1], `${name}.${extensionOf(entry[1]) || 'png'}`)
-            if (asset) assets.push(asset)
+            retain(makeAsset(
+                'character', id, 'emotion', entry[1], `${name}.${extensionOf(entry[1]) || 'png'}`,
+                undefined, context?.getStorageRevision(entry[1]),
+            ), 'emotionImages', index)
         })
     }
     if (Array.isArray(character.additionalAssets)) {
@@ -135,8 +188,10 @@ const mapCharacterAssets = (character: UnknownRecord, id: string): ContextAssetS
             if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return
             const name = nonEmptyString(entry[0]) ? entry[0] : `additional-${index}`
             const extension = nonEmptyString(entry[2]) ? entry[2] : undefined
-            const asset = makeAsset('character', id, 'additional', entry[1], name, extension)
-            if (asset) assets.push(asset)
+            retain(makeAsset(
+                'character', id, 'additional', entry[1], name, extension,
+                context?.getStorageRevision(entry[1]),
+            ), 'additionalAssets', index)
         })
     }
     if (Array.isArray(character.ccAssets)) {
@@ -144,14 +199,85 @@ const mapCharacterAssets = (character: UnknownRecord, id: string): ContextAssetS
             if (!nonEmptyString(entry?.uri)) return
             const name = nonEmptyString(entry?.name) ? entry.name : `card-asset-${index}`
             const extension = nonEmptyString(entry?.ext) ? entry.ext : extensionOf(entry.uri)
-            const asset = makeAsset('character', id, 'additional', entry.uri, name, extension)
-            if (asset) assets.push(asset)
+            retain(makeAsset(
+                'character', id, 'additional', entry.uri, name, extension,
+                context?.getStorageRevision(entry.uri),
+            ), 'ccAssets', index)
         })
     }
     return assets
 }
 
-const mapCharacter = (character: UnknownRecord): ContextCharacterSource | null => {
+const mapCharacterAssetAt = (
+    character: UnknownRecord,
+    locator: AssetSourceLocator,
+    context?: ProjectionContext,
+) => {
+    const id = character.chaId
+    if (!nonEmptyString(id)) return null
+    const attach = (asset: ContextAssetSource | null) => {
+        if (asset) context?.attachAsset(asset, {
+            ownerKind: locator.ownerKind,
+            ownerId: locator.ownerId,
+            ownerRawSlotIndex: locator.ownerRawSlotIndex,
+            rawCollection: locator.rawCollection,
+            rawSlotIndex: locator.rawSlotIndex,
+        })
+        return asset
+    }
+    switch (locator.rawCollection) {
+        case 'image': {
+            if (!nonEmptyString(character.image)) return null
+            const asset = makeAsset(
+                'character', id, 'portrait', character.image,
+                `${character.name || id}.${extensionOf(character.image) || 'png'}`,
+                undefined, context?.getStorageRevision(character.image),
+            )
+            return attach(asset)
+        }
+        case 'emotionImages': {
+            const entry = Array.isArray(character.emotionImages)
+                ? character.emotionImages[locator.rawSlotIndex] : undefined
+            if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return null
+            const name = nonEmptyString(entry[0]) ? entry[0] : `emotion-${locator.rawSlotIndex}`
+            const asset = makeAsset(
+                'character', id, 'emotion', entry[1], `${name}.${extensionOf(entry[1]) || 'png'}`,
+                undefined, context?.getStorageRevision(entry[1]),
+            )
+            return attach(asset)
+        }
+        case 'additionalAssets': {
+            const entry = Array.isArray(character.additionalAssets)
+                ? character.additionalAssets[locator.rawSlotIndex] : undefined
+            if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return null
+            const name = nonEmptyString(entry[0]) ? entry[0] : `additional-${locator.rawSlotIndex}`
+            const extension = nonEmptyString(entry[2]) ? entry[2] : undefined
+            const asset = makeAsset(
+                'character', id, 'additional', entry[1], name, extension,
+                context?.getStorageRevision(entry[1]),
+            )
+            return attach(asset)
+        }
+        case 'ccAssets': {
+            const entry = Array.isArray(character.ccAssets) ? character.ccAssets[locator.rawSlotIndex] : undefined
+            if (!entry || !nonEmptyString(entry.uri)) return null
+            const name = nonEmptyString(entry.name) ? entry.name : `card-asset-${locator.rawSlotIndex}`
+            const extension = nonEmptyString(entry.ext) ? entry.ext : extensionOf(entry.uri)
+            const asset = makeAsset(
+                'character', id, 'additional', entry.uri, name, extension,
+                context?.getStorageRevision(entry.uri),
+            )
+            return attach(asset)
+        }
+        default: return null
+    }
+}
+
+const mapCharacter = (
+    character: UnknownRecord,
+    ownerRawSlotIndex = -1,
+    context?: ProjectionContext,
+): ContextCharacterSource | null => {
     if (!nonEmptyString(character?.chaId) || typeof character?.name !== 'string') return null
     const type = character.type === 'group' ? 'group' : 'character'
     return {
@@ -163,21 +289,42 @@ const mapCharacter = (character: UnknownRecord): ContextCharacterSource | null =
         ...(type === 'group' && Array.isArray(character.characters)
             ? { groupMemberIds: character.characters.filter(nonEmptyString) }
             : {}),
-        assets: mapCharacterAssets(character, character.chaId),
+        assets: mapCharacterAssets(character, character.chaId, ownerRawSlotIndex, context),
     }
+}
+
+const mapModuleAssetAt = (
+    module: UnknownRecord,
+    ownerRawSlotIndex: number,
+    rawSlotIndex: number,
+    context?: ProjectionContext,
+) => {
+    const entry = Array.isArray(module.assets) ? module.assets[rawSlotIndex] : undefined
+    if (!Array.isArray(entry) || !nonEmptyString(entry[1]) || !nonEmptyString(module.id)) return null
+    const name = nonEmptyString(entry[0]) ? entry[0] : `module-asset-${rawSlotIndex}`
+    const extension = nonEmptyString(entry[2]) ? entry[2] : undefined
+    const asset = makeAsset(
+        'module', module.id, 'module', entry[1], name, extension,
+        context?.getStorageRevision(entry[1]),
+    )
+    if (asset) context?.attachAsset(asset, {
+        ownerKind: 'module', ownerId: module.id, ownerRawSlotIndex,
+        rawCollection: 'assets', rawSlotIndex,
+    })
+    return asset
 }
 
 const mapModule = (
     module: UnknownRecord,
     activatedBy: ModuleActivationReason[],
+    ownerRawSlotIndex = -1,
+    context?: ProjectionContext,
+    includeAssets = true,
 ): ContextModuleSource | null => {
     if (!nonEmptyString(module?.id) || !nonEmptyString(module?.name)) return null
-    const assets = Array.isArray(module.assets)
-        ? module.assets.flatMap((entry: unknown, index: number) => {
-            if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return []
-            const name = nonEmptyString(entry[0]) ? entry[0] : `module-asset-${index}`
-            const extension = nonEmptyString(entry[2]) ? entry[2] : undefined
-            const asset = makeAsset('module', module.id, 'module', entry[1], name, extension)
+    const assets = includeAssets && Array.isArray(module.assets)
+        ? module.assets.flatMap((_entry: unknown, index: number) => {
+            const asset = mapModuleAssetAt(module, ownerRawSlotIndex, index, context)
             return asset ? [asset] : []
         })
         : []
@@ -208,32 +355,323 @@ const assertNotAborted = (signal?: AbortSignal) => {
 export function createPocketContextResourceAdapter(
     dependencies: PocketContextAdapterDependencies,
 ): ContextResourceAdapter {
+    const moduleLocators = new WeakMap<ContextModuleSource, ModuleSourceLocator>()
+    const moduleAssetMetadataSources = new WeakSet<ContextModuleSource>()
+    const assetLocators = new WeakMap<ContextAssetSource, AssetSourceLocator>()
+    const projectionContext: ProjectionContext = {
+        getStorageRevision: (storageKey) => dependencies.getAssetStorageRevision?.(storageKey) ?? storageKey,
+        attachAsset(source, locator) {
+            assetLocators.set(source, {
+                ...locator,
+                storageKey: source.storageKey,
+                storageRevision: source.storageRevision ?? source.storageKey,
+            })
+        },
+    }
+    const changed = () => new PluginApiError(
+        'CONFLICT', 'Current context changed while the operation was running', { retryable: true },
+    )
+    const stableHydrations = new WeakMap<UnknownRecord, {
+        chatPage: string | number
+        chat: UnknownRecord | undefined
+    }>()
+    const hydrateStableCurrent = async (signal?: AbortSignal) => {
+        for (let attempt = 0; attempt < 4; attempt++) {
+            assertNotAborted(signal)
+            const currentCharacter = dependencies.getCurrentCharacter()
+            if (!currentCharacter) return {
+                currentCharacter: undefined,
+                currentChat: undefined,
+            }
+            const chatPage = currentCharacter.chatPage as string | number
+            const currentChat = await dependencies.hydrateCurrentChat(currentCharacter)
+            assertNotAborted(signal)
+            if (dependencies.getCurrentCharacter() === currentCharacter
+                && currentCharacter.chatPage === chatPage
+                && (!currentChat || currentCharacter.chats?.[chatPage] === currentChat)) {
+                stableHydrations.set(currentCharacter, { chatPage, chat: currentChat })
+                return { currentCharacter, currentChat }
+            }
+        }
+        throw new PluginApiError('CONFLICT', 'Current context changed repeatedly during hydration', {
+            retryable: true,
+        })
+    }
+    const stableCurrentSynchronously = () => {
+        const currentCharacter = dependencies.getCurrentCharacter()
+        if (!currentCharacter) return {
+            currentCharacter: undefined,
+            currentChat: undefined,
+        }
+        const stable = stableHydrations.get(currentCharacter)
+        if (!stable
+            || currentCharacter.chatPage !== stable.chatPage
+            || (stable.chat && currentCharacter.chats?.[stable.chatPage] !== stable.chat)) throw changed()
+        return { currentCharacter, currentChat: stable.chat }
+    }
+    const selectorsFrom = (
+        currentCharacter: UnknownRecord | undefined,
+        currentChat: UnknownRecord | undefined,
+        characterId: string | undefined,
+        conversationId: string | undefined,
+        allowMissing: boolean,
+    ) => {
+        if (!currentCharacter || !currentChat) {
+            if (allowMissing && characterId === undefined && conversationId === undefined) {
+                return { characterId: null, conversationId: null }
+            }
+            throw new PluginApiError('NOT_FOUND', 'No current character or conversation')
+        }
+        if (!nonEmptyString(currentCharacter.chaId) || !nonEmptyString(currentChat.id)) {
+            throw new PluginApiError('INTERNAL', 'Current context IDs were not normalized during database load')
+        }
+        const authorized = new Set([currentCharacter.chaId])
+        if (currentCharacter.type === 'group' && Array.isArray(currentCharacter.characters)) {
+            const validCharacterIds = new Set((dependencies.getDatabase().characters ?? []).flatMap((character) =>
+                character?.type !== 'group'
+                    && nonEmptyString(character?.chaId)
+                    && typeof character?.name === 'string'
+                    ? [character.chaId] : []))
+            for (const memberId of currentCharacter.characters) {
+                if (nonEmptyString(memberId) && validCharacterIds.has(memberId)) authorized.add(memberId)
+            }
+        }
+        const selectedCharacterId = characterId ?? currentCharacter.chaId
+        const selectedConversationId = conversationId ?? currentChat.id
+        if (!authorized.has(selectedCharacterId)) {
+            throw new PluginApiError('PERMISSION_DENIED', 'Character is outside the current context')
+        }
+        if (selectedConversationId !== currentChat.id) {
+            throw new PluginApiError('PERMISSION_DENIED', 'Conversation is outside the current context')
+        }
+        return { characterId: selectedCharacterId, conversationId: selectedConversationId }
+    }
+    const selectorsFor = async (
+        characterId: string | undefined,
+        conversationId: string | undefined,
+        allowMissing: boolean,
+        signal?: AbortSignal,
+    ) => {
+        const { currentCharacter, currentChat } = await hydrateStableCurrent(signal)
+        assertNotAborted(signal)
+        return selectorsFrom(currentCharacter, currentChat, characterId, conversationId, allowMissing)
+    }
+    const selectorsForSynchronously = (
+        characterId: string | undefined,
+        conversationId: string | undefined,
+        allowMissing: boolean,
+    ) => {
+        const { currentCharacter, currentChat } = stableCurrentSynchronously()
+        return selectorsFrom(currentCharacter, currentChat, characterId, conversationId, allowMissing)
+    }
+    const sameSource = (left: ContextAssetSource, right: ContextAssetSource) =>
+        JSON.stringify(left) === JSON.stringify(right)
+    const sameSelectors = (
+        left: { characterId: string | null; conversationId: string | null },
+        right: { characterId: string | null; conversationId: string | null },
+    ) => left.characterId === right.characterId && left.conversationId === right.conversationId
+    const assetShapeKey = (
+        source: ContextAssetSource,
+        origin: { kind: 'character'; characterId: string } | { kind: 'module'; moduleId: string },
+    ) => JSON.stringify([
+        origin.kind,
+        origin.kind === 'character' ? origin.characterId : origin.moduleId,
+        source.identity,
+        source.storageKey,
+        source.name,
+        source.extension ?? null,
+        source.mediaType ?? null,
+        source.byteLength ?? null,
+        source.role,
+    ])
+    const rawLorebookFingerprint = (module: UnknownRecord) => {
+        const descriptor = Object.getOwnPropertyDescriptor(module, 'lorebook')
+        return descriptor && 'value' in descriptor ? JSON.stringify(descriptor.value) : undefined
+    }
+    const currentModuleRecords = (scope: 'active' | 'installed') => {
+        const activeRecords = dependencies.getActiveModulesWithReasons()
+        const activeById = new Map(activeRecords.flatMap(({ module, activatedBy }) =>
+            nonEmptyString(module?.id) ? [[module.id, activatedBy] as const] : []))
+        return scope === 'installed'
+            ? (dependencies.getDatabase().modules ?? []).map((module, rawSlotIndex) => ({
+                module, activatedBy: activeById.get(module?.id) ?? [], rawSlotIndex,
+            }))
+            : activeRecords.map(({ module, activatedBy }, rawSlotIndex) => ({
+                module, activatedBy, rawSlotIndex,
+            }))
+    }
+    const revalidateModuleRecord = (
+        source: ContextModuleSource,
+        locator: ModuleSourceLocator,
+        raw: UnknownRecord | undefined,
+        activatedBy: ModuleActivationReason[],
+        includeAssetMetadata: boolean,
+        signal?: AbortSignal,
+    ) => {
+        if (!raw || raw.id !== locator.ownerId) throw changed()
+        const namespace = nonEmptyString(raw.namespace) ? raw.namespace : undefined
+        const description = typeof raw.description === 'string' ? raw.description : ''
+        const currentAssets = includeAssetMetadata && Array.isArray(raw.assets)
+            ? raw.assets.flatMap((_entry: unknown, index: number) => {
+                assertNotAborted(signal)
+                const current = mapModuleAssetAt(raw, locator.rawSlotIndex, index, projectionContext)
+                return current ? [current] : []
+            })
+            : []
+        if (raw.name !== source.name
+            || namespace !== source.namespace
+            || description !== source.description
+            || JSON.stringify(activatedBy) !== JSON.stringify(source.activatedBy)
+            || (includeAssetMetadata && (currentAssets.length !== source.assets.length
+                || currentAssets.some((current, index) => !sameSource(current, source.assets[index]))))
+            || (locator.lorebookFingerprint !== undefined
+                && rawLorebookFingerprint(raw) !== locator.lorebookFingerprint)) throw changed()
+    }
+    const currentAssetShape = async (probe: ContextAssetCollectionProbe) => {
+        const selectors = await selectorsFor(
+            probe.input.characterIds[0], probe.input.conversationId || undefined, false, probe.input.signal,
+        ) as { characterId: string; conversationId: string }
+        if (!sameSelectors(selectors, probe.selectors)) throw changed()
+        const { currentCharacter } = stableCurrentSynchronously()
+        const database = dependencies.getDatabase()
+        const entries: string[] = []
+        if (probe.input.include.some((role) => role !== 'module')) {
+            for (const characterId of probe.input.characterIds) {
+                const rawSlotIndex = (database.characters ?? [])
+                    .findIndex((character) => character?.chaId === characterId)
+                const raw = rawSlotIndex >= 0
+                    ? database.characters![rawSlotIndex]
+                    : currentCharacter?.chaId === characterId ? currentCharacter : undefined
+                if (!raw) throw changed()
+                for (const source of mapCharacterAssets(raw, characterId, rawSlotIndex)) {
+                    if (probe.input.include.includes(source.role)) {
+                        entries.push(assetShapeKey(source, { kind: 'character', characterId }))
+                    }
+                }
+            }
+        }
+        if (probe.input.include.includes('module') && probe.input.moduleScope !== 'none') {
+            const records = currentModuleRecords(probe.input.moduleScope)
+                .filter(({ module }) => !probe.input.moduleIdsSpecified
+                    || probe.input.moduleIds.includes(module?.id))
+            for (const { module, rawSlotIndex } of records) {
+                if (!nonEmptyString(module?.id) || !Array.isArray(module.assets)) continue
+                for (let index = 0; index < module.assets.length; index++) {
+                    const source = mapModuleAssetAt(module, rawSlotIndex, index)
+                    if (source) entries.push(assetShapeKey(source, { kind: 'module', moduleId: module.id }))
+                }
+            }
+        }
+        return entries
+    }
+
+    const captureModuleSourcesFrom = (
+        input: ContextModuleCollectionInput,
+        includeAssetMetadata: boolean,
+        selectors: ContextModuleCollection['selectors'],
+    ): ContextModuleCollection => {
+        assertNotAborted(input.signal)
+        if (input.scope !== 'active' && input.scope !== 'installed') {
+            throw new PluginApiError('INVALID_ARGUMENT', 'Invalid module scope')
+        }
+        const activeRecords = dependencies.getActiveModulesWithReasons()
+        const activeById = new Map(activeRecords.flatMap(({ module, activatedBy }) =>
+            nonEmptyString(module?.id) ? [[module.id, activatedBy] as const] : []))
+        const records = input.scope === 'installed'
+            ? (dependencies.getDatabase().modules ?? []).map((module, rawSlotIndex) => ({
+                module, activatedBy: activeById.get(module?.id) ?? [], rawSlotIndex,
+            }))
+            : activeRecords.map(({ module, activatedBy }, rawSlotIndex) => ({
+                module, activatedBy, rawSlotIndex,
+            }))
+        const modules = records.flatMap(({ module, activatedBy, rawSlotIndex }) => {
+            assertNotAborted(input.signal)
+            const source = mapModule(
+                module,
+                activatedBy,
+                rawSlotIndex,
+                projectionContext,
+                includeAssetMetadata,
+            )
+            if (!source) return []
+            moduleLocators.set(source, {
+                scope: input.scope,
+                ownerId: source.id,
+                rawSlotIndex,
+                lorebookFingerprint: rawLorebookFingerprint(module),
+            })
+            if (includeAssetMetadata) moduleAssetMetadataSources.add(source)
+            return [source]
+        })
+        assertNotAborted(input.signal)
+        return { selectors, modules }
+    }
+
+    const revalidateModuleMembership = (probe: ContextModuleCollectionProbe) => {
+        assertNotAborted(probe.input.signal)
+        const selectors = selectorsForSynchronously(
+            probe.input.characterId,
+            probe.input.conversationId,
+            probe.input.scope === 'installed',
+        )
+        if (!sameSelectors(selectors, probe.selectors)) throw changed()
+        const records = currentModuleRecords(probe.input.scope).filter(({ module }) =>
+            nonEmptyString(module?.id) && nonEmptyString(module?.name))
+        if (records.length !== probe.sources.length) throw changed()
+        for (let index = 0; index < records.length; index++) {
+            assertNotAborted(probe.input.signal)
+            const source = probe.sources[index]
+            const record = records[index]
+            const locator = moduleLocators.get(source)
+            if (!locator
+                || locator.scope !== probe.input.scope
+                || locator.ownerId !== source.id
+                || locator.ownerId !== record.module.id
+                || locator.rawSlotIndex !== record.rawSlotIndex) throw changed()
+        }
+        assertNotAborted(probe.input.signal)
+        return records
+    }
+
+    const revalidateModulePage = (probe: ContextModulePageProbe) => {
+        const records = revalidateModuleMembership(probe)
+        const capturedSources = new Set(probe.sources)
+        const recordsByRawSlot = new Map(records.map((record) => [record.rawSlotIndex, record]))
+        for (const source of probe.pageSources) {
+            assertNotAborted(probe.input.signal)
+            const locator = moduleLocators.get(source)
+            const record = locator ? recordsByRawSlot.get(locator.rawSlotIndex) : undefined
+            if (!locator
+                || !capturedSources.has(source)
+                || locator.scope !== probe.input.scope
+                || locator.ownerId !== source.id
+                || record?.module.id !== source.id) throw changed()
+            revalidateModuleRecord(
+                source,
+                locator,
+                record.module,
+                record.activatedBy,
+                moduleAssetMetadataSources.has(source),
+                probe.input.signal,
+            )
+        }
+        assertNotAborted(probe.input.signal)
+    }
+
     return {
+        async resolveCollectionSelectors(input) {
+            assertNotAborted(input.signal)
+            const selectors = await selectorsFor(
+                input.characterId,
+                input.conversationId,
+                input.allowMissingCurrent,
+                input.signal,
+            )
+            assertNotAborted(input.signal)
+            return selectors
+        },
         async getState(): Promise<ContextHostState> {
-            let currentCharacter: UnknownRecord | undefined
-            let currentChat: UnknownRecord | undefined
-            let stable = false
-            for (let attempt = 0; attempt < 4; attempt++) {
-                currentCharacter = dependencies.getCurrentCharacter()
-                if (!currentCharacter) {
-                    currentChat = undefined
-                    stable = true
-                    break
-                }
-                const chatPage = currentCharacter.chatPage
-                currentChat = await dependencies.hydrateCurrentChat(currentCharacter)
-                if (dependencies.getCurrentCharacter() === currentCharacter
-                    && currentCharacter.chatPage === chatPage
-                    && (!currentChat || currentCharacter.chats?.[chatPage] === currentChat)) {
-                    stable = true
-                    break
-                }
-            }
-            if (!stable) {
-                throw new PluginApiError('CONFLICT', 'Current context changed repeatedly during hydration', {
-                    retryable: true,
-                })
-            }
+            const { currentCharacter, currentChat } = await hydrateStableCurrent()
             const database = dependencies.getDatabase()
             let current: ContextHostState['current']
             if (currentCharacter && currentChat) {
@@ -258,10 +696,10 @@ export function createPocketContextResourceAdapter(
             }
 
             const characters = (database.characters ?? [])
-                .map(mapCharacter)
+                .map((character, index) => mapCharacter(character, index, projectionContext))
                 .filter((value): value is ContextCharacterSource => value !== null)
             if (currentCharacter && current && !characters.some((character) => character.id === current.characterId)) {
-                const projected = mapCharacter(currentCharacter)
+                const projected = mapCharacter(currentCharacter, -1, projectionContext)
                 if (projected) characters.unshift(projected)
             }
             const validCharacterIds = new Set(characters
@@ -279,27 +717,194 @@ export function createPocketContextResourceAdapter(
 
             const activeRecords = dependencies.getActiveModulesWithReasons()
             const activeModules = activeRecords
-                .map(({ module, activatedBy }) => mapModule(module, activatedBy))
+                .map(({ module, activatedBy }, index) => mapModule(module, activatedBy, index, projectionContext))
                 .filter((value): value is ContextModuleSource => value !== null)
             const activeById = new Map(activeModules.map((module) => [module.id, module.activatedBy]))
             const installedModules = (database.modules ?? [])
-                .map((module) => mapModule(module, activeById.get(module.id) ?? []))
+                .map((module, index) => mapModule(module, activeById.get(module.id) ?? [], index, projectionContext))
                 .filter((value): value is ContextModuleSource => value !== null)
-            if (dependencies.getAssetStorageRevision) {
-                for (const asset of [
-                    ...characters.flatMap((character) => character.assets),
-                    ...activeModules.flatMap((module) => module.assets),
-                    ...installedModules.flatMap((module) => module.assets),
-                ]) {
-                    asset.storageRevision = dependencies.getAssetStorageRevision(asset.storageKey)
-                }
-            }
             return {
                 ...(current ? { current } : {}),
                 characters,
                 activeModules,
                 installedModules,
             }
+        },
+        async captureModuleSources(input: ContextModuleCollectionInput) {
+            const selectors = await selectorsFor(
+                input.characterId, input.conversationId, input.scope === 'installed', input.signal,
+            )
+            return captureModuleSourcesFrom(input, true, selectors)
+        },
+        captureModuleSourcesSynchronously(
+            input: ContextModuleCollectionInput,
+            options: { includeAssetMetadata: boolean },
+        ) {
+            const selectors = selectorsForSynchronously(
+                input.characterId, input.conversationId, input.scope === 'installed',
+            )
+            return captureModuleSourcesFrom(input, options.includeAssetMetadata, selectors)
+        },
+        async revalidateModuleSource(probe: ContextModuleSourceProbe) {
+            assertNotAborted(probe.input.signal)
+            const locator = moduleLocators.get(probe.source)
+            if (!locator || locator.scope !== probe.input.scope || locator.ownerId !== probe.source.id) throw changed()
+            await selectorsFor(
+                probe.input.characterId,
+                probe.input.conversationId,
+                probe.input.scope === 'installed',
+                probe.input.signal,
+            )
+            const activeRecords = dependencies.getActiveModulesWithReasons()
+            let raw: UnknownRecord | undefined
+            let activatedBy: ModuleActivationReason[] = []
+            if (locator.scope === 'installed') {
+                raw = dependencies.getDatabase().modules?.[locator.rawSlotIndex]
+                activatedBy = activeRecords.find(({ module }) => module?.id === locator.ownerId)?.activatedBy ?? []
+            } else {
+                const record = activeRecords[locator.rawSlotIndex]
+                raw = record?.module
+                activatedBy = record?.activatedBy ?? []
+            }
+            revalidateModuleRecord(
+                probe.source,
+                locator,
+                raw,
+                activatedBy,
+                moduleAssetMetadataSources.has(probe.source),
+                probe.input.signal,
+            )
+            assertNotAborted(probe.input.signal)
+            return probe.source
+        },
+        async revalidateModuleCollection(probe: ContextModuleCollectionProbe) {
+            await selectorsFor(
+                probe.input.characterId,
+                probe.input.conversationId,
+                probe.input.scope === 'installed',
+                probe.input.signal,
+            )
+            revalidateModuleMembership(probe)
+        },
+        revalidateModulePageSynchronously(probe: ContextModulePageProbe) {
+            revalidateModulePage(probe)
+        },
+        async captureAssetSources(input: ContextAssetCollectionInput) {
+            assertNotAborted(input.signal)
+            if (!Array.isArray(input.characterIds)) {
+                throw new PluginApiError('INVALID_ARGUMENT', 'Character IDs must be an array')
+            }
+            const { currentCharacter, currentChat } = await hydrateStableCurrent(input.signal)
+            const defaultCharacterId = currentCharacter?.chaId
+            const characterIds = input.characterIds.length > 0
+                ? [...input.characterIds]
+                : nonEmptyString(defaultCharacterId) ? [defaultCharacterId] : []
+            for (const characterId of characterIds) {
+                selectorsFrom(currentCharacter, currentChat, characterId, input.conversationId || undefined, false)
+            }
+            const selectors = selectorsFrom(
+                currentCharacter, currentChat, characterIds[0], input.conversationId || undefined, false,
+            ) as {
+                characterId: string
+                conversationId: string
+            }
+            const database = dependencies.getDatabase()
+            const includeCharacterAssets = input.include.some((role) => role !== 'module')
+            const characters = (includeCharacterAssets ? characterIds : []).flatMap((characterId) => {
+                let rawSlotIndex = (database.characters ?? []).findIndex((character) => character?.chaId === characterId)
+                const raw = rawSlotIndex >= 0
+                    ? database.characters![rawSlotIndex]
+                    : currentCharacter?.chaId === characterId ? currentCharacter : undefined
+                if (!raw) throw new PluginApiError('NOT_FOUND', 'Character was not found')
+                const projected = mapCharacter(raw, rawSlotIndex, projectionContext)
+                if (!projected) throw new PluginApiError('NOT_FOUND', 'Character was not found')
+                return projected.assets.map((source) => ({
+                    source,
+                    origin: { kind: 'character' as const, characterId },
+                }))
+            })
+            let moduleRecords: Array<{
+                module: UnknownRecord
+                activatedBy: ModuleActivationReason[]
+                rawSlotIndex: number
+            }> = []
+            if (input.moduleScope === 'installed') {
+                const activeById = new Map(dependencies.getActiveModulesWithReasons().flatMap(({ module, activatedBy }) =>
+                    nonEmptyString(module?.id) ? [[module.id, activatedBy] as const] : []))
+                moduleRecords = (database.modules ?? []).flatMap((module, rawSlotIndex) =>
+                    !input.moduleIdsSpecified || input.moduleIds.includes(module?.id)
+                        ? [{ module, activatedBy: activeById.get(module?.id) ?? [], rawSlotIndex }]
+                        : [])
+            } else if (input.moduleScope === 'active') {
+                moduleRecords = dependencies.getActiveModulesWithReasons().flatMap(
+                    ({ module, activatedBy }, rawSlotIndex) =>
+                        !input.moduleIdsSpecified || input.moduleIds.includes(module?.id)
+                            ? [{ module, activatedBy, rawSlotIndex }] : [],
+                )
+            }
+            const modules = moduleRecords.flatMap(({ module, activatedBy, rawSlotIndex }) => {
+                assertNotAborted(input.signal)
+                const projected = mapModule(module, activatedBy, rawSlotIndex, projectionContext)
+                if (!projected) return []
+                return projected.assets.map((source) => ({
+                    source,
+                    origin: { kind: 'module' as const, moduleId: projected.id },
+                }))
+            })
+            const assets = [...characters, ...modules]
+                .filter(({ source }) => input.include.includes(source.role))
+            assertNotAborted(input.signal)
+            return { selectors, assets }
+        },
+        async revalidateAssetSource(probe: ContextAssetSourceProbe) {
+            assertNotAborted(probe.input.signal)
+            const locator = assetLocators.get(probe.located.source)
+            if (!locator
+                || locator.ownerKind !== probe.located.origin.kind
+                || locator.ownerId !== (probe.located.origin.kind === 'character'
+                    ? probe.located.origin.characterId : probe.located.origin.moduleId)
+                || locator.storageKey !== probe.located.source.storageKey
+                || locator.storageRevision !== (probe.located.source.storageRevision ?? probe.located.source.storageKey)) {
+                throw changed()
+            }
+            await selectorsFor(
+                probe.input.characterIds[0],
+                probe.input.conversationId || undefined,
+                false,
+                probe.input.signal,
+            )
+            const { currentCharacter } = stableCurrentSynchronously()
+            const database = dependencies.getDatabase()
+            let current: ContextAssetSource | null = null
+            if (locator.ownerKind === 'module') {
+                if (probe.input.moduleScope === 'none'
+                    || (probe.input.moduleIdsSpecified && !probe.input.moduleIds.includes(locator.ownerId))) {
+                    throw changed()
+                }
+                const records = probe.input.moduleScope === 'installed'
+                    ? database.modules ?? []
+                    : dependencies.getActiveModulesWithReasons().map(({ module }) => module)
+                const raw = records[locator.ownerRawSlotIndex]
+                if (!raw || raw.id !== locator.ownerId) throw changed()
+                current = mapModuleAssetAt(raw, locator.ownerRawSlotIndex, locator.rawSlotIndex, projectionContext)
+            } else {
+                if (probe.input.characterIds.length > 0 && !probe.input.characterIds.includes(locator.ownerId)) throw changed()
+                const raw = locator.ownerRawSlotIndex >= 0
+                    ? database.characters?.[locator.ownerRawSlotIndex]
+                    : currentCharacter
+                if (!raw || raw.chaId !== locator.ownerId) throw changed()
+                current = mapCharacterAssetAt(raw, locator, projectionContext)
+            }
+            if (!current || !sameSource(current, probe.located.source)) throw changed()
+            assertNotAborted(probe.input.signal)
+            return current
+        },
+        async revalidateAssetCollection(probe: ContextAssetCollectionProbe) {
+            assertNotAborted(probe.input.signal)
+            const expected = probe.sources.map(({ source, origin }) => assetShapeKey(source, origin))
+            const current = await currentAssetShape(probe)
+            if (JSON.stringify(current) !== JSON.stringify(expected)) throw changed()
+            assertNotAborted(probe.input.signal)
         },
         async readAsset(source, signal) {
             assertNotAborted(signal)

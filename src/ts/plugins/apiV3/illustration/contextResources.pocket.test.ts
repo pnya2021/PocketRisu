@@ -5,11 +5,27 @@ import {
     parseImageDimensions,
     type PocketContextAdapterDependencies,
 } from './contextResources.pocket'
+import {
+    ContextResourceService,
+    type ContextAssetCollectionInput,
+    type ContextModuleCollectionInput,
+} from './contextResources'
+import { CursorRegistry } from './cursorRegistry'
+import { ContextAssetReadCoordinator } from './contextAssetReadCoordinator'
+import { QueryCaptureCache } from './queryCaptureCache'
 
 const deferred = <T>() => {
     let resolve!: (value: T) => void
     const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
     return { promise, resolve }
+}
+
+const waitFor = async (predicate: () => boolean) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+        if (predicate()) return
+        await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    throw new Error('Timed out waiting for test condition')
 }
 
 const makeLore = (id: string, content: string, mode: 'normal' | 'folder' = 'normal') => ({
@@ -351,8 +367,9 @@ describe('Pocket context resource adapter', () => {
     })
 
     it('keeps installed modules available when no current chat exists', async () => {
+        const character = makeCharacter()
         const deps = dependencies({
-            getCurrentCharacter: () => undefined,
+            getCurrentCharacter: () => character,
             hydrateCurrentChat: async () => undefined,
             getActiveModulesWithReasons: () => [],
         })
@@ -499,6 +516,1079 @@ describe('Pocket context resource adapter', () => {
             expect(after.find((asset) => asset.storageKey === storageKey)?.identity)
                 .toBe(before.find((asset) => asset.storageKey === storageKey)?.identity)
         }
+    })
+    it('captures only the requested Pocket owner collections and revalidates their opaque source locators', async () => {
+        const adapter = createPocketContextResourceAdapter(dependencies())
+        const moduleInput: ContextModuleCollectionInput = {
+            scope: 'installed', characterId: 'char-1', conversationId: 'conversation-1',
+        }
+        const modules = await adapter.captureModuleSources!(moduleInput)
+        expect(modules.selectors).toEqual({ characterId: 'char-1', conversationId: 'conversation-1' })
+        expect(modules.modules.map((module) => module.id)).toEqual([
+            'module-global', 'module-chat', 'module-installed',
+        ])
+        await expect(adapter.revalidateModuleSource!({ source: modules.modules[1], input: moduleInput }))
+            .resolves.toMatchObject({ id: 'module-chat' })
+
+        const assetInput: ContextAssetCollectionInput = {
+            characterIds: ['char-1'],
+            conversationId: 'conversation-1',
+            include: ['portrait', 'emotion', 'additional', 'module'],
+            moduleScope: 'installed',
+            moduleIds: ['module-installed'],
+            moduleIdsSpecified: true,
+            mediaTypes: [],
+        }
+        const assets = await adapter.captureAssetSources!(assetInput)
+        expect(assets.selectors).toEqual({ characterId: 'char-1', conversationId: 'conversation-1' })
+        expect(assets.assets.filter(({ origin }) => origin.kind === 'module').map(({ origin }) => origin))
+            .toEqual([{ kind: 'module', moduleId: 'module-installed' }])
+        expect(assets.assets.some(({ origin }) => origin.kind === 'character')).toBe(true)
+        await expect(adapter.revalidateAssetSource!({ located: assets.assets.at(-1)!, input: assetInput }))
+            .resolves.toMatchObject({ storageKey: 'assets/module-installed.png' })
+    })
+
+    it('treats an explicit empty installed-module filter as no module source while an omitted filter remains inclusive', async () => {
+        const adapter = createPocketContextResourceAdapter(dependencies())
+        const base: Omit<ContextAssetCollectionInput, 'moduleIds'> = {
+            characterIds: ['char-1'],
+            conversationId: 'conversation-1',
+            include: ['module'],
+            moduleScope: 'installed',
+            mediaTypes: [],
+        }
+        const omitted = await adapter.captureAssetSources!({ ...base, moduleIds: [] })
+        const explicitEmpty = await adapter.captureAssetSources!({
+            ...base, moduleIds: [], moduleIdsSpecified: true,
+        })
+        expect(omitted.assets.filter(({ origin }) => origin.kind === 'module')).toHaveLength(3)
+        expect(explicitEmpty.assets.filter(({ origin }) => origin.kind === 'module')).toHaveLength(0)
+    })
+
+    it('bounds real-size Host first-capture and final-probe work to selected modules and assets', async () => {
+        const counters = {
+            fullStateCalls: 0,
+            moduleMaterializations: 0,
+            moduleMetadataVisits: 0,
+            moduleCollectionProbes: 0,
+            modulePhysicalReads: 0,
+            cachedModuleEmissions: 0,
+            finalModuleEmissions: 0,
+        }
+        const countedModule = (id: string, assetCount: number) => {
+            const module = makeModule(id, {
+                assets: Array.from({ length: assetCount }, (_, index) => [
+                    `${id}-${index}`, `assets/${id}-${index}.png`, 'png',
+                ]),
+            })
+            const lorebook = module.lorebook
+            Object.defineProperty(module, 'lorebook', {
+                enumerable: true,
+                get() {
+                    counters.moduleMaterializations += 1
+                    return lorebook
+                },
+            })
+            return module
+        }
+        const current = makeCharacter({
+            image: 'assets/card-portrait.png',
+            emotionImages: [['card-emotion', 'assets/card-emotion.png']],
+            additionalAssets: [],
+            ccAssets: [],
+        })
+        const selected = countedModule('selected', 2_450)
+        const unrelated = countedModule('unrelated', 1_553)
+        const deps = dependencies({
+            getDatabase: () => ({ characters: [current], modules: [selected, unrelated] }),
+            getCurrentCharacter: () => current,
+            hydrateCurrentChat: async () => current.chats[0],
+            getActiveModulesWithReasons: () => [],
+            getAssetStorageRevision: (storageKey) => {
+                counters.moduleMetadataVisits += 1
+                return `revision:${storageKey}:1`
+            },
+            readImage: async () => {
+                counters.modulePhysicalReads += 1
+                return new Uint8Array([1])
+            },
+        })
+        const adapter = createPocketContextResourceAdapter(deps)
+        const revalidateModuleCollection = adapter.revalidateModuleCollection!.bind(adapter)
+        adapter.revalidateModuleCollection = async (probe) => {
+            counters.moduleCollectionProbes += 1
+            return revalidateModuleCollection(probe)
+        }
+        const originalGetState = adapter.getState
+        adapter.getState = async () => {
+            counters.fullStateCalls += 1
+            return originalGetState()
+        }
+        const moduleService = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'real-size-module-workload',
+                displayName: 'Real-size module workload',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const firstModules = await moduleService.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        counters.cachedModuleEmissions = firstModules.items.length
+        const finalModules = await moduleService.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query',
+            captureRevision: firstModules.captureRevision, limit: 1,
+        })
+        counters.finalModuleEmissions = finalModules.items.length
+        const moduleWork = {
+            materializations: counters.moduleMaterializations,
+            metadataVisits: counters.moduleMetadataVisits,
+            collectionProbes: counters.moduleCollectionProbes,
+            physicalReads: counters.modulePhysicalReads,
+        }
+        moduleService.dispose()
+
+        const M = 2
+        const S = 4_003
+        expect(counters.fullStateCalls).toBe(0)
+        expect(moduleWork.materializations).toBeLessThanOrEqual(2 * M)
+        expect(moduleWork.metadataVisits).toBeLessThanOrEqual(2 * S)
+        expect(moduleWork.collectionProbes).toBe(0)
+        expect(moduleWork.physicalReads).toBe(0)
+        expect(counters.cachedModuleEmissions).toBe(M)
+        expect(counters.finalModuleEmissions).toBeLessThanOrEqual(1)
+
+        const runAssetQuery = async (
+            include: Array<'portrait' | 'emotion' | 'additional' | 'module'>,
+            N: number,
+            instanceId: string,
+        ) => {
+            const queryCounters = {
+                fullStateCalls: 0,
+                assetMaterializations: 0,
+                cachedAssetEmissions: 0,
+                finalAssetEmissions: 0,
+                targetedAssetProbes: 0,
+                physicalReads: 0,
+                digests: 0,
+                finalProbePhysicalReads: 0,
+                activeReads: 0,
+                maxPhysicalReads: 0,
+                unselectedSourceMaterializations: 0,
+                unselectedMetadataProjections: 0,
+                unselectedDigests: 0,
+                unselectedStorageReads: 0,
+            }
+            const queryCurrent = makeCharacter({
+                image: 'assets/card-portrait.png',
+                emotionImages: [['card-emotion', 'assets/card-emotion.png']],
+                additionalAssets: [],
+                ccAssets: [],
+            })
+            const queryCountedModule = (id: string, assetCount: number, unselected = false) => {
+                const module = makeModule(id, {
+                    assets: Array.from({ length: assetCount }, (_, index) => [
+                        `${id}-${index}`, `assets/${id}-${index}.png`, 'png',
+                    ]),
+                })
+                const lorebook = module.lorebook
+                Object.defineProperty(module, 'lorebook', {
+                    enumerable: true,
+                    get() {
+                        if (unselected) queryCounters.unselectedSourceMaterializations += 1
+                        return lorebook
+                    },
+                })
+                return module
+            }
+            const querySelected = queryCountedModule('selected', 2_450)
+            const queryUnrelated = queryCountedModule('unrelated', 1_553, true)
+            const queryAdapter = createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({
+                    characters: [queryCurrent], modules: [querySelected, queryUnrelated],
+                }),
+                getCurrentCharacter: () => queryCurrent,
+                hydrateCurrentChat: async () => queryCurrent.chats[0],
+                getActiveModulesWithReasons: () => [],
+                getAssetStorageRevision: (storageKey) => {
+                    if (storageKey.includes('unrelated')) {
+                        queryCounters.unselectedMetadataProjections += 1
+                    }
+                    return `revision:${storageKey}:1`
+                },
+                readImage: async (storageKey) => {
+                    queryCounters.physicalReads += 1
+                    queryCounters.digests += 1
+                    queryCounters.activeReads += 1
+                    queryCounters.maxPhysicalReads = Math.max(
+                        queryCounters.maxPhysicalReads, queryCounters.activeReads,
+                    )
+                    if (storageKey.includes('unrelated')) {
+                        queryCounters.unselectedDigests += 1
+                        queryCounters.unselectedStorageReads += 1
+                    }
+                    await Promise.resolve()
+                    queryCounters.activeReads -= 1
+                    return new Uint8Array([1])
+                },
+            }))
+            const getState = queryAdapter.getState.bind(queryAdapter)
+            queryAdapter.getState = async () => {
+                queryCounters.fullStateCalls += 1
+                return getState()
+            }
+            const captureAssets = queryAdapter.captureAssetSources!.bind(queryAdapter)
+            let captureCalls = 0
+            queryAdapter.captureAssetSources = async (input) => {
+                const captured = await captureAssets(input)
+                captureCalls += 1
+                queryCounters.assetMaterializations += captured.assets.length
+                if (captureCalls === 1) queryCounters.cachedAssetEmissions = captured.assets.length
+                return captured
+            }
+            const revalidateAsset = queryAdapter.revalidateAssetSource!.bind(queryAdapter)
+            queryAdapter.revalidateAssetSource = async (probe) => {
+                queryCounters.targetedAssetProbes += 1
+                return revalidateAsset(probe)
+            }
+            const service = new ContextResourceService(
+                {
+                    principalId: '11111111-1111-4111-8111-111111111111',
+                    instanceId,
+                    displayName: 'Real-size asset workload',
+                    signal: new AbortController().signal,
+                },
+                queryAdapter,
+                {
+                    requirePermission: async () => undefined,
+                    cursorRegistry: new CursorRegistry(),
+                    queryCaptureCache: new QueryCaptureCache(),
+                    readCoordinator: new ContextAssetReadCoordinator(),
+                },
+            )
+            const first = await service.listContextAssets({
+                moduleScope: 'installed', moduleIds: ['selected'], include,
+                captureScope: 'query', limit: 100,
+            })
+            const readsAfterCapture = queryCounters.physicalReads
+            const digestsAfterCapture = queryCounters.digests
+            const final = await service.listContextAssets({
+                moduleScope: 'installed', moduleIds: ['selected'], include,
+                captureScope: 'query', captureRevision: first.captureRevision, limit: 1,
+            })
+            queryCounters.finalAssetEmissions = final.assets.length
+            queryCounters.finalProbePhysicalReads = queryCounters.physicalReads - readsAfterCapture
+
+            expect(queryCounters.fullStateCalls).toBe(0)
+            expect(captureCalls).toBe(2)
+            expect(queryCounters.assetMaterializations).toBe(2 * N)
+            expect(queryCounters.cachedAssetEmissions).toBe(N)
+            expect(queryCounters.finalAssetEmissions).toBeLessThanOrEqual(1)
+            expect(queryCounters.targetedAssetProbes).toBe(2 * N)
+            expect(readsAfterCapture).toBe(N)
+            expect(digestsAfterCapture).toBe(N)
+            expect(queryCounters.finalProbePhysicalReads).toBe(0)
+            expect(queryCounters.unselectedStorageReads).toBe(0)
+            expect(queryCounters.maxPhysicalReads).toBeLessThanOrEqual(4)
+            expect(queryCounters.unselectedSourceMaterializations).toBe(0)
+            expect(queryCounters.unselectedMetadataProjections).toBe(0)
+            expect(queryCounters.unselectedDigests).toBe(0)
+            service.dispose()
+        }
+
+        await runAssetQuery(
+            ['portrait', 'emotion', 'additional', 'module'], 2_452, 'real-size-card-assets',
+        )
+        await runAssetQuery(['module'], 2_450, 'real-size-module-assets')
+    }, 30_000)
+
+    it('bounds a later module cursor page to its selected nested slots', async () => {
+        const current = makeCharacter()
+        const modules = [
+            makeModule('first', {
+                assets: Array.from({ length: 2_450 }, (_, index) => [
+                    `first-${index}`, `assets/first-${index}.png`, 'png',
+                ]),
+            }),
+            makeModule('second', {
+                assets: Array.from({ length: 1_553 }, (_, index) => [
+                    `second-${index}`, `assets/second-${index}.png`, 'png',
+                ]),
+            }),
+        ]
+        let metadataVisits = 0
+        let physicalReads = 0
+        const permissionCalls: string[] = []
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'real-size-module-cursor-workload',
+                displayName: 'Real-size module cursor workload',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [current], modules }),
+                getCurrentCharacter: () => current,
+                hydrateCurrentChat: async () => current.chats[0],
+                getActiveModulesWithReasons: () => [],
+                getAssetStorageRevision: (storageKey) => {
+                    metadataVisits += 1
+                    return `revision:${storageKey}:1`
+                },
+                readImage: async () => {
+                    physicalReads += 1
+                    return new Uint8Array([1])
+                },
+            })),
+            {
+                requirePermission: async (permission) => { permissionCalls.push(permission) },
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+        metadataVisits = 0
+        permissionCalls.length = 0
+
+        const second = await service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query',
+            cursor: first.nextCursor, limit: 1,
+        })
+
+        expect(second.items.map((item) => item.id)).toEqual(['second'])
+        expect(metadataVisits).toBeLessThanOrEqual(1_553)
+        expect(permissionCalls).toEqual([
+            'installedModulesRead', 'contextAssets', 'installedModulesRead', 'contextAssets',
+        ])
+        expect(physicalReads).toBe(0)
+        service.dispose()
+    }, 30_000)
+
+    it('rejects a later module page when its raw source changes before the final synchronous probe', async () => {
+        const current = makeCharacter()
+        const modules = [makeModule('first'), makeModule('second'), makeModule('third')]
+        const cursorRegistry = new CursorRegistry()
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [current], modules }),
+            getCurrentCharacter: () => current,
+            hydrateCurrentChat: async () => current.chats[0],
+            getActiveModulesWithReasons: () => [],
+        }))
+        type CollectionProbe = Parameters<NonNullable<typeof adapter.revalidateModuleCollection>>[0]
+        type ModuleSource = Parameters<NonNullable<typeof adapter.revalidateModuleSource>>[0]['source']
+        const nativeAdapter = adapter as typeof adapter & {
+            revalidateModulePageSynchronously?: (
+                probe: CollectionProbe & { pageSources: readonly ModuleSource[] },
+            ) => void
+        }
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'module-page-source-linearization',
+                displayName: 'Module page source linearization',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+
+        let mutated = false
+        const mutateBeforeFinalProbe = () => {
+            if (mutated) return
+            mutated = true
+            modules[1].name = 'changed before final synchronous probe'
+        }
+        if (nativeAdapter.revalidateModulePageSynchronously) {
+            const revalidate = nativeAdapter.revalidateModulePageSynchronously.bind(nativeAdapter)
+            nativeAdapter.revalidateModulePageSynchronously = (probe) => {
+                mutateBeforeFinalProbe()
+                revalidate(probe)
+            }
+        } else {
+            const revalidate = adapter.revalidateModuleSource!.bind(adapter)
+            adapter.revalidateModuleSource = async (probe) => {
+                const source = await revalidate(probe)
+                queueMicrotask(mutateBeforeFinalProbe)
+                return source
+            }
+        }
+
+        await expect(service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(mutated).toBe(true)
+        expect(cursorRegistry.activeCount('11111111-1111-4111-8111-111111111111')).toBe(0)
+        service.dispose()
+    })
+
+    it('rejects a later module page when permission generation resets before the final synchronous probe', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const current = makeCharacter()
+        const modules = [makeModule('first'), makeModule('second'), makeModule('third')]
+        let permissionGeneration = 0
+        const cursorRegistry = new CursorRegistry()
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [current], modules }),
+            getCurrentCharacter: () => current,
+            hydrateCurrentChat: async () => current.chats[0],
+            getActiveModulesWithReasons: () => [],
+        }))
+        type CollectionProbe = Parameters<NonNullable<typeof adapter.revalidateModuleCollection>>[0]
+        type ModuleSource = Parameters<NonNullable<typeof adapter.revalidateModuleSource>>[0]['source']
+        const nativeAdapter = adapter as typeof adapter & {
+            revalidateModulePageSynchronously?: (
+                probe: CollectionProbe & { pageSources: readonly ModuleSource[] },
+            ) => void
+        }
+        const service = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'module-page-generation-linearization',
+                displayName: 'Module page generation linearization',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                getPermissionGeneration: () => permissionGeneration,
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+
+        let reset = false
+        const resetBeforeFinalProbe = () => {
+            if (reset) return
+            reset = true
+            permissionGeneration += 1
+        }
+        if (nativeAdapter.revalidateModulePageSynchronously) {
+            const revalidate = nativeAdapter.revalidateModulePageSynchronously.bind(nativeAdapter)
+            nativeAdapter.revalidateModulePageSynchronously = (probe) => {
+                resetBeforeFinalProbe()
+                revalidate(probe)
+            }
+        } else {
+            const revalidate = adapter.revalidateModuleSource!.bind(adapter)
+            adapter.revalidateModuleSource = async (probe) => {
+                const source = await revalidate(probe)
+                queueMicrotask(resetBeforeFinalProbe)
+                return source
+            }
+        }
+
+        await expect(service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'ABORTED', retryable: false })
+        expect(reset).toBe(true)
+        expect(cursorRegistry.activeCount(principalId)).toBe(0)
+        service.dispose()
+    })
+
+    it('commits a later module cursor before microtasks queued by the final synchronous probe', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const current = makeCharacter()
+        const modules = [makeModule('first'), makeModule('second'), makeModule('third')]
+        const cursorRegistry = new CursorRegistry()
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [current], modules }),
+            getCurrentCharacter: () => current,
+            hydrateCurrentChat: async () => current.chats[0],
+            getActiveModulesWithReasons: () => [],
+        }))
+        type CollectionProbe = Parameters<NonNullable<typeof adapter.revalidateModuleCollection>>[0]
+        type ModuleSource = Parameters<NonNullable<typeof adapter.revalidateModuleSource>>[0]['source']
+        const nativeAdapter = adapter as typeof adapter & {
+            revalidateModulePageSynchronously?: (
+                probe: CollectionProbe & { pageSources: readonly ModuleSource[] },
+            ) => void
+        }
+        const service = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'module-page-hook-commit-order',
+                displayName: 'Module page hook commit order',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+        expect(nativeAdapter.revalidateModulePageSynchronously).toBeTypeOf('function')
+        if (!nativeAdapter.revalidateModulePageSynchronously) return
+
+        let queuedMutationRan = false
+        let mutationObservedAtCursorCommit: boolean | undefined
+        const revalidate = nativeAdapter.revalidateModulePageSynchronously.bind(nativeAdapter)
+        nativeAdapter.revalidateModulePageSynchronously = (probe) => {
+            revalidate(probe)
+            queueMicrotask(() => { queuedMutationRan = true })
+        }
+        const commitPrepared = cursorRegistry.commitPrepared.bind(cursorRegistry)
+        vi.spyOn(cursorRegistry, 'commitPrepared').mockImplementation((preparation, value, commit) => {
+            mutationObservedAtCursorCommit = queuedMutationRan
+            return commitPrepared(preparation, value, commit)
+        })
+
+        const second = await service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })
+
+        expect(second.items.map((item) => item.id)).toEqual(['second'])
+        expect(second.nextCursor).toBeTypeOf('string')
+        expect(mutationObservedAtCursorCommit).toBe(false)
+        expect(queuedMutationRan).toBe(true)
+        service.dispose()
+    })
+
+    it('uses native captures for Host first pages and metadata-only final probes without full-state calls', async () => {
+        let fullStateCalls = 0
+        let physicalReads = 0
+        let activeReads = 0
+        let maxPhysicalReads = 0
+        let targetedAssetProbes = 0
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            readImage: async () => {
+                physicalReads += 1
+                activeReads += 1
+                maxPhysicalReads = Math.max(maxPhysicalReads, activeReads)
+                await Promise.resolve()
+                activeReads -= 1
+                return new Uint8Array([1, 2, 3])
+            },
+        }))
+        const revalidateAssetSource = adapter.revalidateAssetSource!.bind(adapter)
+        adapter.revalidateAssetSource = async (probe) => {
+            targetedAssetProbes += 1
+            return revalidateAssetSource(probe)
+        }
+        const fullState = adapter.getState
+        adapter.getState = async () => {
+            fullStateCalls += 1
+            return fullState()
+        }
+        const abortController = new AbortController()
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'native-capture-instance',
+                displayName: 'Native capture',
+                signal: abortController.signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextAssets({
+            moduleScope: 'installed',
+            moduleIds: ['module-installed'],
+            captureScope: 'query',
+            limit: 1,
+        })
+        const readsAfterCapture = physicalReads
+        const final = await service.listContextAssets({
+            moduleScope: 'installed',
+            moduleIds: ['module-installed'],
+            captureScope: 'query',
+            captureRevision: first.captureRevision,
+            limit: 1,
+        })
+
+        expect(fullStateCalls).toBe(0)
+        expect(first.assets).toHaveLength(1)
+        expect(final.assets).toHaveLength(1)
+        expect(physicalReads).toBe(readsAfterCapture)
+        expect(maxPhysicalReads).toBeLessThanOrEqual(4)
+        expect(targetedAssetProbes).toBeLessThanOrEqual(2 * readsAfterCapture)
+        service.dispose()
+    })
+
+    it('binds an omitted-selector asset cursor to the context resolved on its first page', async () => {
+        const firstCharacter = makeCharacter()
+        const secondCharacter = makeCharacter({
+            chaId: 'char-2',
+            name: 'Bob',
+            image: 'assets/bob.png',
+            chats: [{ ...makeChat(), id: 'conversation-2' }],
+        })
+        let currentCharacter = firstCharacter
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [firstCharacter, secondCharacter], modules: [] }),
+            getCurrentCharacter: () => currentCharacter,
+            hydrateCurrentChat: async () => currentCharacter.chats[0],
+            getActiveModulesWithReasons: () => [],
+        }))
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'selector-bound-cursor-instance',
+                displayName: 'Selector-bound cursor',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+
+        currentCharacter = secondCharacter
+        await expect(service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT', message: 'Invalid or expired cursor' })
+        service.dispose()
+    })
+
+    it.each([
+        ['append', (modules: Record<string, any>[]) => modules.push(makeModule('module-appended'))],
+        ['delete', (modules: Record<string, any>[]) => modules.splice(2, 1)],
+        ['reorder', (modules: Record<string, any>[]) => modules.splice(1, 2, modules[2], modules[1])],
+    ])('atomically captures installed-module membership changed by %s during publication permission', async (_change, mutate) => {
+        const character = makeCharacter()
+        const modules = [makeModule('module-first'), makeModule('module-second'), makeModule('module-third')]
+        const baselineService = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: `module-collection-baseline-${_change}`,
+                displayName: 'Module collection baseline',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules }),
+                getCurrentCharacter: () => character,
+                hydrateCurrentChat: async () => character.chats[0],
+                getActiveModulesWithReasons: () => [],
+            })),
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const baseline = await baselineService.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 100,
+        })
+        baselineService.dispose()
+
+        const publicationGate = deferred<void>()
+        let publicationEntered = false
+        let permissionCalls = 0
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: `module-collection-fence-${_change}`,
+                displayName: 'Module collection fence',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules }),
+                getCurrentCharacter: () => character,
+                hydrateCurrentChat: async () => character.chats[0],
+                getActiveModulesWithReasons: () => [],
+            })),
+            {
+                requirePermission: async () => {
+                    permissionCalls += 1
+                    if (permissionCalls === 2) {
+                        publicationEntered = true
+                        await publicationGate.promise
+                    }
+                },
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const listing = service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        await waitFor(() => publicationEntered)
+        mutate(modules)
+        publicationGate.resolve()
+
+        const first = await listing
+        expect(first.captureRevision).not.toBe(baseline.captureRevision)
+        const remainder = await service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 100,
+        })
+        expect([...first.items, ...remainder.items].map((module) => module.id))
+            .toEqual(modules.map((module) => module.id))
+        await expect(service.listContextModules({
+            scope: 'installed', captureScope: 'query', captureRevision: baseline.captureRevision, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        service.dispose()
+    })
+
+    it('publishes the post-permission module revision atomically and rejects an older final probe', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const character = makeCharacter()
+        const modules = [makeModule('module-first'), makeModule('module-second')]
+        const baselineService = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'module-storage-revision-baseline',
+                displayName: 'Module storage revision baseline',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules }),
+                getCurrentCharacter: () => character,
+                hydrateCurrentChat: async () => character.chats[0],
+                getActiveModulesWithReasons: () => [],
+            })),
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const baseline = await baselineService.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        baselineService.dispose()
+
+        const cursorRegistry = new CursorRegistry()
+        const publicationGate = deferred<void>()
+        let publicationEntered = false
+        let permissionCalls = 0
+        const storageRevisions = new Map<string, number>()
+        let physicalReads = 0
+        const service = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'module-storage-revision-fence',
+                displayName: 'Module storage revision fence',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules }),
+                getCurrentCharacter: () => character,
+                hydrateCurrentChat: async () => character.chats[0],
+                getActiveModulesWithReasons: () => [],
+                getAssetStorageRevision: (storageKey) =>
+                    `revision:${storageKey}:${storageRevisions.get(storageKey) ?? 1}`,
+                readImage: async () => {
+                    physicalReads += 1
+                    return new Uint8Array([1])
+                },
+            })),
+            {
+                requirePermission: async () => {
+                    permissionCalls += 1
+                    if (permissionCalls === 3) {
+                        publicationEntered = true
+                        await publicationGate.promise
+                    }
+                },
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const listing = service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 1,
+        })
+        await waitFor(() => publicationEntered)
+        storageRevisions.set('assets/module-second.png', 2)
+        publicationGate.resolve()
+
+        const current = await listing
+        expect(current.captureRevision).not.toBe(baseline.captureRevision)
+        expect(current.nextCursor).toBeTypeOf('string')
+        expect(cursorRegistry.activeCount(principalId)).toBe(1)
+
+        await expect(service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query',
+            captureRevision: baseline.captureRevision, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(cursorRegistry.activeCount(principalId)).toBe(1)
+
+        const changed = await service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query',
+            cursor: current.nextCursor, limit: 1,
+        })
+        expect(changed.items[0].assetCollectionRevision)
+            .not.toBe(baseline.items[1].assetCollectionRevision)
+        expect(physicalReads).toBe(0)
+        expect(permissionCalls).toBe(12)
+        service.dispose()
+    })
+
+    it.each([
+        ['append', (character: Record<string, any>) => {
+            character.additionalAssets.push(['appended', 'assets/appended.png', 'png'])
+        }],
+        ['delete', (character: Record<string, any>) => character.ccAssets.splice(1, 1)],
+        ['reorder', (character: Record<string, any>) => character.ccAssets.reverse()],
+    ])('rejects an asset page when off-page membership changes by %s before publication', async (_change, mutate) => {
+        const character = makeCharacter()
+        const publicationGate = deferred<void>()
+        let publicationEntered = false
+        let permissionCalls = 0
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: `asset-collection-fence-${_change}`,
+                displayName: 'Asset collection fence',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules: [] }),
+                getCurrentCharacter: () => character,
+                hydrateCurrentChat: async () => character.chats[0],
+                getActiveModulesWithReasons: () => [],
+            })),
+            {
+                requirePermission: async () => {
+                    permissionCalls += 1
+                    if (permissionCalls === 7) {
+                        publicationEntered = true
+                        await publicationGate.promise
+                    }
+                },
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const listing = service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })
+        await waitFor(() => publicationEntered)
+        mutate(character)
+        publicationGate.resolve()
+
+        await expect(listing).rejects.toMatchObject({ code: 'CONFLICT' })
+        service.dispose()
+    })
+    it('retries optimized selector resolution until deferred Pocket chat hydration is stable', async () => {
+        const first = makeCharacter()
+        const second = makeCharacter({
+            chaId: 'char-2',
+            name: 'Bob',
+            chats: [{ ...makeChat(), id: 'conversation-2' }],
+        })
+        let current = first
+        const gate = deferred<void>()
+        let firstHydrationEntered = false
+        const hydrateCurrentChat = vi.fn(async (character: Record<string, any>) => {
+            if (character === first) {
+                firstHydrationEntered = true
+                await gate.promise
+            }
+            return character.chats[character.chatPage]
+        })
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [first, second], modules: [] }),
+            getCurrentCharacter: () => current,
+            hydrateCurrentChat,
+            getActiveModulesWithReasons: () => [],
+        }))
+
+        const pending = adapter.resolveCollectionSelectors!({ allowMissingCurrent: false })
+        await waitFor(() => firstHydrationEntered)
+        current = second
+        gate.resolve()
+
+        await expect(pending).resolves.toEqual({
+            characterId: 'char-2', conversationId: 'conversation-2',
+        })
+        expect(hydrateCurrentChat).toHaveBeenCalledTimes(2)
+    })
+
+    it('captures installed modules from the authoritative state after deferred chat hydration', async () => {
+        const character = makeCharacter()
+        const modules = [makeModule('first'), makeModule('removed')]
+        const gate = deferred<void>()
+        let hydrationEntered = false
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'pocket-deferred-module-removal',
+                displayName: 'Pocket deferred module removal',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules }),
+                getCurrentCharacter: () => character,
+                hydrateCurrentChat: async () => {
+                    hydrationEntered = true
+                    await gate.promise
+                    return character.chats[0]
+                },
+                getActiveModulesWithReasons: () => [],
+            })),
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+
+        const pending = service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        await waitFor(() => hydrationEntered)
+        modules.splice(1, 1)
+        gate.resolve()
+
+        await expect(pending).resolves.toMatchObject({ items: [{ id: 'first' }] })
+        service.dispose()
+    })
+
+    it('captures a replacement raw module slot after deferred chat hydration', async () => {
+        const character = makeCharacter()
+        const modules = [makeModule('selected', {
+            assets: [['old', 'assets/old.png', 'png']],
+        })]
+        const gate = deferred<void>()
+        let hydrationEntered = false
+        const readImage = vi.fn(async (storageKey: string) => new TextEncoder().encode(storageKey))
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'pocket-deferred-slot-replacement',
+                displayName: 'Pocket deferred slot replacement',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules }),
+                getCurrentCharacter: () => character,
+                hydrateCurrentChat: async () => {
+                    hydrationEntered = true
+                    await gate.promise
+                    return character.chats[0]
+                },
+                getActiveModulesWithReasons: () => [],
+                readImage,
+            })),
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+
+        const pending = service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['selected'], include: ['module'],
+            captureScope: 'query', limit: 100,
+        })
+        await waitFor(() => hydrationEntered)
+        modules[0] = makeModule('selected', {
+            assets: [['replacement', 'assets/replacement.png', 'png']],
+        })
+        gate.resolve()
+
+        const page = await pending
+        expect(page.assets).toHaveLength(1)
+        expect(page.assets[0]).toMatchObject({ name: 'replacement', origin: { moduleId: 'selected' } })
+        expect(readImage).toHaveBeenCalledWith('assets/replacement.png')
+        expect(readImage).not.toHaveBeenCalledWith('assets/old.png')
+        service.dispose()
+    })
+
+    it('rejects an abort that completes while Pocket chat hydration is deferred', async () => {
+        const character = makeCharacter()
+        const gate = deferred<void>()
+        let hydrationEntered = false
+        const controller = new AbortController()
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getCurrentCharacter: () => character,
+            hydrateCurrentChat: async () => {
+                hydrationEntered = true
+                await gate.promise
+                return character.chats[0]
+            },
+        }))
+
+        const pending = adapter.resolveCollectionSelectors!({
+            allowMissingCurrent: false, signal: controller.signal,
+        })
+        await waitFor(() => hydrationEntered)
+        controller.abort()
+        gate.resolve()
+
+        await expect(pending).rejects.toMatchObject({ code: 'ABORTED' })
+    })
+
+    it('publishes no late capture, cursor, handle, or read after disposal during deferred hydration', async () => {
+        const character = makeCharacter()
+        const gate = deferred<void>()
+        let hydrationEntered = false
+        const captures = new QueryCaptureCache()
+        const cursors = new CursorRegistry()
+        const commitCapture = vi.spyOn(captures, 'commitPrepared')
+        const commitCursor = vi.spyOn(cursors, 'commitPrepared')
+        const readImage = vi.fn(async () => new Uint8Array([1]))
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'pocket-deferred-disposal',
+                displayName: 'Pocket deferred disposal',
+                signal: new AbortController().signal,
+            },
+            createPocketContextResourceAdapter(dependencies({
+                getCurrentCharacter: () => character,
+                hydrateCurrentChat: async () => {
+                    hydrationEntered = true
+                    await gate.promise
+                    return character.chats[0]
+                },
+                readImage,
+            })),
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: cursors,
+                queryCaptureCache: captures,
+            },
+        )
+
+        const pending = service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })
+        await waitFor(() => hydrationEntered)
+        service.dispose()
+        gate.resolve()
+
+        await expect(pending).rejects.toMatchObject({ code: 'ABORTED' })
+        expect(commitCapture).not.toHaveBeenCalled()
+        expect(commitCursor).not.toHaveBeenCalled()
+        expect((service as any).issuedHandles.size).toBe(0)
+        expect(readImage).not.toHaveBeenCalled()
     })
 })
 
