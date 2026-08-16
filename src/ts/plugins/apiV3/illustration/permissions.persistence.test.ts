@@ -40,6 +40,17 @@ describe('persistent principal permission records', () => {
         await expect(persistence.get('principal-b', 'chatObserve')).resolves.toEqual({ state: 'denied', decidedAt: 2 })
     })
 
+    it('persists and clears the narrow card catalogue decision by principal', async () => {
+        const persistence = new PersistentPermissionPersistence(kv)
+        await persistence.set('principal-a', 'cardCatalogRead', { state: 'granted', decidedAt: 3 })
+        await expect(persistence.get('principal-a', 'cardCatalogRead')).resolves.toEqual({
+            state: 'granted', decidedAt: 3,
+        })
+        await expect(persistence.get('principal-b', 'cardCatalogRead')).resolves.toBeNull()
+        await persistence.clearPrincipal('principal-a')
+        await expect(persistence.get('principal-a', 'cardCatalogRead')).resolves.toBeNull()
+    })
+
     it('does not poison later writes after one storage failure', async () => {
         const persistence = new PersistentPermissionPersistence(kv)
         storage.failNextWrite = true
