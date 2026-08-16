@@ -208,7 +208,6 @@ const createCaptureMetadataBudget = (): CaptureMetadataBudget => ({
         ['assets', canonicalArrayBytes(0, 0)],
     ]),
     nativeBytes: canonicalObjectBytes([
-        ['version', 1],
         ['card', 0],
         ['groupMembers', canonicalArrayBytes(0, 0)],
         ['assets', canonicalArrayBytes(0, 0)],
