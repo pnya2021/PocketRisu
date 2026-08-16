@@ -5,12 +5,12 @@ import { getCurrentCharacter, getCurrentChat, getDatabase, normalizeChat } from 
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import DOMPurify from 'dompurify';
-import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
+import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, selIdState, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
 import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
 import { language } from "src/lang";
-import { checkCharOrder, forageStorage, getAssetStorageRevision, getFetchLogs, readImage } from "src/ts/globalApi.svelte";
+import { checkCharOrder, forageStorage, getAssetStorageMutationGeneration, getAssetStorageRevision, getFetchLogs, readImage } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { get } from "svelte/store";
 import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
@@ -649,6 +649,15 @@ const authorizationHeaders = [
     'proxy-authorization',
 ]
 
+export const createPocketStudioCardResourceAdapterForV3 = () => createPocketStudioCardResourceAdapter({
+    getDatabase,
+    getSelectedCharacterIndex: () => selIdState.selId,
+    readImage,
+    getAssetStorageRevision,
+    getAssetStorageMutationGeneration,
+    reactiveCatalogueIndex: true,
+})
+
 const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: PluginExecutionContext) => {
 
     const isExecutionCurrent = () => isCurrentPluginRuntimeRecord(
@@ -680,13 +689,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
     addPluginUnloadCallback(context.instanceId, () => contextResources.dispose())
     const studioCardResources = createStudioCardResourceService({
         context,
-        adapter: createPocketStudioCardResourceAdapter({
-            getDatabase,
-            getSelectedCharacterIndex: () => get(selectedCharID),
-            readImage,
-            getAssetStorageRevision,
-            reactiveCatalogueIndex: true,
-        }),
+        adapter: createPocketStudioCardResourceAdapterForV3(),
         assetAuthorityRegistry: contextAssetAuthorityRegistry,
         readCoordinator: contextAssetReadCoordinator,
         permissionGeneration: () => pluginPermissionService.generation(context.principalId),
