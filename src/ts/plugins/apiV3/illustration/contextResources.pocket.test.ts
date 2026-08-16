@@ -674,6 +674,7 @@ describe('Pocket context resource adapter', () => {
                 fullStateCalls: 0,
                 assetMaterializations: 0,
                 cachedAssetEmissions: 0,
+                fullCollectionFenceModuleProjections: 0,
                 finalAssetEmissions: 0,
                 targetedAssetProbes: 0,
                 physicalReads: 0,
@@ -686,6 +687,7 @@ describe('Pocket context resource adapter', () => {
                 unselectedDigests: 0,
                 unselectedStorageReads: 0,
             }
+            let fullCollectionFenceActive = false
             const queryCurrent = makeCharacter({
                 image: 'assets/card-portrait.png',
                 emotionImages: [['card-emotion', 'assets/card-emotion.png']],
@@ -710,6 +712,17 @@ describe('Pocket context resource adapter', () => {
             }
             const querySelected = queryCountedModule('selected', 2_450)
             const queryUnrelated = queryCountedModule('unrelated', 1_553, true)
+            const selectedAssets = querySelected.assets
+            querySelected.assets = new Proxy(selectedAssets, {
+                get(target, property, receiver) {
+                    if (fullCollectionFenceActive
+                        && typeof property === 'string'
+                        && /^(0|[1-9][0-9]*)$/.test(property)) {
+                        queryCounters.fullCollectionFenceModuleProjections += 1
+                    }
+                    return Reflect.get(target, property, receiver)
+                },
+            })
             const queryAdapter = createPocketContextResourceAdapter(dependencies({
                 getDatabase: () => ({
                     characters: [queryCurrent], modules: [querySelected, queryUnrelated],
@@ -750,13 +763,21 @@ describe('Pocket context resource adapter', () => {
                 const captured = await captureAssets(input)
                 captureCalls += 1
                 queryCounters.assetMaterializations += captured.assets.length
-                if (captureCalls === 1) queryCounters.cachedAssetEmissions = captured.assets.length
                 return captured
             }
             const revalidateAsset = queryAdapter.revalidateAssetSource!.bind(queryAdapter)
             queryAdapter.revalidateAssetSource = async (probe) => {
                 queryCounters.targetedAssetProbes += 1
                 return revalidateAsset(probe)
+            }
+            const revalidateAssetCollection = queryAdapter.revalidateAssetCollection!.bind(queryAdapter)
+            queryAdapter.revalidateAssetCollection = async (probe) => {
+                fullCollectionFenceActive = true
+                try {
+                    return await revalidateAssetCollection(probe)
+                } finally {
+                    fullCollectionFenceActive = false
+                }
             }
             const service = new ContextResourceService(
                 {
@@ -777,8 +798,21 @@ describe('Pocket context resource adapter', () => {
                 moduleScope: 'installed', moduleIds: ['selected'], include,
                 captureScope: 'query', limit: 100,
             })
+            expect(first.captureRevision).toMatch(/^sha256:[0-9a-f]{64}$/)
             const readsAfterCapture = queryCounters.physicalReads
             const digestsAfterCapture = queryCounters.digests
+            let page = first
+            let pageCount = 1
+            queryCounters.cachedAssetEmissions += page.assets.length
+            while (page.nextCursor) {
+                page = await service.listContextAssets({
+                    moduleScope: 'installed', moduleIds: ['selected'], include,
+                    captureScope: 'query', captureRevision: first.captureRevision,
+                    cursor: page.nextCursor, limit: 100,
+                })
+                pageCount += 1
+                queryCounters.cachedAssetEmissions += page.assets.length
+            }
             const final = await service.listContextAssets({
                 moduleScope: 'installed', moduleIds: ['selected'], include,
                 captureScope: 'query', captureRevision: first.captureRevision, limit: 1,
@@ -789,9 +823,11 @@ describe('Pocket context resource adapter', () => {
             expect(queryCounters.fullStateCalls).toBe(0)
             expect(captureCalls).toBe(2)
             expect(queryCounters.assetMaterializations).toBe(2 * N)
+            expect(pageCount).toBeGreaterThan(1)
+            expect(queryCounters.fullCollectionFenceModuleProjections).toBe(2 * 2_450)
             expect(queryCounters.cachedAssetEmissions).toBe(N)
             expect(queryCounters.finalAssetEmissions).toBeLessThanOrEqual(1)
-            expect(queryCounters.targetedAssetProbes).toBe(2 * N)
+            expect(queryCounters.targetedAssetProbes).toBe(3 * N - first.assets.length)
             expect(readsAfterCapture).toBe(N)
             expect(digestsAfterCapture).toBe(N)
             expect(queryCounters.finalProbePhysicalReads).toBe(0)
@@ -1173,6 +1209,44 @@ describe('Pocket context resource adapter', () => {
         await expect(service.listContextAssets({
             moduleScope: 'none', captureScope: 'query', cursor: first.nextCursor, limit: 1,
         })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT', message: 'Invalid or expired cursor' })
+        service.dispose()
+    })
+
+    it('rejects a later asset cursor page when its emitted raw slot storage revision changes', async () => {
+        const character = makeCharacter()
+        const storageRevisions = new Map<string, number>()
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [character], modules: [] }),
+            getCurrentCharacter: () => character,
+            hydrateCurrentChat: async () => character.chats[0],
+            getActiveModulesWithReasons: () => [],
+            getAssetStorageRevision: (storageKey) =>
+                `revision:${storageKey}:${storageRevisions.get(storageKey) ?? 1}`,
+        }))
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'asset-page-storage-revision-fence',
+                displayName: 'Asset page storage revision fence',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+        storageRevisions.set('assets/happy.webp', 2)
+
+        await expect(service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', captureRevision: first.captureRevision,
+            cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
         service.dispose()
     })
 
