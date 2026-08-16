@@ -496,6 +496,90 @@ describe('Pocket Studio card native projection', () => {
         expect(h.readImage).not.toHaveBeenCalled()
     })
 
+    it.each([
+        {
+            escape: 'NUL',
+            fields: ['desc'],
+            value: '\0'.repeat(400_000),
+            laterField: 'personality',
+        },
+        {
+            escape: 'C0 control',
+            fields: ['desc'],
+            value: '\u001f'.repeat(400_000),
+            laterField: 'personality',
+        },
+        {
+            escape: 'backslash',
+            fields: ['desc', 'personality', 'scenario'],
+            value: '\\'.repeat(400_000),
+            laterField: 'firstMessage',
+        },
+    ])('rejects $escape-expanded card text before projection or later fields', async ({
+        fields, value, laterField,
+    }) => {
+        const raw = character('escaped-text', 'Escaped Text')
+        for (const field of fields) raw[field] = value
+        let firstFieldReads = 0
+        let laterFieldReads = 0
+        let loreReads = 0
+        const source = new Proxy(raw, {
+            getOwnPropertyDescriptor(target, property) {
+                if (property === fields[0]) firstFieldReads += 1
+                if (property === laterField) laterFieldReads += 1
+                if (property === 'globalLore') loreReads += 1
+                return Reflect.getOwnPropertyDescriptor(target, property)
+            },
+        })
+        const h = await harness({ characters: [source], selected: 0 })
+
+        await expect(select(h, 'escaped-text')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(firstFieldReads).toBe(1)
+        expect(laterFieldReads).toBe(0)
+        expect(loreReads).toBe(0)
+        expect(h.readImage).not.toHaveBeenCalled()
+    }, 30_000)
+
+    it.each([
+        { escape: 'NUL', value: '\0'.repeat(400_000), count: 8 },
+        { escape: 'C0 control', value: '\u001f'.repeat(400_000), count: 8 },
+        { escape: 'backslash', value: '\\'.repeat(400_000), count: 22 },
+    ])('rejects $escape-expanded asset names before projection or later collections', async ({
+        value, count,
+    }) => {
+        const source = character('escaped-assets', 'Escaped Assets')
+        let firstEntryReads = 0
+        let sentinelEntryReads = 0
+        let laterCollectionReads = 0
+        source.additionalAssets = new Proxy([
+            ...Array.from({ length: count }, (_, index) => [
+                value, `assets/escaped-${index}.png`, 'png',
+            ]),
+            ['sentinel.png', 'assets/sentinel.png', 'png'],
+        ], {
+            getOwnPropertyDescriptor(target, property) {
+                if (property === '0') firstEntryReads += 1
+                if (property === String(count)) sentinelEntryReads += 1
+                return Reflect.getOwnPropertyDescriptor(target, property)
+            },
+        })
+        source.ccAssets = new Proxy([
+            { uri: 'assets/later.png', name: 'later.png', ext: 'png' },
+        ], {
+            getOwnPropertyDescriptor(target, property) {
+                if (property === '0') laterCollectionReads += 1
+                return Reflect.getOwnPropertyDescriptor(target, property)
+            },
+        })
+        const h = await harness({ characters: [source], selected: 0 })
+
+        await expect(select(h, 'escaped-assets')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(firstEntryReads).toBe(1)
+        expect(sentinelEntryReads).toBe(0)
+        expect(laterCollectionReads).toBe(0)
+        expect(h.readImage).not.toHaveBeenCalled()
+    }, 60_000)
+
     it('uses the production V3 Studio adapter wiring without touching chat hydration and tracks Host selection', async () => {
         const stores = await import('../../../stores.svelte')
         const chatStorage = await import('../../../storage/chatStorage')

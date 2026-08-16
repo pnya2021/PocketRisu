@@ -115,30 +115,58 @@ const textFields: Array<{ key: string; label: string; source: string }> = [
     { key: 'additionalText', label: 'Additional text', source: 'additionalText' },
 ]
 
-const utf8BytesAtMost = (value: string, maximum: number) => {
-    let bytes = 0
+const boundedCanonicalStringPayloadBytes = (value: string) => {
+    let rawBytes = 0
+    let canonicalBytes = 0
     for (let index = 0; index < value.length; index++) {
         const code = value.charCodeAt(index)
-        if (code <= 0x7f) bytes += 1
-        else if (code <= 0x7ff) bytes += 2
-        else if (code >= 0xd800 && code <= 0xdbff
+        if (code === 0x22 || code === 0x5c) {
+            rawBytes += 1
+            canonicalBytes += 2
+        } else if (code <= 0x1f) {
+            rawBytes += 1
+            canonicalBytes += code === 0x08 || code === 0x09 || code === 0x0a
+                || code === 0x0c || code === 0x0d ? 2 : 6
+        } else if (code <= 0x7f) {
+            rawBytes += 1
+            canonicalBytes += 1
+        } else if (code <= 0x7ff) {
+            rawBytes += 2
+            canonicalBytes += 2
+        } else if (code >= 0xd800 && code <= 0xdbff
             && index + 1 < value.length
             && value.charCodeAt(index + 1) >= 0xdc00
             && value.charCodeAt(index + 1) <= 0xdfff) {
-            bytes += 4
+            rawBytes += 4
+            canonicalBytes += 4
             index += 1
-        } else bytes += 3
-        if (bytes > maximum) return null
+        } else if (code >= 0xd800 && code <= 0xdfff) {
+            rawBytes += 3
+            canonicalBytes += 6
+        } else {
+            rawBytes += 3
+            canonicalBytes += 3
+        }
+        if (rawBytes > MAX_TEXT_FIELD_UTF8_BYTES) {
+            throw resourceLimit('Studio card text field exceeds the advertised limit')
+        }
     }
-    return bytes
+    return canonicalBytes
 }
 
-const boundedMetadataStringBytes = (value: unknown) => {
-    if (typeof value !== 'string') return 0
-    const bytes = utf8BytesAtMost(value, MAX_TEXT_FIELD_UTF8_BYTES)
-    if (bytes === null) throw resourceLimit('Studio card text field exceeds the advertised limit')
-    return bytes
-}
+const boundedCanonicalStringBytes = (value: string) => boundedCanonicalStringPayloadBytes(value) + 2
+
+const canonicalObjectBytes = (properties: ReadonlyArray<readonly [string, number]>) =>
+    2 + Math.max(0, properties.length - 1) + properties.reduce(
+        (bytes, [key, valueBytes]) => bytes + boundedCanonicalStringBytes(key) + 1 + valueBytes,
+        0,
+    )
+
+const canonicalArrayBytes = (itemBytes: number, itemCount: number) =>
+    2 + Math.max(0, itemCount - 1) + itemBytes
+
+const REVISION_STRING_BYTES = boundedCanonicalStringBytes(`sha256:${'0'.repeat(64)}`)
+const LOGICAL_ASSET_ID_STRING_BYTES = boundedCanonicalStringBytes(`studioasset_${'0'.repeat(64)}`)
 
 const preflightArrayLength = (value: unknown, label: string) => {
     if (value === undefined) return 0
@@ -166,37 +194,105 @@ const preflightAssetCount = (raw: UnknownRecord) => {
     return assetCount
 }
 
+interface CaptureMetadataBudget {
+    publicBytes: number
+    nativeBytes: number
+    memberCount: number
+    assetCount: number
+}
+
+const createCaptureMetadataBudget = (): CaptureMetadataBudget => ({
+    publicBytes: canonicalObjectBytes([
+        ['card', 0],
+        ['groupMembers', canonicalArrayBytes(0, 0)],
+        ['assets', canonicalArrayBytes(0, 0)],
+    ]),
+    nativeBytes: canonicalObjectBytes([
+        ['version', 1],
+        ['card', 0],
+        ['groupMembers', canonicalArrayBytes(0, 0)],
+        ['assets', canonicalArrayBytes(0, 0)],
+    ]),
+    memberCount: 0,
+    assetCount: 0,
+})
+
+const assertCaptureMetadataBudget = (budget: CaptureMetadataBudget) => {
+    if (budget.publicBytes > MAX_CAPTURE_METADATA_BYTES
+        || budget.nativeBytes > MAX_CAPTURE_METADATA_BYTES) {
+        throw resourceLimit('Studio card capture metadata limit exceeded')
+    }
+}
+
+const addSnapshotMetadata = (
+    budget: CaptureMetadataBudget,
+    snapshotBytes: number,
+    root: boolean,
+) => {
+    const bytes = snapshotBytes + (!root && budget.memberCount > 0 ? 1 : 0)
+    budget.publicBytes += bytes
+    budget.nativeBytes += bytes
+    if (!root) budget.memberCount += 1
+    assertCaptureMetadataBudget(budget)
+}
+
+const addAssetMetadata = (
+    budget: CaptureMetadataBudget,
+    publicBytes: number,
+    nativeBytes: number,
+) => {
+    const commaBytes = budget.assetCount > 0 ? 1 : 0
+    budget.publicBytes += publicBytes + commaBytes
+    budget.nativeBytes += nativeBytes + commaBytes
+    budget.assetCount += 1
+    assertCaptureMetadataBudget(budget)
+}
+
 const preflightCardMetadata = (
     raw: UnknownRecord,
     cardId: string,
+    kind: 'character' | 'group',
     groupMemberIds: string[],
     storageRevision: (storageKey: string) => string,
-    captureBudget: { bytes: number },
+    captureBudget: CaptureMetadataBudget,
+    root: boolean,
 ) => {
-    let cardBytes = 0
-    const addCaptureBytes = (bytes: number) => {
-        captureBudget.bytes += bytes
-        if (captureBudget.bytes > MAX_CAPTURE_METADATA_BYTES) {
-            throw resourceLimit('Studio card capture metadata limit exceeded')
-        }
-    }
-    const addCardBytes = (bytes: number) => {
-        cardBytes += bytes
-        if (cardBytes > MAX_SNAPSHOT_JSON_BYTES) {
-            throw resourceLimit('Studio card snapshot exceeds the advertised limit')
-        }
-        addCaptureBytes(bytes)
-    }
-    addCardBytes(256 + boundedMetadataStringBytes(cardId))
     const name = ownData(raw, 'name')
-    if (!name.valid) throw malformed('Studio card name is accessor-backed')
-    addCardBytes(boundedMetadataStringBytes(name.value))
-    for (const memberId of groupMemberIds) addCardBytes(boundedMetadataStringBytes(memberId) + 8)
-    for (const { source } of textFields) {
+    if (!name.valid || !nonEmptyString(name.value)) throw malformed('Studio card name is malformed')
+    let memberBytes = 0
+    for (const memberId of groupMemberIds) memberBytes += boundedCanonicalStringBytes(memberId)
+    let cardBytes = canonicalObjectBytes([
+        ['id', boundedCanonicalStringBytes(cardId)],
+        ['type', boundedCanonicalStringBytes(kind)],
+        ['name', boundedCanonicalStringBytes(name.value)],
+        ['textSections', canonicalArrayBytes(0, 0)],
+        ['lorebook', canonicalArrayBytes(0, 0)],
+        ...(kind === 'group' ? [[
+            'groupMemberIds',
+            canonicalArrayBytes(memberBytes, groupMemberIds.length),
+        ] as const] : []),
+        ['revision', REVISION_STRING_BYTES],
+    ])
+    let textCount = 0
+    let loreCount = 0
+    if (cardBytes > MAX_SNAPSHOT_JSON_BYTES) {
+        throw resourceLimit('Studio card snapshot exceeds the advertised limit')
+    }
+    for (const { key, label, source } of textFields) {
         const field = ownData(raw, source)
         if (!field.valid) throw malformed('Studio card text field is accessor-backed')
         if (typeof field.value === 'string' && field.value.length > 0) {
-            addCardBytes(boundedMetadataStringBytes(field.value) + 64)
+            const sectionBytes = canonicalObjectBytes([
+                ['key', boundedCanonicalStringBytes(key)],
+                ['label', boundedCanonicalStringBytes(label)],
+                ['content', boundedCanonicalStringBytes(field.value)],
+            ])
+            const bytes = sectionBytes + (textCount > 0 ? 1 : 0)
+            cardBytes += bytes
+            textCount += 1
+            if (cardBytes > MAX_SNAPSHOT_JSON_BYTES) {
+                throw resourceLimit('Studio card snapshot exceeds the advertised limit')
+            }
         }
     }
     const lore = ownData(raw, 'globalLore')
@@ -216,25 +312,108 @@ const preflightCardMetadata = (
             const name = nonEmptyString(values.comment.value) ? values.comment.value
                 : nonEmptyString(values.key.value) ? values.key.value : id
             const content = typeof values.content.value === 'string' ? values.content.value : ''
-            addCardBytes(boundedMetadataStringBytes(id)
-                + boundedMetadataStringBytes(name)
-                + boundedMetadataStringBytes(content)
-                + 64)
+            const entryBytes = canonicalObjectBytes([
+                ['id', boundedCanonicalStringBytes(id)],
+                ['name', boundedCanonicalStringBytes(name)],
+                ['content', boundedCanonicalStringBytes(content)],
+                ['enabled', values.mode.value === 'folder' ? 5 : 4],
+            ])
+            cardBytes += entryBytes + (loreCount > 0 ? 1 : 0)
+            loreCount += 1
+            if (cardBytes > MAX_SNAPSHOT_JSON_BYTES) {
+                throw resourceLimit('Studio card snapshot exceeds the advertised limit')
+            }
         }
     }
 
+    addSnapshotMetadata(captureBudget, cardBytes, root)
+
     const image = ownData(raw, 'image')
     if (!image.valid) throw malformed('Studio card image is accessor-backed')
-    const accountAsset = (storageKey: unknown, assetName: unknown, extension: unknown) => {
+    let ownerAssetBytes = 0
+    let ownerAssetCount = 0
+    const ownerBaseBytes = canonicalObjectBytes([
+        ['version', 1],
+        ['card', cardBytes],
+        ['assets', canonicalArrayBytes(0, 0)],
+    ])
+    const accountAsset = (
+        collection: 'image' | 'emotionImages' | 'additionalAssets' | 'ccAssets',
+        role: 'portrait' | 'emotion' | 'additional',
+        storageKey: unknown,
+        assetName: string,
+        explicitExtension?: unknown,
+    ) => {
         if (!canonicalStorageKey(storageKey)) return
-        const revision = storageRevision(storageKey)
-        addCaptureBytes(boundedMetadataStringBytes(storageKey)
-            + boundedMetadataStringBytes(revision)
-            + boundedMetadataStringBytes(assetName)
-            + boundedMetadataStringBytes(extension)
-            + 192)
+        const storageKeyPayloadBytes = boundedCanonicalStringPayloadBytes(storageKey)
+        const storageRevisionValue = storageRevision(storageKey)
+        const storageRevisionBytes = boundedCanonicalStringBytes(storageRevisionValue)
+        let extension: string | undefined
+        if (nonEmptyString(explicitExtension)) {
+            boundedCanonicalStringPayloadBytes(explicitExtension)
+            extension = explicitExtension.replace(/^\./, '').toLowerCase()
+        } else {
+            extension = extensionOf(assetName) ?? extensionOf(storageKey)
+        }
+        const mediaType = mediaTypeOf(extension)
+        const nameBytes = boundedCanonicalStringBytes(assetName)
+        const roleBytes = boundedCanonicalStringBytes(role)
+        const mediaTypeBytes = boundedCanonicalStringBytes(mediaType)
+        const ownerCardIdBytes = boundedCanonicalStringBytes(cardId)
+        const logicalIdentityBytes = 2
+            + boundedCanonicalStringPayloadBytes('character:')
+            + boundedCanonicalStringPayloadBytes(cardId)
+            + boundedCanonicalStringPayloadBytes(':')
+            + boundedCanonicalStringPayloadBytes(collection)
+            + boundedCanonicalStringPayloadBytes(':')
+            + storageKeyPayloadBytes
+        const nativeSlotBytes = String(ownerAssetCount).length
+        const locatorBytes = canonicalObjectBytes([
+            ['ownerCardId', ownerCardIdBytes],
+            ['ownerRevision', REVISION_STRING_BYTES],
+            ['storageRevision', storageRevisionBytes],
+            ['nativeSlot', nativeSlotBytes],
+        ])
+        const nativeAssetBytes = canonicalObjectBytes([
+            ['logicalIdentity', logicalIdentityBytes],
+            ['revision', REVISION_STRING_BYTES],
+            ['name', nameBytes],
+            ['mediaType', mediaTypeBytes],
+            ['role', roleBytes],
+            ['locator', locatorBytes],
+        ])
+        const publicAssetBytes = canonicalObjectBytes([
+            ['logicalAssetId', LOGICAL_ASSET_ID_STRING_BYTES],
+            ['assetRevision', REVISION_STRING_BYTES],
+            ['ownerCardId', ownerCardIdBytes],
+            ['name', nameBytes],
+            ['mediaType', mediaTypeBytes],
+            ['role', roleBytes],
+        ])
+        const ownerAssetEntryBytes = canonicalObjectBytes([
+            ['logicalIdentity', logicalIdentityBytes],
+            ['revision', REVISION_STRING_BYTES],
+            ['name', nameBytes],
+            ['mediaType', mediaTypeBytes],
+            ['role', roleBytes],
+            ['nativeSlot', nativeSlotBytes],
+        ])
+        ownerAssetBytes += ownerAssetEntryBytes + (ownerAssetCount > 0 ? 1 : 0)
+        ownerAssetCount += 1
+        if (ownerBaseBytes + ownerAssetBytes > MAX_CAPTURE_METADATA_BYTES) {
+            throw resourceLimit('Studio card capture metadata limit exceeded')
+        }
+        addAssetMetadata(captureBudget, publicAssetBytes, nativeAssetBytes)
     }
-    accountAsset(image.value, name.value, extensionOf(typeof image.value === 'string' ? image.value : ''))
+    if (canonicalStorageKey(image.value)) {
+        const extension = extensionOf(image.value)
+        accountAsset(
+            'image',
+            'portrait',
+            image.value,
+            `${name.value}.${extension ?? 'png'}`,
+        )
+    }
     for (const collection of ['emotionImages', 'additionalAssets'] as const) {
         const field = ownData(raw, collection)
         if (!field.valid) throw malformed(`Studio card ${collection} is accessor-backed`)
@@ -251,7 +430,14 @@ const preflightCardMetadata = (
             if (!assetName.valid || !storageKey.valid || !extension.valid) {
                 throw malformed(`Studio card ${collection} is accessor-backed`)
             }
-            accountAsset(storageKey.value, assetName.value, extension.value)
+            const role = collection === 'emotionImages' ? 'emotion' : 'additional'
+            accountAsset(
+                collection,
+                role,
+                storageKey.value,
+                nonEmptyString(assetName.value) ? assetName.value : `${role}-${index}`,
+                extension.value,
+            )
         }
     }
     const ccAssets = ownData(raw, 'ccAssets')
@@ -267,7 +453,13 @@ const preflightCardMetadata = (
             if (!uri.valid || !assetName.valid || !extension.valid) {
                 throw malformed('Studio card ccAssets is accessor-backed')
             }
-            accountAsset(uri.value, assetName.value, extension.value)
+            accountAsset(
+                'ccAssets',
+                'additional',
+                uri.value,
+                nonEmptyString(assetName.value) ? assetName.value : `card-asset-${index}`,
+                extension.value,
+            )
         }
     }
 }
@@ -458,14 +650,16 @@ export function createPocketStudioCardResourceAdapter(
                 throw resourceLimit('Studio card capture item limit exceeded')
             }
         }
-        const captureBudget = { bytes: 0 }
+        const captureBudget = createCaptureMetadataBudget()
         for (const record of allRecords) {
             preflightCardMetadata(
                 record.raw,
                 record.native.cardId,
+                record.native.kind,
                 record === records.rootRecord ? records.rootMembers : [],
                 (storageKey) => dependencies.getAssetStorageRevision?.(storageKey) ?? storageKey,
                 captureBudget,
+                record === records.rootRecord,
             )
         }
     }
