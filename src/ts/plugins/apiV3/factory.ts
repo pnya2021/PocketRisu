@@ -5,6 +5,10 @@ import {
     serializePluginApiError,
 } from './illustration/errors'
 import { GUEST_RPC_CODEC_SCRIPT, prepareRpcMessage } from './illustration/rpcCodec'
+import {
+    takeStudioCardRpcFinalizer,
+    type StudioCardRpcFinalizer,
+} from './studioCardRpcTransport'
 
 type MsgType =
     | 'CALL_ROOT'
@@ -1075,17 +1079,13 @@ export class SandboxHost {
         response: RpcMessage,
         runGeneration: number,
         extraTransferables: readonly Transferable[] = [],
-        rollback: () => void = () => undefined,
     ) {
-        if (!this.isCurrentRun(runGeneration)) {
-            rollback();
-            return;
-        }
+        if (!this.isCurrentRun(runGeneration)) return false;
         try {
             this.postToGuest(response, extraTransferables);
+            return true;
         } catch {
-            rollback();
-            if (!this.isCurrentRun(runGeneration)) return;
+            if (!this.isCurrentRun(runGeneration)) return false;
             try {
                 this.postToGuest({
                     type: response.type,
@@ -1095,6 +1095,7 @@ export class SandboxHost {
             } catch {
                 console.error('[V3 RPC] postMessage failed', { type: response.type });
             }
+            return false;
         }
     }
 
@@ -1499,12 +1500,26 @@ export class SandboxHost {
                 const usedAbortIds: string[] = [];
                 let streamPorts: MessagePort[] = [];
                 let streamCleanups: (() => void)[] = [];
+                let resourceFinalizer: StudioCardRpcFinalizer | undefined;
 
                 const rollbackStreams = () => {
                     for (const cleanup of streamCleanups) {
                         try { cleanup(); } catch(_) {}
                     }
                     streamCleanups = [];
+                };
+                const rollbackResult = () => {
+                    rollbackStreams();
+                    const finalizer = resourceFinalizer;
+                    resourceFinalizer = undefined;
+                    if (!finalizer) return;
+                    try { finalizer.rollback(); } catch { /* sanitized best effort */ }
+                };
+                const commitResult = () => {
+                    const finalizer = resourceFinalizer;
+                    resourceFinalizer = undefined;
+                    if (!finalizer) return;
+                    try { finalizer.commit(); } catch { /* finalized response cannot be recovered */ }
                 };
 
                 try {
@@ -1523,9 +1538,14 @@ export class SandboxHost {
                         if (typeof instance[data.method!] !== 'function') throw new PluginApiError('NOT_FOUND', 'Instance method not found');
                         result = await instance[data.method!](...args);
                     }
+                    resourceFinalizer = takeStudioCardRpcFinalizer(result);
 
-                    if (!this.isCurrentRun(runGeneration)) return;
+                    if (!this.isCurrentRun(runGeneration)) {
+                        rollbackResult();
+                        return;
+                    }
                     if (!this.isAuthorized()) {
+                        rollbackResult();
                         this.terminateUnauthorized()
                         return
                     }
@@ -1538,7 +1558,7 @@ export class SandboxHost {
                     streamPorts = ports;
 
                 } catch (err: any) {
-                    rollbackStreams();
+                    rollbackResult();
                     delete response.result;
                     if (!this.isCurrentRun(runGeneration)) return;
                     if (!this.isAuthorized()) {
@@ -1550,7 +1570,12 @@ export class SandboxHost {
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }
 
-                this.postResponse(response, runGeneration, streamPorts, rollbackStreams);
+                if (!this.isCurrentRun(runGeneration)) {
+                    rollbackResult();
+                    return;
+                }
+                if (this.postResponse(response, runGeneration, streamPorts)) commitResult();
+                else rollbackResult();
             }
         };
 

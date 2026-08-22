@@ -54,7 +54,10 @@ import { ContextResourceService } from './illustration/contextResources';
 import { createPocketContextResourceAdapter } from './illustration/contextResources.pocket';
 import { contextAssetAuthorityRegistry } from './illustration/contextAssetAuthorityRegistry';
 import { contextAssetReadCoordinator } from './illustration/contextAssetReadCoordinator';
-import { createStudioCardResourceService } from './illustration/studioCardResources';
+import {
+    createStudioCardResourceRpcApi,
+    createStudioCardResourceService,
+} from './illustration/studioCardResources';
 import { createPocketStudioCardResourceAdapter } from './illustration/studioCardResources.pocket';
 import { studioCardCapabilityIdsForApi } from './illustration/capabilityContract';
 import { ensureChatHydrated, ensureCurrentChatReady, saveChatToServer } from 'src/ts/storage/chatStorage';
@@ -697,6 +700,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             locale: DBState.db.language === 'ko' ? 'ko' : 'en',
         }),
     })
+    const studioCardRpcApi = createStudioCardResourceRpcApi(studioCardResources)
     addPluginUnloadCallback(context.instanceId, () => studioCardResources.dispose())
     const inlayNodeStorage = new NodeStorage()
     const messageQuery = new MessageQueryService(
@@ -1445,7 +1449,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.current.v1',
                     'context.assets.v1',
                     'context.modules-installed.v1',
-                    ...studioCardCapabilityIdsForApi(studioCardResources),
+                    ...studioCardCapabilityIdsForApi(studioCardRpcApi),
                     ...MESSAGE_QUERY_CAPABILITY_IDS,
                     ...MESSAGE_EVENT_CAPABILITY_IDS,
                     ...MESSAGE_PATCH_CAPABILITY_IDS,
@@ -1459,7 +1463,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
                 runtime: {
                     registeredServices,
-                    hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
+                    hasCurrentContext: Boolean(getCurrentCharacter()),
                 },
             })
         },
@@ -1470,18 +1474,18 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getActiveModules: (options) => contextResources.getActiveModules(options),
         listContextModules: (options) => contextResources.listContextModules(options),
         readContextAsset: (assetId: string, options) => contextResources.readContextAsset(assetId, options),
-        listStudioCards: (options) => studioCardResources.listStudioCards(options),
+        listStudioCards: (options) => studioCardRpcApi.listStudioCards(options),
         releaseStudioCardCatalogue: (catalogueRevision: string) =>
-            studioCardResources.releaseStudioCardCatalogue(catalogueRevision),
-        captureStudioCardSource: (input) => studioCardResources.captureStudioCardSource(input),
+            studioCardRpcApi.releaseStudioCardCatalogue(catalogueRevision),
+        captureStudioCardSource: (input) => studioCardRpcApi.captureStudioCardSource(input),
         releaseStudioCardTarget: (targetRevision: string) =>
-            studioCardResources.releaseStudioCardTarget(targetRevision),
-        listStudioCardAssets: (options) => studioCardResources.listStudioCardAssets(options),
-        resolveStudioCardAssetHandles: (options) => studioCardResources.resolveStudioCardAssetHandles(options),
+            studioCardRpcApi.releaseStudioCardTarget(targetRevision),
+        listStudioCardAssets: (options) => studioCardRpcApi.listStudioCardAssets(options),
+        resolveStudioCardAssetHandles: (options) => studioCardRpcApi.resolveStudioCardAssetHandles(options),
         releaseStudioCardAssetAccess: (accessRevision: string) =>
-            studioCardResources.releaseStudioCardAssetAccess(accessRevision),
+            studioCardRpcApi.releaseStudioCardAssetAccess(accessRevision),
         releaseStudioCardSource: (captureRevision: string) =>
-            studioCardResources.releaseStudioCardSource(captureRevision),
+            studioCardRpcApi.releaseStudioCardSource(captureRevision),
         getMessageSnapshot: (target) => messageQuery.getMessageSnapshot(target),
         getLatestCommittedMessage: (options) => messageQuery.getLatestCommittedMessage(options),
         getRecentCommittedMessages: (options) => messageQuery.getRecentCommittedMessages(options),
