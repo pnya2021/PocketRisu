@@ -228,6 +228,80 @@ describe('Pocket Studio card native projection', () => {
         expect(index.current().records.map(({ native }) => native.cardId)).toEqual(['alice', 'bob'])
     })
 
+    it('bounds a 4,902-card reactive catalogue to one scalar build and one indexed-field rebuild', async () => {
+        const visibleCardCount = 4_902
+        const scalarKeys = new Set(['chaId', 'type', 'name', 'image', 'characters', 'trashTime'])
+        let scalarReads = 0
+        let fullCardCloneReads = 0
+        const projectedTextOrLore = new Set<string>()
+        const cards = Array.from({ length: visibleCardCount }, (_, index) => {
+            const id = `card-${index.toString().padStart(4, '0')}`
+            const raw = character(id, `Card ${index.toString().padStart(4, '0')}`)
+            raw.image = ''
+            const chatTouched = () => { throw new Error(`chat data touched for ${id}`) }
+            guardChatData(raw, chatTouched)
+            return new Proxy(raw, {
+                getOwnPropertyDescriptor(target, property) {
+                    if (scalarKeys.has(String(property))) scalarReads += 1
+                    if (property === 'desc' || property === 'globalLore') projectedTextOrLore.add(id)
+                    return Reflect.getOwnPropertyDescriptor(target, property)
+                },
+                ownKeys(target) {
+                    fullCardCloneReads += 1
+                    return Reflect.ownKeys(target)
+                },
+            })
+        })
+        const state = deepState({ characters: cards })
+        const h = await harness({ characters: state.characters, selected: 0, reactive: true })
+
+        const first = await h.studio.listStudioCards({ limit: 24 })
+        expect(first.total).toBe(visibleCardCount)
+        expect(first.items).toHaveLength(24)
+        expect(scalarReads).toBe(visibleCardCount * scalarKeys.size * 4)
+        expect(fullCardCloneReads).toBe(0)
+        expect(projectedTextOrLore).toEqual(new Set())
+
+        const coldScalarReads = scalarReads
+        const coldGeneration = h.adapter.captureGeneration()
+        await h.studio.listStudioCards({ limit: 24 })
+        expect(scalarReads).toBe(coldScalarReads)
+        expect(h.adapter.captureGeneration()).toBe(coldGeneration)
+        expect(fullCardCloneReads).toBe(0)
+
+        state.characters[1].name = 'Card 0001 renamed'
+        const rebuilt = await h.studio.listStudioCards({ limit: 24 })
+        const rebuildScalarReads = scalarReads - coldScalarReads
+        const rebuiltGeneration = h.adapter.captureGeneration()
+        expect(rebuildScalarReads).toBeGreaterThan(0)
+        expect(rebuildScalarReads).toBeLessThanOrEqual(coldScalarReads)
+        expect(rebuiltGeneration).not.toBe(coldGeneration)
+        expect(rebuilt.items.some(({ name }) => name === 'Card 0001 renamed')).toBe(true)
+        await h.studio.listStudioCards({ limit: 24 })
+        expect(scalarReads).toBe(coldScalarReads + rebuildScalarReads)
+        expect(h.adapter.captureGeneration()).toBe(rebuiltGeneration)
+        expect(fullCardCloneReads).toBe(0)
+
+        state.characters[0].desc = 'selected text changed without rebuilding the catalogue'
+        state.characters[0].globalLore[0].content = 'selected lore changed without rebuilding the catalogue'
+        const selectedSummary = rebuilt.items.find(({ cardId }) => cardId === 'card-0000')!
+        const scalarReadsBeforeCapture = scalarReads
+        const capture = await h.studio.captureStudioCardSource({
+            cardId: selectedSummary.cardId,
+            expectedCatalogueItemRevision: selectedSummary.catalogueItemRevision,
+            catalogueRevision: rebuilt.catalogueRevision,
+        })
+
+        expect(capture.card.textSections.find(({ key }) => key === 'description')?.content)
+            .toBe('selected text changed without rebuilding the catalogue')
+        expect(capture.card.lorebook[0].content)
+            .toBe('selected lore changed without rebuilding the catalogue')
+        expect(projectedTextOrLore).toEqual(new Set(['card-0000']))
+        expect(scalarReads - scalarReadsBeforeCapture).toBeLessThanOrEqual(64)
+        expect(h.adapter.captureGeneration()).toBe(rebuiltGeneration)
+        expect(fullCardCloneReads).toBe(0)
+    }, 60_000)
+
     it.each([
         {
             change: 'card id',
@@ -429,12 +503,15 @@ describe('Pocket Studio card native projection', () => {
         expect(chatTouched).not.toHaveBeenCalled()
     })
 
-    it('enumerates 4,902 logical assets without authority and reads only an exact resolved batch', async () => {
+    it('bounds arbitrary 4,902-asset access and recapture without bulk handle reissue', async () => {
         const source = character('asset-heavy', 'Asset Heavy')
         source.image = ''
         source.additionalAssets = Array.from({ length: 4_902 }, (_, index) => [
             `asset-${index}`, `assets/asset-${index}.png`, 'png',
         ])
+        const expectedStorageKeys = new Set(
+            Array.from({ length: 4_902 }, (_, index) => `assets/asset-${index}.png`),
+        )
         const chatTouched = vi.fn(() => { throw new Error('chat data touched') })
         guardChatData(source, chatTouched)
         const h = await harness({ characters: [source], selected: 0 })
@@ -457,24 +534,66 @@ describe('Pocket Studio card native projection', () => {
         expect(h.registry.size(contextPrincipal(h))).toBe(0)
         expect(h.readImage).not.toHaveBeenCalled()
 
-        const requested = descriptors.slice(2_111, 2_135).map((asset) => asset.logicalAssetId)
-        const access = await h.studio.resolveStudioCardAssetHandles({
+        const ranked = Array.from({ length: descriptors.length }, (_, rank) =>
+            descriptors[(rank * 197 + 31) % descriptors.length].logicalAssetId)
+        expect(ranked.slice(0, 24)).not.toEqual(
+            descriptors.slice(0, 24).map(({ logicalAssetId }) => logicalAssetId),
+        )
+        const firstAccess = await h.studio.resolveStudioCardAssetHandles({
             captureRevision: capture.captureRevision,
-            logicalAssetIds: requested,
+            logicalAssetIds: ranked.slice(0, 24),
             purpose: 'candidate-page',
         })
-        expect(access.assets.map((asset) => asset.logicalAssetId)).toEqual(requested)
-        expect(h.registry.size(contextPrincipal(h))).toBe(24)
+        const adjacentAccess = await h.studio.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: ranked.slice(2_111, 2_135),
+            purpose: 'candidate-page',
+        })
+        const selectedAccess = await h.studio.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: ranked.slice(-3),
+            purpose: 'selected',
+        })
+        expect(firstAccess.assets).toHaveLength(24)
+        expect(adjacentAccess.assets).toHaveLength(24)
+        expect(selectedAccess.assets).toHaveLength(3)
+        expect(h.registry.size(contextPrincipal(h))).toBe(51)
         expect(h.readImage).not.toHaveBeenCalled()
 
-        await expect(h.reader.readContextAsset(access.assets[7].asset.assetId)).resolves.toMatchObject({
+        await expect(h.reader.readContextAsset(adjacentAccess.assets[7].asset.assetId)).resolves.toMatchObject({
             data: new Uint8Array([1, 2, 3]),
         })
-        expect(h.readImage).toHaveBeenCalledTimes(1)
-        await h.studio.releaseStudioCardAssetAccess(access.accessRevision)
-        await expect(h.reader.readContextAsset(access.assets[7].asset.assetId)).rejects.toMatchObject({ code: 'NOT_FOUND' })
-        await h.studio.releaseStudioCardSource(capture.captureRevision)
-        await h.studio.releaseStudioCardTarget(capture.targetRevision)
+        await expect(h.reader.readContextAsset(selectedAccess.assets[1].asset.assetId)).resolves.toMatchObject({
+            data: new Uint8Array([1, 2, 3]),
+        })
+        expect(h.readImage).toHaveBeenCalledTimes(2)
+
+        const currentAccess = await h.studio.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: ranked.slice(3_500, 3_524),
+            purpose: 'candidate-page',
+        })
+        expect(h.registry.size(contextPrincipal(h))).toBe(51)
+        await expect(h.reader.readContextAsset(firstAccess.assets[7].asset.assetId))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(h.readImage).toHaveBeenCalledTimes(2)
+        await expect(h.reader.readContextAsset(currentAccess.assets[7].asset.assetId)).resolves.toMatchObject({
+            data: new Uint8Array([1, 2, 3]),
+        })
+        expect(h.readImage).toHaveBeenCalledTimes(3)
+
+        h.getAssetStorageRevision.mockClear()
+        const recapture = await h.studio.captureStudioCardSource({
+            targetRevision: capture.targetRevision,
+            expectedSourceRevision: capture.sourceRevision,
+        })
+        const recaptureStorageKeys = new Set(
+            h.getAssetStorageRevision.mock.calls.map(([storageKey]) => storageKey),
+        )
+        expect(recaptureStorageKeys).toEqual(expectedStorageKeys)
+        expect(recapture.sourceRevision).toBe(capture.sourceRevision)
+        expect(recapture.captureRevision).not.toBe(capture.captureRevision)
+        expect(h.registry.size(contextPrincipal(h))).toBe(51)
         expect(chatTouched).not.toHaveBeenCalled()
     }, 60_000)
 
