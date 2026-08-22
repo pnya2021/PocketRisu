@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { dockerTagPlan } from './dockerTagPlan.mjs'
@@ -59,5 +60,22 @@ describe('PocketRisu Docker tag routing', () => {
             'publish_legacy=false',
             '',
         ].join('\n'))
+    })
+
+    it('checks out the repository in the merge job before executing the tag-plan helper', () => {
+        const workflow = readFileSync(
+            resolve(process.cwd(), '.github/workflows/docker-build.yml'),
+            'utf8',
+        ).replace(/\r\n/g, '\n')
+        const mergeStart = workflow.indexOf('\n  merge:\n')
+        const cleanupStart = workflow.indexOf('\n  cleanup-old-images:\n', mergeStart)
+        const mergeJob = workflow.slice(mergeStart, cleanupStart)
+        const checkout = mergeJob.search(/uses:\s+actions\/checkout@/)
+        const tagPlan = mergeJob.indexOf('node .github/scripts/dockerTagPlan.mjs')
+
+        expect(mergeStart).toBeGreaterThanOrEqual(0)
+        expect(cleanupStart).toBeGreaterThan(mergeStart)
+        expect(checkout).toBeGreaterThanOrEqual(0)
+        expect(tagPlan).toBeGreaterThan(checkout)
     })
 })
