@@ -33,6 +33,7 @@ import {
 } from "src/ts/preset/adapter";
 import { formatReasoningParts } from "src/ts/preset/adapter/reasoning";
 import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
+import { resolveWireModelId } from "src/ts/preset/adapter/wireInvariants";
 import { pumpPresetStream } from "./presetStreamPump";
 import { makeJobFetch } from "./jobFetch";
 import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams } from "./modelPresetBinding";
@@ -705,6 +706,18 @@ const formatPresetReasoning = formatReasoningParts
 async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelPreset, abortSignal:AbortSignal=null, mode:ModelModeExtended='model'):Promise<requestDataResponse> {
     const credential = buildModelPresetCredential(preset)
     const kind = preset.profileSnapshot.adapterKind
+    // Actual wire model id, for logs and generationInfo. The preset NAME was
+    // recorded before, which loses the real model once the preset is edited —
+    // and profileSnapshot.modelId alone is empty for profiles whose model is a
+    // user value (resolveWireModelId prefers userValues.modelId). Resolution
+    // throws only on broken config; the request would fail anyway, so fall
+    // back to something identifying for that failed entry's log row.
+    let wireModel: string
+    try {
+        wireModel = resolveWireModelId(preset)
+    } catch {
+        wireModel = preset.profileSnapshot.modelId || preset.name
+    }
     // arg.chatId is the per-request generationId for main chat (sendChat passes
     // it under that name; see generation-state-keying.md §1-bis). Aux requests
     // (translate/memory/emotion/sub) don't supply one, so mint a per-request key
@@ -727,7 +740,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         source: arg.logSource ?? (arg.previewBody ? 'preview' : toLogSource(mode)),
         chatId: genId,
         generationId: genId,
-        model: preset.profileSnapshot.modelId,
+        model: wireModel,
         provider: preset.profileSnapshot.providerBaseId,
         streaming: resolvePresetStreaming(preset, arg),
     })
@@ -777,7 +790,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             realChatId: arg.realChatId ?? genId,
             generationId: genId,
             adapterKind: kind,
-            model: preset.profileSnapshot.modelId,
+            model: wireModel,
             jobKind: arg.realChatId ? 'main' : 'aux',
             streaming: resolvePresetStreaming(preset, arg),
             timeoutMs: (getDatabase().localNetworkTimeoutSec ?? 600) * 1000,
@@ -875,7 +888,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     try {
         arg.formated = reformater(safeStructuredClone(arg.formated), presetFlags)
     } catch (err) {
-        return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: preset.name }
+        return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: wireModel }
     }
 
     // Expand `<tool_call>` history into structured tool turns ONLY on the active
@@ -904,10 +917,10 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             return {
                 type: 'success',
                 result: JSON.stringify({ url: prepared.url, body: prepared.body, headers: prepared.headers }),
-                model: preset.name,
+                model: wireModel,
             }
         } catch (err) {
-            return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: preset.name }
+            return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: wireModel }
         } finally {
             void logScope.close()
         }
@@ -923,7 +936,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             // The tool loop issues one request per turn; each is its own log
             // entry and all of them flush together here.
             void logScope.close()
-            return { type: 'success', result, model: preset.name, toolExecuted: toolsExecuted }
+            return { type: 'success', result, model: wireModel, toolExecuted: toolsExecuted }
         }
 
         const useStreaming = resolvePresetStreaming(preset, arg)
@@ -992,11 +1005,11 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             // once instead of token-by-token.
             if(preset.decoupledStreaming){
                 const text = await collectStreamingText(stream)
-                return { type: 'success', result: text, model: preset.name }
+                return { type: 'success', result: text, model: wireModel }
             }
             // endStatus fires from the pump's onFinish once the consumer drains
             // the stream — NOT here, because the stream outlives this return.
-            return { type: 'streaming', result: stream, model: preset.name }
+            return { type: 'streaming', result: stream, model: wireModel }
         }
         const response = await sendModelPreset(kind, preset, options, credential)
         logScope.setUsage(toLogUsage(response.usage))
@@ -1016,7 +1029,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
                 })
             })
         }
-        return { type: 'success', result: formatPresetReasoning(response.reasoning) + response.text, model: preset.name }
+        return { type: 'success', result: formatPresetReasoning(response.reasoning) + response.text, model: wireModel }
     } catch (err) {
         console.error('[ModelPreset] request failed', describeModelPresetError(err))
         // A throw before the stream started (or instead of it) means onFinish
@@ -1030,7 +1043,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         return {
             type: 'fail',
             result: err instanceof Error ? err.message : String(err),
-            model: preset.name,
+            model: wireModel,
         }
     }
 }

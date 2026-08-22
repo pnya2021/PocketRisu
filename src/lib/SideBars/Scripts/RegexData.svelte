@@ -29,9 +29,12 @@ interface Props {
     idx
   }: Props = $props();
 
+    // flag is optional in customscript — imported/legacy scripts can have
+    // ableFlag set without a flag string, so every read must tolerate undefined.
     const checkFlagContain = (flag:string, matchFlag:string) => {
+        matchFlag ??= ''
         if(flag.length === 1){
-            matchFlag = value.flag.replace(/<(.+?)>/g, '')
+            matchFlag = (value.flag ?? '').replace(/<(.+?)>/g, '')
         }
         return matchFlag.includes(flag)
     }
@@ -42,12 +45,12 @@ interface Props {
             value.flag = value.flag.replace(flag, '')
         }
         else{
-            value.flag += flag
+            value.flag = (value.flag ?? '') + flag
         }
     }
 
     const getOrder = (flag:string) => {
-        const order = flag.match(/<order (-?\d+)>/)?.[1]
+        const order = flag?.match(/<order (-?\d+)>/)?.[1]
         if(order === undefined || order === null){
             return 0
         }
@@ -55,11 +58,11 @@ interface Props {
     }
 
     const changeOrder = (order:number) => {
-        if(value.flag.includes('<order')){
+        if(value.flag?.includes('<order')){
             value.flag = value.flag.replace(/<order (-?\d+)>/, `<order ${order}>`)
         }
         else{
-            value.flag += `<order ${order}>`
+            value.flag = (value.flag ?? '') + `<order ${order}>`
         }
     }
 

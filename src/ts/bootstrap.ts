@@ -26,6 +26,7 @@ import {
     setPatchSyncBaseline,
     getDbBackups,
     getUncleanables,
+    extractAssetRefs,
     getBasename,
     checkCharOrder
 } from "./globalApi.svelte";
@@ -546,8 +547,28 @@ async function checkNewFormat(): Promise<void> {
  */
 async function cleanChunks() {
     const db = getDatabase()
+    // Orphan assets/* are only swept when the user opted in — the walker below
+    // has no way to know about a reference field it was never taught, and the
+    // deletion is permanent. Opted out, the storage dashboard offers the same
+    // sweep on demand. remotes/* are regenerable caches and always swept.
+    const cleanAssets = db.nodeOnlyAutoCleanAssets === true
     const uncleanable = new Set(getUncleanables(db))
     const indexes = await forageStorage.keys()
+    // V3 plugin persistent storage lives outside the DB (cache/plugin-storage/*)
+    // and may hold saveAsset paths — treat anything it references as in use.
+    if (cleanAssets) {
+        for (const key of indexes) {
+            if (!key.startsWith('cache/plugin-storage/')) continue
+            try {
+                const payload = await forageStorage.getItem(key)
+                if (!payload) continue
+                const text = new TextDecoder().decode(payload)
+                for (const ref of extractAssetRefs(text)) {
+                    uncleanable.add(getBasename(ref))
+                }
+            } catch { /* unreadable entry — skip */ }
+        }
+    }
     const allKeys = new Set(indexes)
     const characterIds = new Set<string>(
         db.characters.map((v) => v.chaId)
@@ -557,6 +578,9 @@ async function cleanChunks() {
             continue
         }
         else if (asset.startsWith('assets/')) {
+            if(!cleanAssets) {
+                continue
+            }
             const n = getBasename(asset)
             if(!uncleanable.has(n)) {
                 await forageStorage.removeItem(asset)

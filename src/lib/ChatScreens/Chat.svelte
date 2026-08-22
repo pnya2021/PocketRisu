@@ -1167,6 +1167,15 @@
                     </div>
                 </div>
             </div>
+        {:else if isComment}
+            <!-- Comment messages (e.g. branch-point markers) are blankMessage,
+                 but must still render their text and delete button. -->
+            <div class="flex flex-col w-full min-w-0 max-w-3xl mx-auto px-4 sm:px-8">
+                <div class="flexium items-center">
+                    {@render iconButtons()}
+                </div>
+                {@render textBox()}
+            </div>
         {/if}
     </div>
 </div>

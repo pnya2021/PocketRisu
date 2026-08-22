@@ -1079,6 +1079,7 @@ export const languageKorean = {
   persistentStorageFail:
     "저장소 설정에 실패했습니다. 브라우저에서 거부되었을 수 있습니다.",
   persistentStorageRecommended: "영구 저장소 권장됨",
+  unsupportedFileType: "지원하지 않는 파일 형식입니다",
   persistentStorageDesc:
     "당신의 브라우저는 영구 저장소를 지원합니다. 이 기능을 활성화하면, 데이터가 브라우저에 더 오래 남습니다.",
   enable: "활성화",
@@ -1671,6 +1672,7 @@ export const languageKorean = {
   folderNameInput: "새 폴더 이름을 입력해주세요",
   folderRemoveLengthError: "폴더를 제거하려면 폴더가 비어 있어야 합니다.",
   personaNote: "페르소나 노트",
+  personaDuplicate: "복제",
   mcpAccessPrompt:
     '{{tool}}이(가) "{{action}}"을(를) 시도하고 있습니다. 허용하시겠습니까?',
   rememberToolUsage: "도구 사용 기억하기",
@@ -2247,6 +2249,26 @@ export const languageKorean = {
   storageOptimizeFailed: "정리 실패",
 
   storageCleanup: "SQLite 오버헤드 정리",
+
+  storageOrphan: "고아 미디어",
+  storageOrphanHeader: (count: number, size: number) =>
+    `${count}개 · ${(size / 1024 / 1024).toFixed(1)} MB`,
+  storageOrphanWhat:
+    "캐릭터·모듈·페르소나 어디에서도 참조하지 않는 이미지 파일입니다. 캐릭터를 지우거나 에셋을 교체할 때 남습니다.",
+  storageOrphanWhen:
+    "삭제된 파일은 복구할 수 없습니다. 중요한 데이터가 있다면 백업을 먼저 만드세요. 정리 후에는 위의 \"SQLite 오버헤드 정리\"까지 실행해야 파일 크기가 실제로 줄어듭니다.",
+  storageOrphanUnavailable:
+    "아직 검사할 수 없습니다. 데이터베이스가 서버 메모리에 올라온 뒤 새로고침하세요.",
+  storageOrphanPurge: "고아 미디어 정리",
+  storageOrphanPurging: "고아 미디어 정리 중...",
+  storageOrphanConfirm: (count: number, size: number) =>
+    `참조되지 않는 미디어 ${count}개(${(size / 1024 / 1024).toFixed(1)} MB)를 삭제할까요? 되돌릴 수 없습니다.`,
+  storageOrphanDone: (count: number, size: number) =>
+    `${count}개 삭제 (${(size / 1024 / 1024).toFixed(1)} MB).`,
+  storageOrphanFailed: "고아 미디어 정리 실패",
+  storageOrphanAutoClean: "부팅 시 자동 정리",
+  storageOrphanAutoCleanDesc:
+    "앱을 열 때마다 고아 미디어를 자동으로 지웁니다. 기본은 꺼짐 — 아직 알려지지 않은 참조까지 지울 수 있어 수동 정리를 권장합니다.",
 
   storageWalCleanup: "WAL 수동 정리",
   storageWalCleanupHeader: (walSize: number) =>

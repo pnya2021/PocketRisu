@@ -1412,6 +1412,10 @@ export class SandboxHost {
         this.iframe.sandbox.add('allow-modals')
         this.iframe.sandbox.add('allow-downloads')
 
+        // Permissions Policy: let plugins keep the screen awake during
+        // long-running streams (mobile Safari kills streaming on screen-off).
+        this.iframe.setAttribute('allow', 'screen-wake-lock')
+
         this.iframe.setAttribute('csp', this.csp);
 
         this.terminated = false;

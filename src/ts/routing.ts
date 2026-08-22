@@ -16,7 +16,7 @@
 // src/ts/setting/searchIndex.ts (declarativeSources), hardcoded pages in
 // src/ts/setting/searchManifestData.ts. Otherwise it won't be findable.
 
-import { settingsOpen, SettingsMenuIndex, SystemSubmenuIndex, AccessibilitySubmenuIndex } from "./stores.svelte";
+import { settingsOpen, SettingsMenuIndex, SystemSubmenuIndex, AccessibilitySubmenuIndex, ModelPresetListTabIndex } from "./stores.svelte";
 
 export const SettingsRoute = {
     None: -1 as const,
@@ -69,6 +69,19 @@ export const AccessibilityTab = {
 
 export type AccessibilityTabValue = (typeof AccessibilityTab)[keyof typeof AccessibilityTab];
 
+/** Top-level tab indices of the Model Preset page ($ModelPresetListTabIndex).
+ *  Values mirror the SettingTabs list in ModelPresetSettings.svelte — note the
+ *  display order there is Presets, Keys, Modules, Options while the stored
+ *  values are not sequential. */
+export const ModelPresetTab = {
+    Presets: 0 as const,
+    Keys: 1 as const,
+    Options: 2 as const,
+    Modules: 3 as const,
+} as const;
+
+export type ModelPresetTabValue = (typeof ModelPresetTab)[keyof typeof ModelPresetTab];
+
 /**
  * Open the settings panel and navigate to a specific page (and optional
  * System sub-tab). Use this from anywhere in the app that needs to deep-link
@@ -78,6 +91,7 @@ export function openSettings(
     route: SettingsRouteValue,
     systemTab?: SystemTabValue,
     accessibilityTab?: AccessibilityTabValue,
+    modelPresetTab?: ModelPresetTabValue,
 ) {
     SettingsMenuIndex.set(route);
     if (systemTab !== undefined) {
@@ -85,6 +99,9 @@ export function openSettings(
     }
     if (accessibilityTab !== undefined) {
         AccessibilitySubmenuIndex.set(accessibilityTab);
+    }
+    if (modelPresetTab !== undefined) {
+        ModelPresetListTabIndex.set(modelPresetTab);
     }
     settingsOpen.set(true);
 }

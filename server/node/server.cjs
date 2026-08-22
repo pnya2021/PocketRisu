@@ -3668,6 +3668,9 @@ app.post('/api/patch', async (req, res, next) => {
         return;
     }
 
+    // Which step of the patch flow was running when the outer catch fired —
+    // without it a bare error name (e.g. RangeError) is undiagnosable.
+    let patchStage = 'load';
     try {
         await queueStorageOperation(async () => {
             const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
@@ -3724,14 +3727,18 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
+            patchStage = 'hash';
             const serverHash = calculateHash(dbCache[filePath]).toString(16);
 
             if (expectedHash !== serverHash) {
                 console.log(`[Patch] Hash mismatch for ${decodedKey}: expected=${expectedHash}, server=${serverHash}`);
                 let currentEtag = undefined;
                 if (decodedKey === 'database/database.bin') {
-                    currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
-                    dbEtag = currentEtag;
+                    // Encode failure must not upgrade this 409 into a 500.
+                    try {
+                        currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                        dbEtag = currentEtag;
+                    } catch {}
                 }
                 res.status(409).send({
                     error: 'Hash mismatch - data out of sync',
@@ -3740,8 +3747,15 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
-            // Apply patch to in-memory database (clone first to prevent partial mutation on failure)
-            const snapshot = JSON.parse(JSON.stringify(dbCache[filePath]));
+            // Apply patch to in-memory database (clone first to prevent partial
+            // mutation on failure). structuredClone instead of a JSON round-trip:
+            // stringifying the whole DB into one JS string hits V8's ~512MB
+            // string ceiling on large databases (RangeError: Invalid string
+            // length), which rejected every patch. The cache is normalized to
+            // plain JSON values at load, so the clone semantics are identical.
+            patchStage = 'clone';
+            const snapshot = structuredClone(dbCache[filePath]);
+            patchStage = 'apply';
             let result;
             try {
                 result = applyPatch(snapshot, patch, true);
@@ -3790,6 +3804,7 @@ app.post('/api/patch', async (req, res, next) => {
             }, SAVE_INTERVAL);
 
             // Update ETag after successful patch (based on stripped version)
+            patchStage = 'etag';
             if (decodedKey === 'database/database.bin') {
                 dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
             }
@@ -3806,7 +3821,12 @@ app.post('/api/patch', async (req, res, next) => {
             res.send(responsePayload);
         });
     } catch (error) {
-        logger.error(`[Patch] Error applying patch to ${filePath}:`, error.name);
+        const decodedKeyForLog = isHex(filePath) ? Buffer.from(filePath, 'hex').toString('utf-8') : filePath;
+        logger.error(
+            `[Patch] Error applying patch to ${decodedKeyForLog} (stage=${patchStage}, ops=${Array.isArray(patch) ? patch.length : '?'}): `
+            + `${error?.name}: ${error?.message}`,
+            error?.stack
+        );
         res.status(500).send({
             error: 'Patch application failed: ' + (error && error.message ? error.message : error)
         });
@@ -5100,6 +5120,37 @@ function statsBasename(s) {
     return String(s).replace(/\\/g, '/').split('/').pop();
 }
 
+// Pull "assets/..." path references out of an arbitrary value. Non-string
+// values are serialized first so references nested inside plugin-stored JSON
+// (objects, arrays) are found too. Mirrors globalApi's extractAssetRefs.
+function extractAssetRefsFromText(value) {
+    let text;
+    if (typeof value === 'string') text = value;
+    else {
+        try { text = JSON.stringify(value) ?? ''; } catch { return []; }
+    }
+    return Array.from(text.matchAll(/assets[/\\][\w-]+\.\w+/g), (m) => m[0]);
+}
+
+// V3 plugin persistent storage lives in kv (cache/plugin-storage/*.json), not
+// in the DB blob, and may hold saveAsset paths. Returns basenames so callers
+// can union it with buildUncleanableSet before deciding what is orphaned.
+function collectPluginStorageAssetRefs() {
+    const set = new Set();
+    for (const key of kvList('cache/plugin-storage/')) {
+        try {
+            const raw = kvGet(key);
+            if (!raw) continue;
+            const text = Buffer.isBuffer(raw) ? raw.toString('utf-8') : String(raw);
+            for (const ref of extractAssetRefsFromText(text)) {
+                const bn = statsBasename(ref);
+                if (bn) set.add(bn);
+            }
+        } catch { /* unreadable entry — skip */ }
+    }
+    return set;
+}
+
 // Every asset reference reachable from the DB. Mirrors
 // src/ts/globalApi.svelte.ts:getUncleanables, plus the settings-level image-gen
 // references that walker misses (NAIImgConfig, wavespeedImage).
@@ -5143,6 +5194,8 @@ function buildUncleanableSet(dbObj, { includeModuleAssets = true } = {}) {
             if (Array.isArray(cha.additionalAssets)) for (const em of cha.additionalAssets) add(em?.[1]);
             if (cha.vits?.files) for (const k of Object.keys(cha.vits.files)) add(cha.vits.files[k]);
             if (Array.isArray(cha.ccAssets)) for (const a of cha.ccAssets) add(a?.uri);
+            // GPT-SoVITS reference audio — assetId holds the full "assets/..." path.
+            add(cha.gptSoVitsConfig?.ref_audio_data?.assetId);
         }
     }
     if (Array.isArray(dbObj.modules)) {
@@ -5154,6 +5207,9 @@ function buildUncleanableSet(dbObj, { includeModuleAssets = true } = {}) {
     if (Array.isArray(dbObj.personas)) {
         for (const p of dbObj.personas) {
             add(p?.icon);
+            // Legacy `image` alongside `icon` on card-imported personas. Unread
+            // by current code but still a live reference — see getUncleanables.
+            add(p?.image);
             const embedded = p?.embeddedModule;
             if (includeModuleAssets && Array.isArray(embedded?.assets)) for (const a of embedded.assets) add(a?.[1]);
             add(embedded?.icon);
@@ -5162,6 +5218,14 @@ function buildUncleanableSet(dbObj, { includeModuleAssets = true } = {}) {
     if (Array.isArray(dbObj.characterOrder)) {
         for (const item of dbObj.characterOrder) {
             if (item && typeof item === 'object' && 'imgFile' in item) add(item.imgFile);
+        }
+    }
+    // Plugins can persist asset paths (from risuai.saveAsset) anywhere inside
+    // their storage — as plain strings or nested in JSON values — so scan the
+    // serialized text for "assets/..." references instead of assuming a structure.
+    if (dbObj.pluginCustomStorage && typeof dbObj.pluginCustomStorage === 'object') {
+        for (const value of Object.values(dbObj.pluginCustomStorage)) {
+            for (const ref of extractAssetRefsFromText(value)) add(ref);
         }
     }
     return set;
@@ -5323,8 +5387,12 @@ app.get('/api/db/stats', async (req, res, next) => {
             }
             trashed.available = true;
         }
-        if (stripped) {
+        // `characters` must be an array: a decode failure parks `{}` in dbCache,
+        // and walking that yields an empty reference set — which would report
+        // every stored asset as an orphan.
+        if (stripped && Array.isArray(stripped.characters)) {
             const uncleanable = buildUncleanableSet(stripped);
+            for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
             for (const it of kvListWithSizes('assets/')) {
                 if (!uncleanable.has(statsBasename(it.key))) {
                     orphan.count++;
@@ -5439,6 +5507,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
         }
 
         const uncleanable = buildUncleanableSet(dbObj);
+        for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
         let orphanCount = 0, orphanTotal = 0;
         for (const it of kvListWithSizes('assets/')) {
             if (!uncleanable.has(statsBasename(it.key))) {
@@ -5513,6 +5582,54 @@ app.get('/api/db/stats/modules', async (req, res, next) => {
     } catch (err) { next(err); }
 });
 
+// Delete every assets/* row no reference in the database points at. The count
+// shown by /api/db/stats comes from the in-memory stripped cache; this pass
+// recomputes from the persisted blob instead, so the deletion is decided by the
+// same bytes a backup would carry rather than by cache state.
+app.post('/api/db/assets/purge-orphans', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const result = await queueStorageOperation(async () => {
+            // Land any debounced write first — otherwise the blob we walk is
+            // older than the assets the client just attached.
+            await flushPendingDb();
+            const raw = kvGet(DB_BLOB_KEY);
+            if (!raw) return { error: 'No database blob' };
+            const dbObj = await decodeRisuSave(raw);
+            if (!dbObj || !Array.isArray(dbObj.characters)) return { error: 'Database decode failed' };
+
+            const uncleanable = buildUncleanableSet(dbObj);
+            const assets = kvListWithSizes('assets/');
+            // A walker that returns nothing while assets exist means the decode
+            // produced a shape we do not understand — every asset would look
+            // orphaned. Refuse rather than delete the library. Checked before
+            // plugin-storage refs are unioned in so those can't mask a bad walk.
+            if (uncleanable.size === 0 && assets.length > 0) {
+                return { error: 'Reference scan produced no references — refusing to purge' };
+            }
+            for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
+
+            const victims = assets.filter((it) => !uncleanable.has(statsBasename(it.key)));
+            // One commit for the whole sweep: thousands of autocommitted deletes
+            // would each hit the WAL, and a crash mid-loop would leave the
+            // library half-swept.
+            sqliteDb.transaction(() => {
+                for (const it of victims) kvDel(it.key);
+            })();
+            const deleted = victims.length;
+            const bytes = victims.reduce((sum, it) => sum + it.size, 0);
+            if (deleted > 0) {
+                try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[PurgeOrphans] checkpoint failed:', e?.message || e); }
+            }
+            return { ok: true, deleted, bytes, scanned: assets.length };
+        });
+        if (result.error) return res.status(400).json(result);
+        logger.info(`[PurgeOrphans] removed ${result.deleted}/${result.scanned} assets (${result.bytes} bytes)`);
+        res.json(result);
+    } catch (err) { next(err); }
+});
+
 app.post('/api/db/optimize', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
@@ -5521,11 +5638,14 @@ app.post('/api/db/optimize', async (req, res, next) => {
         const dbFilePath = path.join(saveDir, 'risuai.db');
         const preDbSize = statSafe(dbFilePath)?.size ?? 0;
 
+        // VACUUM peaks at ~2x the DB size on disk: the transient copy it builds
+        // (routed to the save dir via SQLITE_TMPDIR) plus the WAL inflating to
+        // roughly the full DB while the copy is written back.
         const { free } = await diskFreeStat(saveDir);
-        if (preDbSize > 0 && free != null && free < preDbSize * 1.2) {
+        if (preDbSize > 0 && free != null && free < preDbSize * 2.2) {
             return res.status(400).json({
                 error: 'Insufficient disk space for VACUUM',
-                required: Math.ceil(preDbSize * 1.2),
+                required: Math.ceil(preDbSize * 2.2),
                 free,
             });
         }
@@ -5539,7 +5659,16 @@ app.post('/api/db/optimize', async (req, res, next) => {
             let gcDeleted = 0;
             try { gcDeleted = gcChunks(); } catch (e) { logger.warn('[Optimize] chunk gc failed:', e?.message || e); }
             try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[Optimize] checkpoint failed:', e?.message || e); }
-            sqliteDb.exec('VACUUM');
+            // VACUUM copies the entire DB into a transient database that honors
+            // temp_store. With the session-wide temp_store=MEMORY that copy
+            // lands in RAM and OOM-kills the process on multi-GB DBs, so spill
+            // it to disk (SQLITE_TMPDIR = save dir) for the duration.
+            sqliteDb.pragma('temp_store = FILE');
+            try {
+                sqliteDb.exec('VACUUM');
+            } finally {
+                sqliteDb.pragma('temp_store = MEMORY');
+            }
             // VACUUM streams the whole DB through the WAL; without this checkpoint the
             // -wal file stays inflated until the next 5-min background TRUNCATE.
             try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[Optimize] post-VACUUM checkpoint failed:', e?.message || e); }

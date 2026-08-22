@@ -237,6 +237,17 @@ describe('recoverTerminalJob', () => {
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
     })
 
+    test('recovered messages retain the job model label used by the live generation path', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({ journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverTerminalJob(makeJob({ model: 'gpt-5' }) as any)
+
+        expect(chat.message[0]?.generationInfo?.model).toBe('gpt-5')
+    })
+
     test('fresh group recovery uses the neutral group fallback when the job has no member identity', async () => {
         const { recovery } = await loadModules()
         const chat = makeChat()

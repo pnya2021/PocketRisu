@@ -558,6 +558,11 @@ export class NodeStorage{
             return { success: false, etag: currentEtag, chatGuardRejected: rejectedByChatGuard }
         }
         if (da.status < 200 || da.status >= 300) {
+            // Surface the server's error detail — without this the browser
+            // console shows nothing while every save silently falls back to
+            // a full write.
+            const body = await da.text().catch(() => '')
+            console.error(`[Patch] Server rejected patch (${da.status}):`, body)
             return { success: false }
         }
         const data = await da.json()

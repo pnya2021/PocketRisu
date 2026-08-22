@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
+      - 'v*'
       - 'pnya-v*'
 
 env:
@@ -100,40 +101,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from tag
+      - name: Resolve Docker tag plan
         id: version
-        shell: bash
-        run: |
-          if [[ "${{ github.ref }}" =~ ^refs/tags/pnya-v(.+)$ ]]; then
-            VERSION="${BASH_REMATCH[1]}"
-            MINOR="${VERSION%.*}"
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-            echo "minor=$MINOR" >> $GITHUB_OUTPUT
-            echo "is_tag=true" >> $GITHUB_OUTPUT
-          else
-            echo "version=pnya-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
-            echo "is_tag=false" >> $GITHUB_OUTPUT
-          fi
+        env:
+          DOCKER_RELEASE_REF: ${{ github.ref }}
+          DOCKER_RELEASE_SHA: ${{ github.sha }}
+        run: node .github/scripts/dockerTagPlan.mjs >> "$GITHUB_OUTPUT"
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
         shell: bash
+        env:
+          TAG_SUFFIXES: ${{ steps.version.outputs.tag_suffixes }}
         run: |
           IMAGE="${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}"
           TAGS=""
-          if [[ "${{ steps.version.outputs.is_tag }}" == "true" ]]; then
-            TAGS="-t ${IMAGE}:pnya-latest"
-            TAGS="$TAGS -t ${IMAGE}:pnya-v${{ steps.version.outputs.version }}"
-            TAGS="$TAGS -t ${IMAGE}:pnya-v${{ steps.version.outputs.minor }}"
-          else
-            TAGS="-t ${IMAGE}:${{ steps.version.outputs.version }}"
-          fi
+          for SUFFIX in $TAG_SUFFIXES; do
+            TAGS="$TAGS -t ${IMAGE}:${SUFFIX}"
+          done
           docker buildx imagetools create $TAGS \
             $(printf "${IMAGE}@sha256:%s " *)
 
+      # Official v* releases retain the mandatory legacy publish. Personal
+      # pnya-v* releases never require or use the official maintainer's PAT.
+      - name: Log in to legacy GHCR
+        if: steps.version.outputs.publish_legacy == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: mrbart3885
+          password: ${{ secrets.GHCR_LEGACY_PAT }}
+
+      - name: Create legacy manifest list and push
+        if: steps.version.outputs.publish_legacy == 'true'
+        working-directory: /tmp/digests
+        shell: bash
+        run: |
+          NEW="${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}"
+          LEGACY="${{ env.REGISTRY }}/mrbart3885/risuai-nodeonly"
+          TAGS="-t ${LEGACY}:latest"
+          TAGS="$TAGS -t ${LEGACY}:v${{ steps.version.outputs.version }}"
+          TAGS="$TAGS -t ${LEGACY}:v${{ steps.version.outputs.minor }}"
+          docker buildx imagetools create $TAGS \
+            $(printf "${NEW}@sha256:%s " *)
+
   cleanup-old-images:
     needs: merge
-    if: startsWith(github.ref, 'refs/tags/pnya-v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/pnya-v')
     runs-on: ubuntu-latest
     permissions:
       packages: write
