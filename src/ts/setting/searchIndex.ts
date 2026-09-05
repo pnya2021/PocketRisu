@@ -28,6 +28,7 @@ import {
     DisplaySubmenuIndex,
     BotSubmenuIndex,
     PromptPresetSubmenuIndex,
+    PromptPresetEditorOpen,
     OtherBotsSubmenuIndex,
     InlayGallerySubmenuIndex,
     ModelPresetListTabIndex,
@@ -266,6 +267,9 @@ const submenuStores: Partial<Record<SettingsRouteValue, Writable<number>>> = {
  */
 export function navigateToSearchResult(result: SettingSearchResult) {
     openSettings(result.route);
+    if (result.route === SettingsRoute.PromptPreset) {
+        PromptPresetEditorOpen.set(true);
+    }
     if (result.subTab !== undefined) {
         submenuStores[result.route]?.set(result.subTab);
     }

@@ -887,19 +887,22 @@ export const searchTagList = (query:string) => {
     const result: string[] = []
 
     for(const tag of TagList){
-        if(tag.value.startsWith(realQuery)){
+        if(tag.value.toLowerCase().startsWith(realQuery)){
             result.push(tag.value)
             continue
         }
         for(const alias of tag.alias){
-            if(alias.startsWith(realQuery)){
+            if(alias.toLowerCase().startsWith(realQuery)){
                 result.push(tag.value)
                 break
             }
         }
     }
 
-    return result.filter(v => splited.indexOf(v) === -1)
+    // Case-insensitive dedup: `splited` holds the user's raw input while
+    // `result` holds canonical tag casing (e.g. typed "male" vs tag "Male").
+    const splitedLower = splited.map(v => v.toLowerCase())
+    return result.filter(v => splitedLower.indexOf(v.toLowerCase()) === -1)
 }
 
 export const isKnownUri = (uri:string) => {
@@ -1015,6 +1018,11 @@ export const sortableOptions = {
 	delay: 300, // time in milliseconds to define when the sorting should start
 	delayOnTouchOnly: true,
     filter: '.no-sort',
+    // Sortable's default preventOnFilter calls preventDefault() on the
+    // pointerdown of filtered elements, which blocks input focus by mouse and
+    // cancels the synthetic click on iOS — the .no-sort areas hold the plugin
+    // toggle and argument inputs, which must stay interactive.
+    preventOnFilter: false,
     onMove: (event) => {
         return event.related.className.indexOf('no-sort') === -1
     }

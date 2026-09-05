@@ -19,6 +19,7 @@ describe('V2 runtime reload', () => {
         const unload = vi.fn()
         const runtime: PluginV2RuntimeState = {
             providers: new Map([['provider', handler]]),
+            chatOutput: new Set([handler]),
             providerOptions: new Map([['provider', { tokenizer: 'legacy' }]]),
             editdisplay: new Set([handler]), editoutput: new Set([handler]),
             editprocess: new Set([handler]), editinput: new Set([handler]),
@@ -37,6 +38,7 @@ describe('V2 runtime reload', () => {
         expect(runtime.editoutput.size).toBe(0)
         expect(runtime.editprocess.size).toBe(0)
         expect(runtime.editinput.size).toBe(0)
+        expect(runtime.chatOutput?.size).toBe(0)
         expect(runtime.replacerbeforeRequest.size).toBe(0)
         expect(runtime.replacerafterRequest.size).toBe(0)
         expect(runtime.unload.size).toBe(0)

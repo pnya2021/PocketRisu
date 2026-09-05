@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { DynamicGUI, settingsOpen, sideBarStore, openPresetList, openModelPresetList, openModelProfileBrowser, openPersonaList, personaSelectCallback, openHypaV3PresetList, openThemePresetList, MobileGUI, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, popUpEditorStore } from './ts/stores.svelte';
+    import { DynamicGUI, settingsOpen, sideBarStore, openPresetList, openModelPresetList, openModelProfileBrowser, openPersonaList, personaSelectCallback, openMemoryPresetList, memoryPresetSelectCallback, openThemePresetList, MobileGUI, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, popUpEditorStore } from './ts/stores.svelte';
     import Sidebar from './lib/SideBars/Sidebar.svelte';
     import { DBState } from './ts/stores.svelte';
     import ChatScreen from './lib/ChatScreens/ChatScreen.svelte';
@@ -19,7 +19,7 @@
     import ModelProfileBrowser from './lib/Setting/modelProfileBrowser.svelte';
     import Themepreset from './lib/Setting/themepreset.svelte';
     import ListedPersona from './lib/Setting/listedPersona.svelte';
-    import ListedHypaV3Preset from './lib/Setting/listedHypaV3Preset.svelte';
+    import ListedMemoryPreset from './lib/Setting/listedMemoryPreset.svelte';
     import MobileHeader from './lib/Mobile/MobileHeader.svelte';
     import MobileBody from './lib/Mobile/MobileBody.svelte';
     import MobileFooter from './lib/Mobile/MobileFooter.svelte';
@@ -34,6 +34,7 @@
     import PluginPermissionConsent from './lib/Others/PluginPermissionConsent.svelte';
     import PopupEditor from './lib/Others/PopupEditor.svelte';
     import UpdatePopup from './lib/Others/UpdatePopup.svelte';
+    import SupportDialog from './lib/Others/SupportDialog.svelte';
     import BootBackupPrompt from './lib/Others/BootBackupPrompt.svelte';
     import PopupList from './lib/UI/PopupList.svelte';
     import LoadingOverlay from './lib/Others/LoadingOverlay.svelte';
@@ -250,8 +251,8 @@
     {#if $openPersonaList}
         <ListedPersona close={() => {$openPersonaList = false; $personaSelectCallback = null}} onSelect={$personaSelectCallback} />
     {/if}
-    {#if $openHypaV3PresetList}
-        <ListedHypaV3Preset close={() => {$openHypaV3PresetList = false}} />
+    {#if $openMemoryPresetList}
+        <ListedMemoryPreset close={() => {$openMemoryPresetList = false; $memoryPresetSelectCallback = null}} onSelect={$memoryPresetSelectCallback} />
     {/if}
     {#if $bookmarkListOpen}
         <BookmarkList />
@@ -267,6 +268,7 @@
     <PluginPermissionConsent />
     <LoadingOverlay />
     <UpdatePopup />
+    <SupportDialog />
     <BootBackupPrompt />
     {#if popupStore.children}
         <PopupList />

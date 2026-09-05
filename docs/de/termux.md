@@ -8,7 +8,7 @@
 
 Diese Anleitung erklärt, wie PocketRisu direkt auf einem Android-Telefon über Termux gebaut und ausgeführt wird. Das vorgesehene Nutzungsmuster ist das Öffnen von `http://localhost:6001` im Browser desselben Telefons.
 
-- [1. Voraussetzungen](#1-voraussetzungen) — F-Droid Termux und Systemanforderungen
+- [1. Voraussetzungen](#1-voraussetzungen) — Termux und Systemanforderungen
 - [2. Installation und Build](#2-installation-und-build) — Einrichtung mit einem einzigen Befehl
 - [3. Ausführen und Verbinden](#3-ausführen-und-verbinden) — vom Browser des Telefons öffnen
 - [4. Laufen lassen](#4-laufen-lassen) — auch bei ausgeschaltetem Bildschirm
@@ -32,17 +32,13 @@ PocketRisu liefert keine vorkompilierten Binärdateien für Termux, daher baut d
 
 ## 1. Voraussetzungen
 
-### Verwenden Sie die F-Droid- oder GitHub-Releases-Version von Termux
-
-> ⚠️ **Die Play-Store-Version von Termux kann nicht verwendet werden.**
-> Die Termux-Maintainer haben die Aktualisierung der Play-Store-Version 2020 eingestellt, und sie kann die aktuellen Pakete, die PocketRisu benötigt (Node.js 22+), nicht mehr installieren.
+### Termux installieren
 
 Installieren Sie Termux von einer dieser Quellen:
 
 - **F-Droid (empfohlen)**: https://f-droid.org/packages/com.termux/
 - **GitHub Releases**: https://github.com/termux/termux-app/releases
-
-Wenn Sie bereits die Play-Store-Version installiert haben, deinstallieren Sie sie zuerst und installieren Sie aus einer der obigen Quellen.
+- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=de&pli=1
 
 
 ---

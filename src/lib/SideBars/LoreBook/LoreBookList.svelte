@@ -117,8 +117,8 @@
             swapThreshold: 0.9,      // More sensitive drag response
             preventOnFilter: false, // Allow click events on filtered elements
             animation: 150, // Animation
-            chosenClass: "risu-chosen-item", // Class for the item being dragged
-            ghostClass: "risu-ghost-item",  // Class for the drop placeholder
+            chosenClass: "risu-lore-chosen-item", // Class for the item being dragged
+            ghostClass: "risu-lore-ghost-item",  // Class for the drop placeholder
 
             onEnd: async (evt) => {
                 
@@ -355,9 +355,53 @@
          bind:this={ele} 
          data-show-folder={showFolder || ''}>
         {#if globalMode}
-            <!--
-                This was a place for global lorebooks, but it was removed :)
-            -->
+            <!-- Global (settings-page) lorebook: renders db.loreBook[loreBookPage].data.
+                 The script-side globalMode logic (counts, drag write-back) already
+                 targets this array; this branch was left empty and showed nothing. -->
+            {@const globalLore = DBState.db.loreBook[DBState.db.loreBookPage].data}
+            {@const visibleItems = globalLore.filter(book => (!showFolder && !book.folder) || (showFolder === book.folder))}
+            {@const lastVisibleItem = visibleItems[visibleItems.length - 1]}
+            {#if globalLore.length === 0}
+                <span class="text-textcolor2">No Lorebook</span>
+            {:else}
+                {#each globalLore as book, i}
+                    {#if (!showFolder && !book.folder) || (showFolder === book.folder)}
+                        <LoreBookData idgroup={idgroup} bind:value={DBState.db.loreBook[DBState.db.loreBookPage].data[i]} idx={i}
+                        isOpen={openedRefs.has(book)}
+                        openFolders={openFolders()}
+                        isLastInContainer={book === lastVisibleItem}
+                        onRemove={() => {
+                            if (openedRefs.has(book)) {
+                                onClose(book.mode !== 'folder', book)
+                            }
+
+                            let lore = DBState.db.loreBook[DBState.db.loreBookPage].data
+
+                            if (book.mode === 'folder') {
+                                lore.forEach(item => {
+                                    if (item.folder === book.key && openedRefs.has(item)) {
+                                        onClose(true, item)
+                                    }
+                                })
+
+                                lore = lore.filter(item =>
+                                    item !== book && item.folder !== book.key
+                                )
+                            } else {
+                                lore.splice(i, 1)
+                            }
+
+                            DBState.db.loreBook[DBState.db.loreBookPage].data = lore
+                        }}
+                        onOpen={(isDetail = true) => onOpen(isDetail, book)}
+                        onClose={(isDetail = true) => onClose(isDetail, book)}
+                        bind:externalLoreBooks={DBState.db.loreBook[DBState.db.loreBookPage].data}/>
+                    {:else}
+                        <!-- Hidden marker for filtered items (for SortableJS) -->
+                        <div data-risu-idx={i} data-risu-idgroup={idgroup} style="display: none;"></div>
+                    {/if}
+                {/each}
+            {/if}
         {:else if externalLoreBooks}
             {@const visibleItems = externalLoreBooks.filter(book => (!showFolder && !book.folder) || (showFolder === book.folder))}
             {@const lastVisibleItem = visibleItems[visibleItems.length - 1]}

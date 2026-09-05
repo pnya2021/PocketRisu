@@ -2,6 +2,7 @@ import { PluginApiError } from './errors'
 import { assertContextSnapshotLimits, type CharacterCardSnapshot, type CharacterTextSection, type ContextLoreSnapshot } from './contextResources'
 import { createSynchronousRevision } from './queryCaptureCache'
 import { createStudioCardCatalogueIndex, type StudioCardCatalogueIndexSnapshot } from './studioCardCatalogueIndex.svelte'
+import { createPocketAssetManifestProjection, type PocketContextAdapterDependencies } from './contextResources.pocket'
 import type {
     StudioCardAssetLocator,
     StudioCardNativeCatalogue,
@@ -18,6 +19,7 @@ export interface PocketStudioCardAdapterDependencies {
     getAssetStorageRevision?(storageKey: string): string
     getAssetStorageMutationGeneration?(): string | number
     reactiveCatalogueIndex?: boolean
+    loadAssetManifestItems?: PocketContextAdapterDependencies['loadAssetManifestItems']
 }
 
 const ownData = (record: object, key: PropertyKey) => {
@@ -190,6 +192,18 @@ const preflightAssetCount = (raw: UnknownRecord) => {
         if (assetCount > MAX_CAPTURE_ITEMS) {
             throw resourceLimit('Studio card capture item limit exceeded')
         }
+    }
+    const inline = ownData(raw, 'additionalAssets')
+    const manifest = ownData(raw, 'additionalAssetManifest')
+    if (!manifest.valid) throw malformed('Studio card asset manifest is accessor-backed')
+    if (!Array.isArray(inline.value) && manifest.value) {
+        if (!isRecord(manifest.value)) throw malformed('Studio card asset manifest is malformed')
+        const count = ownData(manifest.value, 'count')
+        if (!count.valid || !Number.isSafeInteger(count.value) || count.value < 0) {
+            throw malformed('Studio card asset manifest count is malformed')
+        }
+        assetCount += count.value
+        if (assetCount > MAX_CAPTURE_ITEMS) throw resourceLimit('Studio card capture item limit exceeded')
     }
     return assetCount
 }
@@ -594,6 +608,7 @@ const normalizeBinary = (value: Uint8Array | ArrayBuffer | ArrayBufferView | nul
 export function createPocketStudioCardResourceAdapter(
     dependencies: PocketStudioCardAdapterDependencies,
 ): StudioCardResourceAdapter {
+    const manifests = createPocketAssetManifestProjection(dependencies.loadAssetManifestItems)
     const index = createStudioCardCatalogueIndex({
         getCharacters: () => dependencies.getDatabase().characters,
         getSelectedCharacterIndex: dependencies.getSelectedCharacterIndex,
@@ -608,7 +623,7 @@ export function createPocketStudioCardResourceAdapter(
         source: StudioCardNativeSource
     }>()
 
-    const sourceRecords = (cardId: string) => {
+    const sourceRecords = (cardId: string, projectAssets = true) => {
         const catalogue = index.current()
         const rootRecord = catalogue.byId.get(cardId)
         if (!rootRecord) return null
@@ -619,7 +634,10 @@ export function createPocketStudioCardResourceAdapter(
         if (memberRecords.some((member) => !member || member.native.kind !== 'character')) {
             throw malformed('Studio group membership is missing, nested, or malformed')
         }
-        return { rootRecord, rootMembers, memberRecords: memberRecords as typeof rootRecord[] }
+        const project = (record: typeof rootRecord) => projectAssets
+            ? { ...record, raw: manifests.project(record.raw, 'character') } : record
+        return { rootRecord: project(rootRecord), rootMembers,
+            memberRecords: (memberRecords as typeof rootRecord[]).map(project) }
     }
 
     const projectSnapshot = (
@@ -663,8 +681,11 @@ export function createPocketStudioCardResourceAdapter(
         }
     }
 
-    const sourceProjection = (cardId: string): StudioCardNativeSource | null => {
-        const records = sourceRecords(cardId)
+    const sourceProjection = (
+        cardId: string,
+        suppliedRecords?: NonNullable<ReturnType<typeof sourceRecords>>,
+    ): StudioCardNativeSource | null => {
+        const records = suppliedRecords ?? sourceRecords(cardId)
         if (!records) return null
         const { rootRecord, rootMembers, memberRecords } = records
         preflightRecords(records)
@@ -745,8 +766,8 @@ export function createPocketStudioCardResourceAdapter(
             })
     }
 
-    const coherentSource = (cardId: string) => {
-        const before = sourceProjection(cardId)
+    const coherentSource = (cardId: string, records?: NonNullable<ReturnType<typeof sourceRecords>>) => {
+        const before = sourceProjection(cardId, records)
         if (!before) return null
         const after = sourceProjection(cardId)
         if (!after || before.nativeRevision !== after.nativeRevision) {
@@ -783,6 +804,24 @@ export function createPocketStudioCardResourceAdapter(
                 && index.isCurrent(snapshot))
         },
         async captureSource(cardId) {
+            const records = sourceRecords(cardId, false)
+            if (!records) return null
+            const owners = [records.rootRecord, ...records.memberRecords]
+            if (!owners.some((record) => manifests.isLazy(record.raw, 'character'))) {
+                return coherentSource(cardId, records)
+            }
+            // Fence descriptive/inline fields too: loading only the manifest
+            // must not silently adopt edits made during the network await.
+            const before = sourceProjection(cardId, records)!.nativeRevision
+            await Promise.all(owners
+                .map((record) => manifests.prepare(record.raw, 'character')))
+            const current = sourceRecords(cardId, false)
+            if (!current || current.rootRecord.raw !== records.rootRecord.raw
+                || JSON.stringify(current.rootMembers) !== JSON.stringify(records.rootMembers)
+                || current.memberRecords.some((record, index) => record.raw !== records.memberRecords[index]?.raw)
+                || sourceProjection(cardId, current)!.nativeRevision !== before) {
+                throw malformed('Studio card source changed during manifest hydration')
+            }
             return coherentSource(cardId)
         },
         revalidateSource(capture) {
@@ -815,7 +854,7 @@ export function createPocketStudioCardResourceAdapter(
                 || asset.locator.ownerRevision !== locator.ownerRevision
                 || asset.locator.storageRevision !== locator.storageRevision) return null
             const rawAssets = mapAssets(
-                owner.raw,
+                manifests.project(owner.raw, 'character'),
                 owner.native.cardId,
                 (storageKey) => dependencies.getAssetStorageRevision?.(storageKey) ?? storageKey,
             )

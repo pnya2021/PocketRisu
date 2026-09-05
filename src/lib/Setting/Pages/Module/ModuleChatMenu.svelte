@@ -1,10 +1,11 @@
 <script lang="ts">
-    import { CircleCheckIcon, Waypoints, XIcon } from "@lucide/svelte";
+    // Chat module picker. Grouped by folder; folder management lives in
+    // Settings → Modules. Each row has two scope buttons: chat scope and
+    // character scope. Globally enabled modules show a globe instead.
+    import { ChevronDownIcon, ChevronRightIcon, CircleCheckIcon, FolderIcon, GlobeIcon, MessageSquareIcon, SearchIcon, SettingsIcon, UserRoundIcon, Waypoints, XIcon } from "@lucide/svelte";
     import { language } from "src/lang";
-    import Button from "src/lib/UI/GUI/Button.svelte";
-    import TextInput from "src/lib/UI/GUI/TextInput.svelte";
-    import type { RisuModule } from "src/ts/process/modules";
-    
+    import { groupByFolder } from "src/ts/folders";
+
     import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte';
     import { selectedCharID } from "src/ts/stores.svelte";
     import { openSettings, SettingsRoute } from "src/ts/routing";
@@ -15,24 +16,54 @@
 
     let { close = (i:string) => {}, alertMode = false }: Props = $props();
     let moduleSearch = $state('')
+    // Folders start collapsed; searching shows everything that matches.
+    // Folders start collapsed; the uncategorized group (key '') starts open,
+    // so for that key the set records "collapsed" instead. Always shown as a
+    // header so the list reads the same with or without folders.
+    let expanded = $state<Set<string>>(new Set());
 
-    function sortModules(modules:RisuModule[], search:string){
-        const db = DBState.db
-        return modules.filter((v) => {
-            if(search === '') return true
-            return v.name.toLowerCase().includes(search.toLowerCase())
-        
-        }).sort((a, b) => {
-            let score = a.name.toLowerCase().localeCompare(b.name.toLowerCase())
-            return score
-        })
+    const query = $derived(moduleSearch.trim().toLocaleLowerCase())
+    const groups = $derived(groupByFolder(DBState.db.modules.map(m => m.folderId), DBState.db.moduleFolders ?? []))
+
+    function matches(index: number) {
+        const rmodule = DBState.db.modules[index]
+        return !query || `${rmodule?.name ?? ''}\n${rmodule?.description ?? ''}`.toLocaleLowerCase().includes(query)
     }
 
+    function toggle(key: string) {
+        const next = new Set(expanded);
+        if (next.has(key)) next.delete(key); else next.add(key);
+        expanded = next;
+    }
+
+    function currentChat() {
+        const character = DBState.db.characters[$selectedCharID]
+        return character?.chats?.[character.chatPage]
+    }
+
+    function toggleChatScope(moduleId: string) {
+        const chat = currentChat()
+        if (!chat) return
+        chat.modules ??= []
+        if (chat.modules.includes(moduleId)) chat.modules.splice(chat.modules.indexOf(moduleId), 1)
+        else chat.modules.push(moduleId)
+        chat.modules = chat.modules
+        $ReloadGUIPointer += 1
+    }
+
+    function toggleCharacterScope(moduleId: string) {
+        const character = DBState.db.characters[$selectedCharID]
+        if (!character) return
+        character.modules ??= []
+        if (character.modules.includes(moduleId)) character.modules.splice(character.modules.indexOf(moduleId), 1)
+        else character.modules.push(moduleId)
+        $ReloadGUIPointer += 1
+    }
 </script>
 
 
 <div class="absolute w-full h-full z-40 bg-black/50 flex justify-center items-center">
-    <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl w-full max-h-full overflow-y-auto">
+    <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl w-full max-h-full overflow-y-auto max-sm:w-full max-sm:h-full max-sm:max-w-none max-sm:rounded-none">
         <div class="flex items-center text-textcolor">
             <h2 class="mt-0 mb-0 text-lg">{language.modules}</h2>
             <div class="grow flex justify-end">
@@ -46,85 +77,75 @@
 
         <span class="text-sm text-textcolor2">{language.chatModulesInfo}</span>
 
-        <TextInput className="mt-4" placeholder={language.search} bind:value={moduleSearch} />
+        <div class="risu-field-border flex items-center gap-2 rounded-md px-3 mt-4 mb-2">
+            <SearchIcon size={16} class="text-textcolor2 shrink-0"/>
+            <input bind:value={moduleSearch} placeholder={language.search}
+                class="w-full py-1.5 text-sm bg-transparent text-textcolor outline-none"/>
+        </div>
 
-        <div class="contain w-full max-w-full mt-4 flex flex-col border-selected border-1 rounded-md">
-            {#if DBState.db.modules.length === 0}
-                <div class="text-textcolor2 p-3">{language.noModules}</div>
-            {:else}
-                {#each sortModules(DBState.db.modules, moduleSearch) as rmodule, i}
-                    {#if i !== 0}
-                        <div class="border-t-1 border-selected"></div>
-                    {/if}
-                    <div class="pl-3 py-3 text-left flex items-center">
+        {#if DBState.db.modules.length === 0}
+            <div class="text-textcolor2 p-3">{language.noModules}</div>
+        {/if}
+        {#each groups as group (group.folder?.id ?? '')}
+            {@const visible = group.indexes.filter(matches)}
+            {@const key = group.folder?.id ?? ''}
+            {@const hasHeader = true}
+            {@const open = !!query || (key === '' ? !expanded.has(key) : expanded.has(key))}
+            {#if visible.length > 0}
+                {#if hasHeader}
+                    <button class="flex items-center gap-2 w-full rounded-md px-2 py-2 mt-1 border-t border-darkborderc text-textcolor cursor-pointer hover:bg-selected/30 select-none" onclick={() => toggle(key)}>
+                        {#if open}<ChevronDownIcon size={16} class="shrink-0 text-textcolor2"/>{:else}<ChevronRightIcon size={16} class="shrink-0 text-textcolor2"/>{/if}
+                        <FolderIcon size={16} class="shrink-0 text-textcolor2"/>
+                        <span class="grow text-left truncate {group.folder ? '' : 'text-textcolor2'}">{group.folder?.name ?? language.folderUncategorized}</span>
+                        <span class="text-xs text-textcolor2">{visible.length}</span>
+                    </button>
+                {/if}
+                {#each open ? visible : [] as i}
+                    {@const rmodule = DBState.db.modules[i]}
+                    {@const isGlobal = DBState.db.enabledModules.includes(rmodule.id)}
+                    {@const inChat = currentChat()?.modules?.includes(rmodule.id) ?? false}
+                    {@const inCharacter = DBState.db.characters[$selectedCharID]?.modules?.includes(rmodule.id) ?? false}
+                    <!-- Chat and character scope are separate buttons: the old
+                         right-click / long-press toggle is not reachable on iOS
+                         (Safari fires no contextmenu on long press). -->
+                    <div class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 pl-7">
                         {#if rmodule.mcp}
-                            <Waypoints size={18} class="mr-2" />
+                            <Waypoints size={18} class="shrink-0 text-textcolor2" />
                         {/if}
-                        {#if !alertMode && DBState.db.enabledModules.includes(rmodule.id)}
-                            <span class="text-textcolor2">{rmodule.name}</span>
+                        <span class="min-w-0 grow truncate {!alertMode && isGlobal ? 'text-textcolor2' : ''}">{rmodule.name}</span>
+                        {#if alertMode}
+                            <button class="text-textcolor2 cursor-pointer hover:text-success transition-colors shrink-0" onclick={(e) => {
+                                e.stopPropagation()
+                                close(rmodule.id)
+                            }}>
+                                <CircleCheckIcon size={18}/>
+                            </button>
+                        {:else if isGlobal}
+                            <!-- Globally enabled: always on, managed in Settings > Modules.
+                                 Shown explicitly so the row does not read as "off". -->
+                            <span class="shrink-0 p-1 rounded-sm text-emerald-500 bg-emerald-500/15" title={language.moduleScopeGlobal} aria-label={language.moduleScopeGlobal}>
+                                <GlobeIcon size={18}/>
+                            </span>
                         {:else}
-                            <span class="">{rmodule.name}</span>
+                            <button class="shrink-0 cursor-pointer p-1 rounded-sm {inChat ? 'text-blue-500 bg-blue-500/15' : 'text-textcolor2 hover:text-blue-400'}"
+                                title={language.moduleScopeChat} aria-label={language.moduleScopeChat} aria-pressed={inChat}
+                                onclick={(e) => { e.stopPropagation(); toggleChatScope(rmodule.id) }}>
+                                <MessageSquareIcon size={18}/>
+                            </button>
+                            <button class="shrink-0 cursor-pointer p-1 rounded-sm {inCharacter ? 'text-violet-500 bg-violet-500/15' : 'text-textcolor2 hover:text-violet-400'}"
+                                title={language.moduleScopeCharacter} aria-label={language.moduleScopeCharacter} aria-pressed={inCharacter}
+                                onclick={(e) => { e.stopPropagation(); toggleCharacterScope(rmodule.id) }}>
+                                <UserRoundIcon size={18}/>
+                            </button>
                         {/if}
-                        <div class="grow flex justify-end">
-
-                            {#if alertMode}
-                                <button class={"text-textcolor2 mr-2 cursor-pointer hover:text-success transition-colors"} onclick={async (e) => {
-                                    e.stopPropagation()
-
-                                    close(rmodule.id)
-                                }}>
-                                    <CircleCheckIcon size={18}/>
-                                </button>
-                            {:else if DBState.db.enabledModules.includes(rmodule.id)}
-                                <button class="mr-2 text-textcolor2 cursor-not-allowed"aria-labelledby="disabled">
-                                </button>
-                            {:else}
-                                <button class={(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].modules.includes(rmodule.id)) ?
-                                        "mr-2 cursor-pointer text-blue-500" :
-                                        (DBState.db.characters[$selectedCharID]?.modules?.includes(rmodule.id)) ?
-                                        "mr-2 cursor-pointer text-violet-500" :
-                                        "text-textcolor2 hover:text-blue-400 mr-2 cursor-pointer"
-                                } onclick={async (e) => {
-                                    e.stopPropagation()
-                                    if(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].modules.includes(rmodule.id)){
-                                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].modules.splice(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].modules.indexOf(rmodule.id), 1)
-
-                                    }
-                                    else{
-                                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].modules.push(rmodule.id)
-                                    }
-                                    DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].modules = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].modules
-                                    $ReloadGUIPointer += 1
-                                }}
-                                oncontextmenu={(e) => {
-                                    e.preventDefault()
-                                    e.stopPropagation()
-                                    if(!DBState.db.characters[$selectedCharID].modules){
-                                        DBState.db.characters[$selectedCharID].modules = []
-                                    }
-                                    if(DBState.db.characters[$selectedCharID].modules.includes(rmodule.id)){
-                                        DBState.db.characters[$selectedCharID].modules.splice(DBState.db.characters[$selectedCharID].modules.indexOf(rmodule.id), 1)
-                                    }
-                                    else{
-                                        DBState.db.characters[$selectedCharID].modules.push(rmodule.id)
-                                    }
-                                    $ReloadGUIPointer += 1
-                                }}>
-
-                                    <CircleCheckIcon size={18}/>
-                                </button>
-                            {/if}
-                        </div>
                     </div>
                 {/each}
             {/if}
-        </div>
-        <div>
-            <Button className="mt-4 grow-0" size="sm" onclick={() => {
-                openSettings(SettingsRoute.Module)
-                close('')
-            }}>{language.edit}</Button>
-        </div>
+        {/each}
+        <button class="mt-3 pt-2 w-full border-t border-darkborderc flex items-center gap-2 text-sm text-textcolor2 hover:text-primary cursor-pointer"
+            onclick={() => { openSettings(SettingsRoute.Module); close('') }}>
+            <SettingsIcon size={16}/><span>{language.moduleManage}</span>
+        </button>
     </div>
 </div>
 

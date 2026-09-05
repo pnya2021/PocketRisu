@@ -17,6 +17,11 @@ const REPO = 'PocketRisu/PocketRisu';
 const ROOT = path.resolve(__dirname, '..');
 
 const isWin = process.platform === 'win32';
+// Top-level entries the installed release shipped, written after each update.
+// Entries not in (new package ∪ this manifest) are treated as user files and
+// never touched. Absent on installs that predate the manifest — first update
+// then manages only what the new package contains.
+const MANIFEST_NAME = '.installed-manifest';
 const REQUIRED_ENTRIES = ['dist', 'server', 'package.json'];
 const REQUIRED_DIST_FILES = ['index.html'];
 const REQUIRED_WIN_ENTRIES = ['bin'];
@@ -61,6 +66,16 @@ function getCustomBackupKeepEntry() {
         return top || null;
     } catch {
         return null;
+    }
+}
+
+function readInstalledManifest() {
+    try {
+        const entries = fs.readFileSync(path.join(ROOT, MANIFEST_NAME), 'utf-8')
+            .split('\n').map(s => s.trim()).filter(Boolean);
+        return { exists: true, entries };
+    } catch {
+        return { exists: false, entries: [] };
     }
 }
 
@@ -267,19 +282,43 @@ async function main() {
 
     // Phase 1: move old files to backup (safer than immediate delete)
     log('Replacing files...');
-    const keep = new Set(['save', 'backups', 'model-cache', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
+    const keep = new Set(['save', 'backups', 'model-cache', '.installed-version', MANIFEST_NAME, '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
     if (isWin || skipBinReplacement) keep.add('bin');
     const customBackupKeep = getCustomBackupKeepEntry();
     if (customBackupKeep && !keep.has(customBackupKeep)) {
         log(`Preserving custom backup directory: ${customBackupKeep}/`);
         keep.add(customBackupKeep);
     }
+    const newEntries = fs.readdirSync(extractedRoot);
+    const oldManifest = readInstalledManifest();
+    const managed = new Set([...newEntries, ...oldManifest.entries]);
     const backupDir = path.join(tmpDir, 'backup');
     fs.mkdirSync(backupDir, { recursive: true });
 
+    // A user file whose name collides with an entry the new release introduces
+    // would be overwritten in Phase 2 — evacuate it to backups/ instead of
+    // losing it. Only decidable when a previous manifest exists.
+    const isConflict = (entry) => oldManifest.exists
+        && !oldManifest.entries.includes(entry) && newEntries.includes(entry);
+    const conflictDir = path.join(ROOT, 'backups', `update-conflict-${latest}`);
+    // A retried update may have evacuated the same name before — never overwrite
+    const conflictDest = (entry) => {
+        let dest = path.join(conflictDir, entry);
+        for (let n = 1; fs.existsSync(dest); n++) dest = path.join(conflictDir, `${entry}.${n}`);
+        return dest;
+    };
+
+    const preserved = [];
     for (const entry of fs.readdirSync(ROOT)) {
         if (keep.has(entry)) continue;
+        if (!managed.has(entry)) { preserved.push(entry); continue; }
         try {
+            if (isConflict(entry)) {
+                log(`User file "${entry}" collides with a new app file — moving it to backups/update-conflict-${latest}/`);
+                fs.mkdirSync(conflictDir, { recursive: true });
+                fs.renameSync(path.join(ROOT, entry), conflictDest(entry));
+                continue;
+            }
             fs.renameSync(path.join(ROOT, entry), path.join(backupDir, entry));
         } catch (e) {
             log(`Error backing up ${entry}: ${e.message}`);
@@ -290,13 +329,16 @@ async function main() {
                 : 'Update failed because some files are in use. Stop the running server first, then try again.');
         }
     }
+    if (preserved.length) {
+        log(`Preserving user files: ${preserved.join(', ')}`);
+    }
 
     // Phase 2: move new files from extracted to root
     const moved = [];
     const skipMove = new Set(['save', 'scripts', 'model-cache']);
     if (isWin || skipBinReplacement) skipMove.add('bin');
     try {
-        for (const entry of fs.readdirSync(extractedRoot)) {
+        for (const entry of newEntries) {
             if (skipMove.has(entry)) continue;
             const src = path.join(extractedRoot, entry);
             const dest = path.join(ROOT, entry);
@@ -334,6 +376,10 @@ async function main() {
             fs.copyFileSync(path.join(newScripts, f), path.join(ROOT, 'scripts', f));
         }
     }
+
+    // Record what this release shipped, so the next update knows which entries
+    // are app-managed and can leave everything else (user files) alone.
+    fs.writeFileSync(path.join(ROOT, MANIFEST_NAME), newEntries.join('\n') + '\n');
 
     // Phase 4 (Windows): stage bin/ update for update.bat post-step
     if (isWin) {

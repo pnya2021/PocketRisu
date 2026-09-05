@@ -95,12 +95,18 @@ function createSessionLock(opts = {}) {
     // AFTER this one booted, so this one's in-memory copy is outdated.
     // 'fresh' needs nothing — the copy includes every accepted write, and the
     // next user action simply takes the lock over.
+    // An id with no recorded boot is 'unknown', NOT 'stale': the boot
+    // registration is a separate request that can fail alone on a flaky link
+    // (mobile + VPN), and judging such a session stale turns every focus into
+    // an automatic reload — a reload loop the client cannot break. The write
+    // path still 423s a genuinely stale session, so no data is at risk.
     function peek(id) {
         if (typeof id !== 'string' || id === '') return 'active';
         if (!active) return 'free';
         if (active.id === id) return 'active';
         const boot = boots.get(id);
-        if (boot !== undefined && boot > active.lastWriteAt) return 'fresh';
+        if (boot === undefined) return 'unknown';
+        if (boot > active.lastWriteAt) return 'fresh';
         return 'stale';
     }
 

@@ -6,7 +6,7 @@
 
 안드로이드 폰에서 Termux를 통해 PocketRisu를 직접 빌드해 사용하는 방법을 안내합니다. 같은 폰의 브라우저에서 `http://localhost:6001`로 접속하는 사용 패턴이 기본입니다.
 
-- [1. 사전 준비](#1-사전-준비) — F-Droid Termux + 시스템 요구사항
+- [1. 사전 준비](#1-사전-준비) — Termux + 시스템 요구사항
 - [2. 설치 및 빌드](#2-설치-및-빌드) — 한 줄 명령으로 자동 진행
 - [3. 실행 및 접속](#3-실행-및-접속) — 폰 브라우저로 사용
 - [4. 백그라운드 유지](#4-백그라운드-유지) — 화면 꺼진 상태에서도 서버 유지
@@ -30,17 +30,13 @@ PocketRisu는 Termux에서 미리 컴파일된 바이너리를 제공하지 않�
 
 ## 1. 사전 준비
 
-### Termux는 F-Droid 또는 GitHub Releases 버전을 사용
+### Termux 설치
 
-> ⚠️ **Play Store의 Termux는 사용할 수 없습니다.**
-> Termux 개발진이 2020년 이후 Play Store 버전 업데이트를 중단했으며, PocketRisu 빌드에 필요한 최신 패키지(Node.js 22 이상 등)가 설치되지 않습니다.
-
-다음 두 곳 중 하나에서 Termux를 받습니다.
+다음 중 한 곳에서 Termux를 받습니다.
 
 - **F-Droid (권장)**: https://f-droid.org/packages/com.termux/
 - **GitHub Releases**: https://github.com/termux/termux-app/releases
-
-이미 Play Store 버전이 설치돼 있다면 삭제 후 위 두 곳 중 한 곳에서 새로 설치합니다.
+- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=ko&pli=1
 
 
 ---

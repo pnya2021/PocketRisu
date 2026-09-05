@@ -85,3 +85,8 @@ export function makeEncodedStorageKey(prefix: string, rawKey: string): string {
 export function decodeStorageKeyComponent(encodedKey: string): string {
     return decodeKeyComponent(encodedKey);
 }
+
+// Shared with the server's plugin-storage kv key scheme (no `.json` suffix).
+export function encodeStorageKeyComponent(rawKey: string): string {
+    return encodeKeyComponent(rawKey);
+}

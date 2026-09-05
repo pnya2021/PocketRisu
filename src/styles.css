@@ -2,6 +2,22 @@
 
 @plugin '@tailwindcss/typography';
 
+/*
+  Treat keyboard focus as the keyboard equivalent of hover. Existing hover:*
+  utilities keep their pointer behavior and also apply to :focus-visible.
+*/
+@custom-variant hover {
+  &:focus-visible {
+    @slot;
+  }
+
+  @media (hover: hover) {
+    &:hover {
+      @slot;
+    }
+  }
+}
+
 @theme {
   --breakpoint-xs: 25rem;
 
@@ -15,6 +31,9 @@
   --color-darkborderc: var(--risu-theme-darkborderc);
   --color-darkbutton: var(--risu-theme-darkbutton);
   --color-success: var(--risu-theme-success);
+  --color-warning: var(--risu-theme-warning);
+  --color-highlight: var(--risu-theme-highlight);
+  --color-accent: var(--risu-theme-accent);
   --color-primary: var(--risu-theme-primary);
 
   --color-primary-50: var(--risu-theme-primary-50);
@@ -124,6 +143,66 @@
 }
 
 /*
+  Shared interaction vocabulary. These classes describe intent while the
+  hover variant above keeps pointer hover and keyboard focus-visible aligned.
+  Component-specific motion and layout effects should remain local.
+*/
+@utility risu-interactive-accent {
+  @apply hover:text-primary;
+}
+
+@utility risu-interactive-foreground {
+  @apply hover:text-textcolor;
+}
+
+@utility risu-interactive-danger {
+  @apply hover:text-draculared;
+}
+
+@utility risu-interactive-surface {
+  @apply hover:bg-selected/30;
+}
+
+@utility risu-interactive-surface-strong {
+  @apply hover:bg-selected/50;
+}
+
+@utility risu-interactive-surface-solid {
+  @apply hover:bg-selected;
+}
+
+@utility risu-interactive-primary {
+  @apply hover:bg-primary/90;
+}
+
+@utility risu-interactive-primary-soft {
+  @apply hover:bg-primary/20;
+}
+
+@utility risu-interactive-border {
+  @apply hover:border-borderc;
+}
+
+@utility risu-interactive-border-subtle {
+  @apply hover:border-borderc/30;
+}
+
+@utility risu-interactive-reveal {
+  @apply hover:opacity-100;
+}
+
+/* Full-viewport modal scrim. 100dvh follows mobile browser chrome as it
+   expands and collapses; 100vh remains the fallback for older engines. */
+@utility risu-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  background-color: var(--risu-black-50);
+}
+
+/*
   The default border color has changed to `currentcolor` in Tailwind CSS v4,
   so we've added these compatibility styles to make sure everything still
   looks the same as it did with Tailwind CSS v3.
@@ -196,10 +275,14 @@ body {
      of ColorScheme interface, so updateColorScheme() never overrides it.
      See .agent/guide/ui.md "시맨틱 토큰". */
   --risu-theme-success: #16a34a;
+  --risu-theme-highlight: #f59e0b;
+  --risu-theme-warning: #ffca1e;
+  --risu-theme-accent: #7581ff;
   /* Primary — dynamic accent for "active/on" fills (toggle track, primary CTA).
      Part of ColorScheme: updateColorScheme() overrides it per theme. The default
      here is a fallback for the brief boot window before updateColorScheme runs. */
   --risu-theme-primary: #3b82f6;
+  --risu-black-50: rgb(0 0 0 / 50%);
   --risu-height-size: 100%;
   --risu-font-family: Arial, sans-serif, serif;
 
@@ -345,40 +428,34 @@ body {
 }
 
 ::-webkit-scrollbar {
-  width: 4px;
-  height: 4px;
+  width: 6px;
+  height: 6px;
 }
 
-/* Track */
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
-/* Handle — global auto-hide. Transparent by default; fades in on hover.
-   The tint is a translucent form of the theme's secondary text color, so it
-   adapts to every theme. `visibility`/`opacity` are avoided: on a webkit thumb
-   they make Chrome fall back to the default system gray bar instead of hiding,
-   so we toggle the thumb's background-color instead. */
+/* Handle — always faintly visible so it can be found and grabbed, drawn
+   stronger while scrolling and faded back afterwards. ts/gui/scrollbarAutoHide.ts
+   steps `--risu-scrollbar-alpha` on the scrolling element (0.22 at rest, 0.45
+   while scrolling); the alpha lives on the scroller because Chromium only
+   re-resolves scrollbar part styles when the scroller's own computed style
+   changes and cannot animate scrollbar parts itself. Verified on macOS Chrome
+   151 (classic scrollbars). A fully hidden 3px thumb (v1.11.0) could not be
+   located or dragged on long lists. */
 ::-webkit-scrollbar-thumb {
-  background-color: transparent;
+  background-color: color-mix(in srgb, var(--color-textcolor2) calc(var(--risu-scrollbar-alpha, 0.22) * 100%), transparent);
   border-radius: 9999px;
-  transition: background-color 0.3s linear;
 }
 
-/* Hovering any scrollable area (hover bubbles to ancestors) reveals the thumb. */
-*:hover::-webkit-scrollbar-thumb {
-  background-color: color-mix(in srgb, var(--color-textcolor2) 35%, transparent);
-}
-
-/* Stronger when pointing directly at the thumb. */
-::-webkit-scrollbar-thumb:hover {
-  background-color: color-mix(in srgb, var(--color-textcolor2) 55%, transparent);
-}
-
-/* Firefox: thin neutral scrollbar (inherits from root; no per-element auto-hide). */
-html {
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--color-textcolor2) 35%, transparent) transparent;
+/* Firefox only. Must not reach Chromium: a non-auto `scrollbar-width` on the
+   root would make the document scroller native (always visible). */
+@supports not selector(::-webkit-scrollbar) {
+  html {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--color-textcolor2) 35%, transparent) transparent;
+  }
 }
 
 /* Touch devices: the chat scroller's scrollbar spans the container's full height,
@@ -413,6 +490,16 @@ html {
 
 .text-bordered {
   -webkit-text-stroke: 1px #000;
+}
+
+/* Shared border treatment for text fields and compound input frames. */
+.risu-field-border {
+  border: 1px solid var(--risu-theme-darkborderc);
+  transition: border-color 200ms ease;
+}
+
+.risu-field-border:focus-within {
+  border-color: var(--risu-theme-primary);
 }
 
 .x-risu-risu-file {

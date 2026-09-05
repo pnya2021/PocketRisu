@@ -301,7 +301,7 @@
     }
 
     /* Styles for SortableJS drag-and-drop feedback */
-    :global(.risu-chosen-item) {
+    :global(.risu-lore-chosen-item) {
         /* The item being dragged */
         padding-bottom: 0.5rem;
         margin-bottom: 0.5rem;
@@ -310,7 +310,7 @@
         opacity: 0.7;
     }
 
-    :global(.risu-ghost-item) {
+    :global(.risu-lore-ghost-item) {
         /* The placeholder for the drop location */
         background-color: rgba(var(--risu-theme-selected-rgb), 0.2);
 

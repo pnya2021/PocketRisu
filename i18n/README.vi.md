@@ -79,6 +79,7 @@ PocketRisu được phát triển từ [RisuAI](https://github.com/kwaroran/Risu
 
 - Báo cáo lỗi / yêu cầu tính năng: [GitHub Issues](https://github.com/PocketRisu/PocketRisu/issues)
 - Email: contact@pocketrisu.com
+- Ủng hộ dự án: [Patreon](https://patreon.com/PocketRisu/membership) — hoàn toàn tự nguyện; người ủng hộ có thể hiển thị tên trong ứng dụng, không có tính năng hay đặc quyền thêm
 
 
 ## Giấy phép

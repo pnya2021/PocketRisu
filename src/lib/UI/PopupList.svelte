@@ -24,7 +24,9 @@
     });
 
     const close = (() => {
-        popupStore.children = null;
+        setTimeout(() => {
+            popupStore.children = null;
+        }, 10);
     });
 
     onMount(async () => {

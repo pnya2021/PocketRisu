@@ -4,7 +4,7 @@ import { globalFetch, fetchNative } from "../../globalApi.svelte";
 import { getModelInfo, LLMFlags, LLMFormat, type LLMModel } from "../../model/modellist";
 import { risuChatParser, risuEscape, risuUnescape } from "../../parser/parser.svelte";
 import { pluginProcess, pluginV2 } from "../../plugins/plugins.svelte";
-import { getCurrentCharacter, getCurrentChat, getDatabase, type character } from "../../storage/database.svelte";
+import { getCurrentCharacter, getCurrentChat, getDatabase, type character, type MessageGenerationInfo } from "../../storage/database.svelte";
 import { tokenizeNum, encodeWithTokenizer } from "../../tokenizer";
 import { v4 as uuidv4 } from "uuid";
 import { simplifySchema, sleep } from "../../util";
@@ -32,17 +32,17 @@ import {
     type AdapterToolCall, type AdapterToolDef, type AdapterUsage,
 } from "src/ts/preset/adapter";
 import { formatReasoningParts } from "src/ts/preset/adapter/reasoning";
-import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
+import { TOOL_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
 import { resolveWireModelId } from "src/ts/preset/adapter/wireInvariants";
 import { pumpPresetStream } from "./presetStreamPump";
 import { makeJobFetch } from "./jobFetch";
-import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams } from "./modelPresetBinding";
+import { toLogSource, toRequestKind } from "./logSource";
+import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams, presetSupportsVision } from "./modelPresetBinding";
 import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./modelPresetMessages";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
-import { createRequestLogScope, type RequestLogRoute, type RequestLogSource, type RequestLogUsage } from "src/ts/requestLog";
+import { createRequestLogScope, recordRequestLog, stripInlineMedia, type RequestLogRoute, type RequestLogSource, type RequestLogUsage } from "src/ts/requestLog";
 import {
     startStatus, appendText, endStatus, setStatusTokenCounter, addBadge,
-    type RequestKind,
 } from "src/ts/status/requestStatus";
 
 export type ToolCall = {
@@ -81,6 +81,9 @@ interface requestDataArgument{
     forceStreaming?: boolean
     blockPlugins?: boolean
     forceLocalNetwork?: boolean
+    /** Live message metadata persisted with a durable model job so a recovered
+     *  message has the same model and token details as the normal write path. */
+    generationInfo?: MessageGenerationInfo
     // Set when this request originates from a module's own LLM call (module
     // Lua/Python script or module trigger). Lets resolveChatModelBinding route
     // it to the ModelPreset bound to that module (db.moduleModelBindings).
@@ -116,6 +119,7 @@ export type requestDataResponse = {
     },
     failByServerError?: boolean
     model?: string
+    modelLabel?: string
 }|{
     type: "streaming",
     result: ReadableStream<StreamResponseChunk>,
@@ -123,6 +127,7 @@ export type requestDataResponse = {
         emotion?: string
     }
     model?: string
+    modelLabel?: string
 }|{
     type: "multiline",
     result: ['user'|'char',string][],
@@ -130,6 +135,7 @@ export type requestDataResponse = {
         emotion?: string
     }
     model?: string
+    modelLabel?: string
 }
 
 export interface StreamResponseChunk{[key:string]:string}
@@ -632,16 +638,6 @@ function safeStatus(fn: () => void): void {
     try { fn() } catch (e) { console.error('[ModelPreset] status publish failed', e) }
 }
 
-// Map the request pipeline's mode to the status-channel chip kind. submodel and
-// otherAx collapse to 'sub' (both are internal aux calls the user rarely
-// distinguishes; see the toast infra note).
-// The request log reuses RequestKind's vocabulary for its `source` tag, so the
-// part of the app that issued a request reads the same in the log as it does
-// in the request-status toast.
-function toLogSource(mode: ModelModeExtended): RequestLogSource {
-    return toRequestKind(mode)
-}
-
 function toLogUsage(usage: AdapterUsage | undefined): RequestLogUsage | undefined {
     if (!usage) return undefined
     return {
@@ -649,17 +645,6 @@ function toLogUsage(usage: AdapterUsage | undefined): RequestLogUsage | undefine
         outputTokens: usage.completionTokens,
         cachedTokens: usage.cachedTokens,
         reasoningTokens: usage.reasoningTokens,
-    }
-}
-
-function toRequestKind(mode: ModelModeExtended): RequestKind {
-    switch (mode) {
-        case 'translate': return 'translate'
-        case 'memory': return 'memory'
-        case 'emotion': return 'emotion'
-        case 'submodel':
-        case 'otherAx': return 'sub'
-        default: return 'main'
     }
 }
 
@@ -791,6 +776,10 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             generationId: genId,
             adapterKind: kind,
             model: wireModel,
+            modelLabel: preset.name,
+            inputTokens: arg.generationInfo?.inputTokens,
+            outputTokens: arg.generationInfo?.outputTokens,
+            maxContext: arg.generationInfo?.maxContext,
             jobKind: arg.realChatId ? 'main' : 'aux',
             streaming: resolvePresetStreaming(preset, arg),
             timeoutMs: (getDatabase().localNetworkTimeoutSec ?? 600) * 1000,
@@ -814,8 +803,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     // the preset's imageInput toggle (for profiles like ollama / openai-compatible
     // whose snapshot does not declare 'vision'). Additive — both branches default
     // off, so OFF is byte-identical to the prior text-only behavior.
-    const supportsVision = VISION_CAPABLE_ADAPTER_KINDS.includes(kind)
-        && ((caps?.includes('vision') ?? false) || preset.imageInput === true)
+    const supportsVision = presetSupportsVision(preset)
 
     // Gemini context caching: MAIN chat requests on the google-gemini adapter
     // (AI Studio key auth OR Vertex native service-account auth) — tool runs and
@@ -888,7 +876,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     try {
         arg.formated = reformater(safeStructuredClone(arg.formated), presetFlags)
     } catch (err) {
-        return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: wireModel }
+        return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: wireModel, modelLabel: preset.name }
     }
 
     // Expand `<tool_call>` history into structured tool turns ONLY on the active
@@ -918,9 +906,10 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
                 type: 'success',
                 result: JSON.stringify({ url: prepared.url, body: prepared.body, headers: prepared.headers }),
                 model: wireModel,
+                modelLabel: preset.name,
             }
         } catch (err) {
-            return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: wireModel }
+            return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: wireModel, modelLabel: preset.name }
         } finally {
             void logScope.close()
         }
@@ -936,7 +925,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             // The tool loop issues one request per turn; each is its own log
             // entry and all of them flush together here.
             void logScope.close()
-            return { type: 'success', result, model: wireModel, toolExecuted: toolsExecuted }
+            return { type: 'success', result, model: wireModel, modelLabel: preset.name, toolExecuted: toolsExecuted }
         }
 
         const useStreaming = resolvePresetStreaming(preset, arg)
@@ -1005,11 +994,11 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             // once instead of token-by-token.
             if(preset.decoupledStreaming){
                 const text = await collectStreamingText(stream)
-                return { type: 'success', result: text, model: wireModel }
+                return { type: 'success', result: text, model: wireModel, modelLabel: preset.name }
             }
             // endStatus fires from the pump's onFinish once the consumer drains
             // the stream — NOT here, because the stream outlives this return.
-            return { type: 'streaming', result: stream, model: wireModel }
+            return { type: 'streaming', result: stream, model: wireModel, modelLabel: preset.name }
         }
         const response = await sendModelPreset(kind, preset, options, credential)
         logScope.setUsage(toLogUsage(response.usage))
@@ -1029,7 +1018,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
                 })
             })
         }
-        return { type: 'success', result: formatPresetReasoning(response.reasoning) + response.text, model: wireModel }
+        return { type: 'success', result: formatPresetReasoning(response.reasoning) + response.text, model: wireModel, modelLabel: preset.name }
     } catch (err) {
         console.error('[ModelPreset] request failed', describeModelPresetError(err))
         // A throw before the stream started (or instead of it) means onFinish
@@ -1044,6 +1033,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             type: 'fail',
             result: err instanceof Error ? err.message : String(err),
             model: wireModel,
+            modelLabel: preset.name,
         }
     }
 }
@@ -1250,7 +1240,7 @@ async function requestNovelAI(arg:RequestDataArgumentExtended):Promise<requestDa
 
     const da = await globalFetch(aiModel === 'novelai_kayra' ? "https://text.novelai.net/ai/generate" : "https://api.novelai.net/ai/generate", {
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         logModel: aiModel,
         body: body,
         headers: {
@@ -1380,7 +1370,7 @@ async function requestOobaLegacy(arg:RequestDataArgumentExtended):Promise<reques
 
     const res = await globalFetch(blockingUrl, {
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         body: bodyTemplate,
         headers: headers,
         abortSignal,
@@ -1463,7 +1453,7 @@ async function requestOoba(arg:RequestDataArgumentExtended):Promise<requestDataR
 
     const response = await globalFetch(urlStr, {
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         body: bodyTemplate,
         chatId: arg.chatId,
         abortSignal: arg.abortSignal
@@ -1487,11 +1477,40 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
     const db = getDatabase()
     const isV3Model = arg.aiModel.startsWith('pluginmodel:::')
     const responseModel = isV3Model ? arg.aiModel : 'custom'
+    const logStarted = Date.now()
+    let logWritten = false
+    const logModel = isV3Model ? arg.aiModel : db.currentPluginProvider
+    let providerForLog = logModel
+    let providerArgForLog: unknown = {}
+    const writeLog = (provider: string, requestBody: unknown, responseBody: string, success: boolean, streaming: boolean, extra: { aborted?: boolean, errorMessage?: string } = {}) => {
+        if (arg.previewBody || logWritten) return
+        logWritten = true
+        try {
+            recordRequestLog({
+                timestamp: logStarted,
+                category: 'llm',
+                source: 'plugin',
+                chatId: arg.chatId,
+                model: logModel,
+                provider,
+                url: `plugin://${provider}`,
+                method: 'POST',
+                success,
+                streaming,
+                durationMs: Date.now() - logStarted,
+                requestBody: stripInlineMedia(JSON.stringify(requestBody)),
+                responseBody: stripInlineMedia(responseBody),
+                aborted: extra.aborted,
+                errorMessage: extra.errorMessage,
+            })
+        } catch {}
+    }
     try {
         const formated = arg.formated
         const maxTokens = arg.maxTokens
         const bias = arg.biasString
         const model = isV3Model ? arg.aiModel.replace('pluginmodel:::', '') : db.currentPluginProvider
+        providerForLog = model
         const v2Function = pluginV2.providers.get(model)
 
         if(arg.previewBody){
@@ -1503,7 +1522,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             }
         }
     
-        const d = v2Function ? (await v2Function(applyParameters({
+        const providerArg = v2Function ? applyParameters({
             prompt_chat: formated,
             mode: arg.mode,
             bias: [],
@@ -1512,16 +1531,19 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             'frequency_penalty','min_p','presence_penalty','repetition_penalty','top_k','top_p','temperature'
         ], {}, arg.mode, {
             modelId: arg.aiModel
-        }) as any, arg.abortSignal)) : await pluginProcess({
+        }) : {
             bias: bias,
             prompt_chat: formated,
             temperature: (db.temperature / 100),
             max_tokens: maxTokens,
             presence_penalty: (db.PresensePenalty / 100),
             frequency_penalty: (db.frequencyPenalty / 100)
-        })
+        }
+        providerArgForLog = providerArg
+        const d = v2Function ? (await v2Function(providerArg as any, arg.abortSignal)) : await pluginProcess(providerArg)
     
         if(!d){
+            writeLog(model, providerArg, language.errors.unknownModel, false, false)
             return {
                 type: 'fail',
                 result: (language.errors.unknownModel),
@@ -1529,9 +1551,11 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             }
         }
         else if(!d.success){
+            const content = d.content instanceof ReadableStream ? await (new Response(d.content)).text() : d.content
+            writeLog(model, providerArg, content, false, d.content instanceof ReadableStream)
             return {
                 type: 'fail',
-                result: d.content instanceof ReadableStream ? await (new Response(d.content)).text() : d.content,
+                result: content,
                 model: responseModel
             }
         }
@@ -1544,8 +1568,16 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
                     control.enqueue({
                         "0": fullText
                     })
+                },
+                flush() {
+                    writeLog(model, providerArg, fullText, !arg.abortSignal?.aborted, true, {
+                        aborted: arg.abortSignal?.aborted,
+                    })
                 }
             })
+            arg.abortSignal?.addEventListener('abort', () => {
+                writeLog(model, providerArg, fullText, false, true, { aborted: true })
+            }, { once: true })
     
             return {
                 type: 'streaming',
@@ -1554,6 +1586,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             }
         }
         else{
+            writeLog(model, providerArg, d.content ?? '', true, false)
             return {
                 type: 'success',
                 result: d.content ?? '',
@@ -1562,6 +1595,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
         }   
     } catch (error) {
         console.error(error)
+        writeLog(providerForLog, providerArgForLog, '', false, false, { aborted: arg.abortSignal?.aborted, errorMessage: `${error}` })
         return {
             type: 'fail',
             result: `Plugin Error from ${db.currentPluginProvider}: ` + JSON.stringify(error),
@@ -1627,7 +1661,7 @@ async function requestKobold(arg:RequestDataArgumentExtended):Promise<requestDat
     
     const da = await globalFetch(url.toString(), {
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         method: "POST",
         body: body,
         headers: {
@@ -1706,7 +1740,7 @@ async function requestNovelList(arg:RequestDataArgumentExtended):Promise<request
     }
     const response = await globalFetch(arg.customURL ?? api_server_url + '/api', {
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         method: 'POST',
         headers: headers,
         body: send_body,
@@ -1749,7 +1783,18 @@ async function requestOllama(arg:RequestDataArgumentExtended):Promise<requestDat
         }
     }
 
-    const ollama = new Ollama({host: db.ollamaURL})
+    const logScope = createRequestLogScope({
+        category: 'llm',
+        source: arg.logSource ?? toLogSource(arg.mode),
+        chatId: arg.chatId,
+        model: db.ollamaModel,
+        provider: 'ollama',
+        streaming: true,
+    })
+    const ollama = new Ollama({
+        host: db.ollamaURL,
+        fetch: logScope.wrap(globalThis.fetch.bind(globalThis)),
+    })
 
     const messages = []
     for (const v of formated) {
@@ -1761,20 +1806,33 @@ async function requestOllama(arg:RequestDataArgumentExtended):Promise<requestDat
         }
     }
 
-    const response = await ollama.chat({
-        model: db.ollamaModel,
-        messages: messages,
-        stream: true
-    })
+    let response: any
+    try {
+        response = await ollama.chat({
+            model: db.ollamaModel,
+            messages: messages,
+            stream: true
+        })
+    } catch (error) {
+        void logScope.close()
+        throw error
+    }
 
     const readableStream = new ReadableStream<StreamResponseChunk>({
         async start(controller){
-            for await(const chunk of response){
-                controller.enqueue({
-                    "0": chunk.message.content
-                })
+            try {
+                for await(const chunk of response){
+                    controller.enqueue({
+                        "0": chunk.message.content
+                    })
+                }
+                controller.close()
+            } catch (error) {
+                controller.error(error)
+                throw error
+            } finally {
+                void logScope.close()
             }
-            controller.close()
         }
     })
 
@@ -1883,7 +1941,7 @@ async function requestCohere(arg:RequestDataArgumentExtended):Promise<requestDat
 
     const res = await globalFetch(arg.customURL ?? 'https://api.cohere.com/v1/chat', {
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         method: "POST",
         headers: {
             "Authorization": "Bearer " + (arg.key ?? db.cohereAPIKey),
@@ -1963,7 +2021,9 @@ async function requestHorde(arg:RequestDataArgumentExtended):Promise<requestData
         apiKey = db.hordeConfig.apiKey
     }
 
-    const da = await fetch("https://stablehorde.net/api/v2/generate/text/async", {
+    const hordeUrl = "https://stablehorde.net/api/v2/generate/text/async"
+    const hordeStarted = Date.now()
+    const da = await fetch(hordeUrl, {
         body: JSON.stringify(argument),
         method: "POST",
         headers: {
@@ -1972,11 +2032,31 @@ async function requestHorde(arg:RequestDataArgumentExtended):Promise<requestData
         },
         signal: abortSignal
     })
+    const hordeText = await da.text()
+    try {
+        recordRequestLog({
+            timestamp: hordeStarted,
+            category: 'llm',
+            source: arg.logSource ?? toLogSource(arg.mode),
+            chatId: arg.chatId,
+            model: realModel,
+            provider: 'horde',
+            url: hordeUrl,
+            method: 'POST',
+            status: da.status,
+            success: da.status === 202,
+            aborted: abortSignal?.aborted,
+            streaming: false,
+            durationMs: Date.now() - hordeStarted,
+            requestBody: stripInlineMedia(JSON.stringify(argument)),
+            responseBody: stripInlineMedia(hordeText),
+        })
+    } catch {}
 
     if(da.status !== 202){
         return {
             type: "fail",
-            result: await da.text()
+            result: hordeText
         }
     }
 
@@ -1984,7 +2064,7 @@ async function requestHorde(arg:RequestDataArgumentExtended):Promise<requestData
         id:string,
         kudos:number,
         message:string
-    } = await da.json()
+    } = JSON.parse(hordeText)
 
     let warnMessage = ""
     if(json.message){

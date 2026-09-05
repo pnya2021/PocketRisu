@@ -4,13 +4,14 @@ import { replacePluginV3RuntimeSnapshot } from "../pluginV3Reload";
 import { getCurrentCharacter, getCurrentChat, getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
+import * as pluginStorageStore from "../pluginStorageStore";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, selIdState, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
-import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
+import { alertConfirm, alertError, alertNormal, alertNormalWait } from "src/ts/alert";
 import { language } from "src/lang";
-import { checkCharOrder, forageStorage, getAssetStorageMutationGeneration, getAssetStorageRevision, getFetchLogs, readImage } from "src/ts/globalApi.svelte";
+import { checkCharOrder, forageStorage, getAssetStorageMutationGeneration, getAssetStorageRevision, getFetchLogs, readImage, loadAssetManifestItems } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { get } from "svelte/store";
 import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
@@ -24,6 +25,8 @@ import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
 import type { OpenAIChat } from "src/ts/process/index.svelte";
 import { getActiveModulesWithReasons, getModuleLorebooks } from "src/ts/process/modules";
+import { hydratePluginCharacterSnapshot, hydratePluginDatabaseSnapshot, restorePluginCharacterManifest } from "../pluginCharacterSnapshot";
+import { PLUGIN_CUSTOM_STORAGE_KEY, wantsFullPluginStorage } from "../pluginDbProxy";
 import {
     registerTTSPreprocessor,
     unregisterTTSPreprocessor,
@@ -86,6 +89,10 @@ import {
     type CancellableMessageListener,
     type MessageEventOptions,
 } from './illustration/messageEvents';
+
+type SaveStorageOwner = NonNullable<ReturnType<typeof getDatabase>['pluginStorageMeta']>[string]
+// Weak links let overlapping failed writes recover the last surviving attribution.
+const failedPluginStorageOwners = new WeakMap<object, SaveStorageOwner | undefined>()
 
 /*
     V3 API for RisuAI Plugins
@@ -653,6 +660,7 @@ const authorizationHeaders = [
 ]
 
 export const createPocketStudioCardResourceAdapterForV3 = () => createPocketStudioCardResourceAdapter({
+    loadAssetManifestItems,
     getDatabase,
     getSelectedCharacterIndex: () => selIdState.selId,
     readImage,
@@ -671,6 +679,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
     const contextResources = new ContextResourceService(
         context,
         createPocketContextResourceAdapter({
+            loadAssetManifestItems,
             getDatabase,
             getCurrentCharacter,
             hydrateCurrentChat: (character) => ensureCurrentChatReady(
@@ -796,19 +805,26 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getInlayAssetBlob,
     })
     addPluginUnloadCallback(context.instanceId, () => pixaiLocalModel.releaseAll())
-    const pluginStorageMutations = createOwnedSyncStorageMutations({
-        storage: oldApis.pluginStorage,
-        canMutate: canRegisterResource,
-        recordOwner: (key) => recordOwner('save', key, context.principalId, context.displayName) === true,
-        removeOwner: (key) => { removeOwner('save', key) },
-        clearOwners: () => { clearOwners('save') },
-    })
     const safeLocalStorageMutations = createOwnedSyncStorageMutations({
         storage: oldApis.safeLocalStorage,
         canMutate: canRegisterResource,
         recordOwner: (key) => recordOwner('local', key, context.principalId, context.displayName) === true,
         removeOwner: (key) => { removeOwner('local', key) },
         clearOwners: () => { clearOwners('local') },
+    })
+    // Same character as oldApis.getChar/setChar, but with lazy assets filled
+    // on read and the manifest kept on an assets-unchanged write (#80).
+    const getCharacterForPlugin = async () => {
+        const char = DBState.db.characters?.[get(selectedCharID)]
+        return await hydratePluginCharacterSnapshot(char ? $state.snapshot(char) : char)
+    }
+    const setCharacterForPlugin = (char: any) => {
+        oldApis.setChar(restorePluginCharacterManifest(char, DBState.db.characters?.[get(selectedCharID)]))
+    }
+    const withPluginName = (options: any) => ({
+        ...(options ?? {}),
+        ...(options?.logCategory ? {} : { logCategory: 'other', logSource: 'plugin' }),
+        logPlugin: plugin.name,
     })
     return {
 
@@ -828,7 +844,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     console.warn(`Request contains potentially sensitive header '${headerName}'. handling of such headers may be changed to only work with nativeFetch.`);
                 }
             }
-            return oldApis.risuFetch(url, options);
+            return oldApis.risuFetch(url, withPluginName(options));
         },
         nativeFetch: (url, options) => {
             for(const blocked of urlBlacklist){
@@ -844,10 +860,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     console.warn(`Request contains potentially sensitive header '${headerName}'. handling of such headers may be changed to use server-side approch with write-only api access in the future for better security.`);
                 }
             }
-            return oldApis.nativeFetch(url, options);
+            return oldApis.nativeFetch(url, withPluginName(options));
         },
-        getChar: oldApis.getChar,
-        setChar: oldApis.setChar,
+        getChar: getCharacterForPlugin,
+        setChar: setCharacterForPlugin,
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>, options?: PluginV3ProviderOptions) => {
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             const providerCallback = async (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => {
@@ -924,6 +940,17 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             addPluginUnloadCallback(context.instanceId, () => oldApis.removeRisuReplacer(name, func as any))
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
+        addRisuChatListener: async (mode:'output', func:Function) => {
+            //permission check, lets use same as replacer
+            const conf = await getPluginPermission(context, 'replacer', 'periodically');
+            if(!conf){
+                return;
+            }
+            if (!canRegisterResource()) return
+            oldApis.addRisuChatListener(mode, func as any);
+            addPluginUnloadCallback(context.instanceId, () => oldApis.removeRisuChatListener(mode, func as any));
+        },
+        removeRisuChatListener: oldApis.removeRisuChatListener,
         setDatabaseLite: (newDb: any) => applyProgrammaticDatabaseMutation(newDb, 'lite', canRegisterResource, isExecutionCurrent),
         setDatabase: (newDb: any) => applyProgrammaticDatabaseMutation(newDb, 'approved', canRegisterResource, isExecutionCurrent),
         loadPlugins: async () => {
@@ -932,6 +959,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         readImage: oldApis.readImage,
         readInlay: async (id: string) => {
+            const conf = await getPluginPermission(context, 'inlayRead', 'periodically');
+            if(!conf){
+                return null;
+            }
             return await getInlayAsset(id);
         },
         saveAsset: oldApis.saveAsset,
@@ -961,6 +992,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     ? (db.plugins ?? []).map((installed) => stripPluginPrincipal(installed))
                     : (db as any)[key]
                 ;(liteDB as any)[key] = $state.snapshot(value);
+            }
+            // Lazy asset manifests are filled here for modules, persona-embedded
+            // modules (#80 follow-up) and characters — a plugin reading the
+            // database instead of getCharacter* must see the same shape.
+            await hydratePluginDatabaseSnapshot(liteDB);
+            // Plugin values live on the server, so the DB field is always {}.
+            // Fill it with every stored value only when the user allowed it
+            // for this plugin (see wantsFullPluginStorage); otherwise say once
+            // why it is empty.
+            if (PLUGIN_CUSTOM_STORAGE_KEY in liteDB) {
+                if (wantsFullPluginStorage(plugin)) {
+                    (liteDB as any)[PLUGIN_CUSTOM_STORAGE_KEY] = await pluginStorageStore.snapshotAll();
+                } else if (!fullStorageHintShown.has(plugin.name)) {
+                    fullStorageHintShown.add(plugin.name);
+                    console.warn(`[RisuAI Plugin: ${plugin.name}] getDatabase() returns an empty pluginCustomStorage on PocketRisu. Read other plugins' values with pluginStorage.getItem(key), or allow full storage access for this plugin in Settings > Plugins. See docs/en/plugin-storage.md.`);
+                }
             }
             return liteDB;
         },
@@ -1056,12 +1103,12 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 }
             }
         },
-        getCharacterFromIndex: (index:number) => {
+        getCharacterFromIndex: async (index:number) => {
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
             if(charId){
-                return $state.snapshot(db.characters[charId]);
+                return await hydratePluginCharacterSnapshot($state.snapshot(db.characters[charId]));
             }
             return null;
         },
@@ -1070,7 +1117,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
             if(charId){
-                DBState.db.characters[charId] = char
+                DBState.db.characters[charId] = restorePluginCharacterManifest(char, db.characters[charId])
             }
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
@@ -1117,8 +1164,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             return $state.snapshot(characterLore.concat(chatLore).concat(moduleLore))
         },
         //New names for character APIs, to match API naming conventions
-        getCharacter: oldApis.getChar,
-        setCharacter: oldApis.setChar,
+        getCharacter: getCharacterForPlugin,
+        setCharacter: setCharacterForPlugin,
 
         showContainer: (
             //more types may be added in future
@@ -1536,21 +1583,49 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             
             return v;
         },
-        _getPluginStorage: oldApis.pluginStorage.getItem,
-        // Wrapped (not aliased) so we can record the originating plugin into the
-        // sidecar meta map. The value write is unchanged; reads stay aliased.
-        _setPluginStorage: (key: string, value: any) => {
-            pluginStorageMutations.setItem(key, value)
+        _getPluginStorage: async (key: string) => (await pluginStorageStore.getItem(key)) || null,
+        _setPluginStorage: async (key: string, value: any) => {
+            if (!canRegisterResource()) return false
+            const previousOwner = getDatabase().pluginStorageMeta?.[key]
+            if (!recordOwner('save', key, context.principalId, context.displayName)) return false
+            const provisionalOwner = getDatabase().pluginStorageMeta?.[key]
+            try {
+                await pluginStorageStore.setItem(key, value)
+            } catch (error) {
+                if (provisionalOwner) failedPluginStorageOwners.set(provisionalOwner, previousOwner)
+                const owners = getDatabase().pluginStorageMeta
+                // Preserve newer writes and retirement quarantine while restoring failed attribution.
+                if (owners?.[key] === provisionalOwner) {
+                    let survivingOwner = previousOwner
+                    while (survivingOwner && failedPluginStorageOwners.has(survivingOwner)) {
+                        survivingOwner = failedPluginStorageOwners.get(survivingOwner)
+                    }
+                    if (!survivingOwner) removeOwner('save', key)
+                    else owners[key] = 'state' in survivingOwner && survivingOwner.state === 'principal'
+                        && pluginDataLifecycle.isRetiring(survivingOwner.principalId)
+                        ? { ...survivingOwner, state: 'quarantined' } : survivingOwner
+                }
+                throw error
+            }
         },
-        _removePluginStorage: (key: string) => {
-            pluginStorageMutations.removeItem(key)
+        _removePluginStorage: async (key: string) => {
+            if (!canRegisterResource()) return
+            const owner = getDatabase().pluginStorageMeta?.[key]
+            await pluginStorageStore.removeItem(key)
+            // A later queued write (or quarantine) may now own the key.
+            if (getDatabase().pluginStorageMeta?.[key] === owner) removeOwner('save', key)
         },
-        _clearPluginStorage: () => {
-            pluginStorageMutations.clear()
+        _clearPluginStorage: async () => {
+            if (!canRegisterResource()) return
+            const owners = Object.entries(getDatabase().pluginStorageMeta ?? {})
+            await pluginStorageStore.clear()
+            for (const [key, owner] of owners) {
+                if (getDatabase().pluginStorageMeta?.[key] === owner) removeOwner('save', key)
+            }
         },
-        _keyPluginStorage: oldApis.pluginStorage.key,
-        _keysPluginStorage: oldApis.pluginStorage.keys,
-        _lengthPluginStorage: oldApis.pluginStorage.length,
+        _keyPluginStorage: pluginStorageStore.key,
+        _keysPluginStorage: pluginStorageStore.keys,
+        _lengthPluginStorage: pluginStorageStore.length,
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
         _setSafeLocalStorage: (key: string, value: string) => {
             safeLocalStorageMutations.setItem(key, value)
@@ -1715,6 +1790,9 @@ type V3PluginInstance = {
 
 const v3PluginInstances: V3PluginInstance[] = [];
 
+// Plugins already told (once per session) why pluginCustomStorage is empty.
+const fullStorageHintShown = new Set<string>()
+
 export async function loadV3Plugins(plugins:RisuPlugin[]){
     await replacePluginV3RuntimeSnapshot({
         liveInstances: v3PluginInstances,
@@ -1722,6 +1800,11 @@ export async function loadV3Plugins(plugins:RisuPlugin[]){
         unload: (instance) => unloadV3Plugin(instance.instanceId),
         load: executePluginV3,
     })
+}
+
+export async function reloadV3Plugin(plugin:RisuPlugin){
+    await unloadV3Plugin(plugin.name);
+    await executePluginV3(plugin);
 }
 
 export async function executePluginV3(plugin:RisuPlugin){

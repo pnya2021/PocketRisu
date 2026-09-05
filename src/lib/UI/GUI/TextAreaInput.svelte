@@ -69,7 +69,7 @@
             onkeydown={async (e) => {
                 if(
                     (e.ctrlKey || e.shiftKey || e.altKey)
-                    && hotkeyMatches(DBState.db.hotkeys.find(hk => hk.action === 'popupEditor'), e)
+                    && hotkeyMatches((DBState.db.hotkeys ?? []).find(hk => hk.action === 'popupEditor'), e)
                 ){
                     e.preventDefault()
                     popUpEditorStore.value = value
@@ -114,7 +114,7 @@
         onkeydown={async (e) => {
             if(
                 (e.ctrlKey || e.shiftKey || e.altKey)
-                && hotkeyMatches(DBState.db.hotkeys.find(hk => hk.action === 'popupEditor'), e)
+                && hotkeyMatches((DBState.db.hotkeys ?? []).find(hk => hk.action === 'popupEditor'), e)
             ){
                 e.preventDefault()
                 popUpEditorStore.value = value

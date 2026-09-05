@@ -23,7 +23,8 @@
                 type: c.type,
                 interaction: c.lastInteraction || 0,
                 agoText: makeAgoText(c.lastInteraction || 0),
-            })).sort((a, b) => {
+                trashTime: c.trashTime,
+            })).filter((c) => !c.trashTime).sort((a, b) => {
             if (a.interaction === b.interaction) {
                 return a.name.localeCompare(b.name);
             }

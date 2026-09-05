@@ -148,4 +148,17 @@ describe('session-lock', () => {
         expect(lock.activeId()).toBe('phone')
         expect(lock.peek('')).toBe('active')            // sessionless clients never reload
     })
+
+    // Reload-loop guard (2026-08-24): a session whose boot registration never
+    // reached the server (flaky mobile/VPN link) must not be judged 'stale' —
+    // the client would auto-reload on every focus with no way to break out.
+    it('peek reports unknown, not stale, for an unregistered session', () => {
+        const { lock } = makeLock()
+        lock.register('pc')
+        expect(lock.checkWrite('pc').ok).toBe(true)     // pc holds the lock
+        expect(lock.checkWrite('phone', true).ok).toBe(false) // writes still 423 — data stays safe
+        expect(lock.peek('phone')).toBe('unknown')      // phone's register never arrived
+        lock.register('phone')                          // registration finally lands
+        expect(lock.peek('phone')).toBe('fresh')        // normal judgment resumes
+    })
 })

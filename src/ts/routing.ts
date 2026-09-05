@@ -41,6 +41,7 @@ export const SettingsRoute = {
     RemoteAccess: 21 as const,
     System: 22 as const,
     InlayImageGallery: 23 as const,
+    LongTermMemory: 24 as const,
     DevPanel: 99 as const,
 } as const;
 

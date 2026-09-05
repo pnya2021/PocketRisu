@@ -1,7 +1,8 @@
 import { get } from "svelte/store"
 import { alertClear, alertMd, alertSelect, alertWait, doingAlert } from "./alert"
-import { getDatabase  } from "./storage/database.svelte"
-import { alertStore, DBState, MobileGUIStack, MobileSideBar, openPersonaList, personaSelectCallback, openPresetList, openModelPresetList, openHypaV3PresetList, openThemePresetList, OpenRealmStore, PlaygroundStore, QuickSettings, SafeModeStore, selectedCharID, settingsOpen } from "./stores.svelte"
+import { getDatabase, getCurrentCharacter, getCurrentChat } from "./storage/database.svelte"
+import { setChatMemoryPreset } from "./process/memory/memoryPresets"
+import { alertStore, DBState, MobileGUIStack, MobileSideBar, openPersonaList, personaSelectCallback, openPresetList, openModelPresetList, openMemoryPresetList, memoryPresetSelectCallback, openThemePresetList, OpenRealmStore, PlaygroundStore, QuickSettings, SafeModeStore, selectedCharID, settingsOpen } from "./stores.svelte"
 import { language } from "src/lang"
 import { updateTextThemeAndCSS } from "./gui/colorscheme"
 import { defaultHotkeys } from "./defaulthotkeys"
@@ -9,6 +10,7 @@ import { doingChat, previewBody, sendChat } from "./process/index.svelte"
 import { endAllGenerations } from "./process/generationState"
 import { RISU_SIDEBAR_DRAG_TYPE } from "./dragTypes"
 import { openSettings, SettingsRoute, SystemTab } from "./routing"
+import { deselectCharacter } from "./characters"
 
 export function initHotkey(){
     document.addEventListener('keydown', async (ev) => {
@@ -75,7 +77,7 @@ export function initHotkey(){
                     break
                 }
                 case 'home':{
-                    selectedCharID.set(-1)
+                    deselectCharacter()
                     break
                 }
                 case 'presets':{
@@ -105,6 +107,12 @@ export function initHotkey(){
                         return
                     }
                     selectedCharID.set(sorted[currentIndex - 1].i)
+                    try {
+                        const char = database.characters[sorted[currentIndex - 1].i]
+                        if (char?.chaId) {
+                            localStorage.setItem('risu-last-active-character', char.chaId)
+                        }
+                    } catch {}
                     PlaygroundStore.set(0)
                     OpenRealmStore.set(false)
                     break
@@ -120,6 +128,12 @@ export function initHotkey(){
                     // currentIndex === -1 (nothing selected) intentionally falls through
                     // to sorted[0], matching the previous behaviour.
                     selectedCharID.set(sorted[currentIndex + 1].i)
+                    try {
+                        const char = database.characters[sorted[currentIndex + 1].i]
+                        if (char?.chaId) {
+                            localStorage.setItem('risu-last-active-character', char.chaId)
+                        }
+                    } catch {}
                     PlaygroundStore.set(0)
                     OpenRealmStore.set(false)
                     break
@@ -263,7 +277,7 @@ export function initHotkey(){
 
 export async function quickMenu(){
     const db = getDatabase()
-    const showHypaV3 = db.hypaV3 && db.hypaV3Presets?.length > 1
+    const showHypaV3 = (db.memoryPresets?.length ?? 0) > 0 && !!getCurrentChat()
 
     const options = [
         language.presets,
@@ -286,7 +300,12 @@ export async function quickMenu(){
         personaSelectCallback.set(null)
     }
     else if(showHypaV3 && sel === idx++){
-        openHypaV3PresetList.set(true)
+        memoryPresetSelectCallback.set((value) => {
+            const char = getCurrentCharacter()
+            const chat = getCurrentChat()
+            if (chat) setChatMemoryPreset(DBState.db, char, chat, value)
+        })
+        openMemoryPresetList.set(true)
     }
 }
 

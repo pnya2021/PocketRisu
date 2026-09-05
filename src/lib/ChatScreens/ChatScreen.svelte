@@ -39,8 +39,9 @@
     });
 </script>
 
+<!-- `isolate` keeps bot HTML/CSS z-index (panels, tooltips) inside the chat layer so app popups and alerts stay on top. -->
 {#if DBState.db.theme === 'waifu'}
-    <div class="grow h-full flex justify-center relative" style="{bgImg.length < 4 ? wallPaper : bgImg}">
+    <div class="isolate grow h-full flex justify-center relative" style="{bgImg.length < 4 ? wallPaper : bgImg}">
         <SideBarArrow />
         <BackgroundDom />
         {#if $selectedCharID >= 0}
@@ -55,7 +56,7 @@
         </div>
     </div>
 {:else if DBState.db.theme === 'waifuMobile'}
-    <div class="grow h-full relative" style={bgImg.length < 4 ? wallPaper : bgImg}>
+    <div class="isolate grow h-full relative" style={bgImg.length < 4 ? wallPaper : bgImg}>
         <SideBarArrow />
         <BackgroundDom />
         <div class="w-full absolute z-10 bottom-0 left-0"
@@ -73,7 +74,7 @@
         {/if}
     </div>
 {:else}
-    <div class="grow h-full min-w-0 relative justify-center flex">
+    <div class="isolate grow h-full min-w-0 relative justify-center flex">
         <SideBarArrow />
         <BackgroundDom />
         <div style={bgImg} class="h-full w-full" class:max-w-6xl={DBState.db.classicMaxWidth}>

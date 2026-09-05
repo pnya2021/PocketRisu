@@ -8,6 +8,7 @@
     import { Dialog } from 'bits-ui';
     import { LoaderCircleIcon } from '@lucide/svelte';
     import { cn } from 'src/lib/utils';
+    import { handleDialogCloseAutoFocus } from './dialogFocusPolicy';
     import type { ShDialogTier } from './ShDialog.svelte';
 
     interface Props {
@@ -60,6 +61,7 @@
             class={cn(contentBase, tierClasses[tier], contentClass)}
             escapeKeydownBehavior="ignore"
             interactOutsideBehavior="ignore"
+            onCloseAutoFocus={handleDialogCloseAutoFocus}
         >
             <Dialog.Title class="sr-only">Loading</Dialog.Title>
             <Dialog.Description class="sr-only">

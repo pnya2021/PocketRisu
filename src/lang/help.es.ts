@@ -7,6 +7,8 @@
  */
 
 export const helpEs = {
+    "memoryPresetBinding": "El preset de memoria a largo plazo que usa este chat.\n\n- **Predeterminado**: sigue el preset predeterminado de Ajustes → Memoria a largo plazo y cambia con él.\n- **Desactivado**: los mensajes fuera de la ventana de contexto simplemente se recortan.\n- **Un preset**: este chat usa ese preset independientemente del predeterminado.\n\nSe guarda por chat; no afecta a otros chats del mismo personaje.",
+    "memoryPresetDefault": "El preset de memoria a largo plazo que usan los chats en «Predeterminado». Con «Desactivado», la memoria solo funciona en los chats que eligieron un preset por sí mismos.",
         "model": "La opción de modelo es el modelo principal usado en el chat.",
         "submodel": "El Modelo Auxiliar es un modelo que se utiliza para analizar imágenes de emociones, auto sugerencias, etc. Se recomienda GPT-3.5.",
         "oaiapikey": "Clave API para OpenAI. Puedes obtenerla en https://platform.openai.com/account/api-keys",

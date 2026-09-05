@@ -59,6 +59,7 @@ async function harness(options: {
     storageRevisions?: Map<string, string>
     reactive?: boolean
     getAssetStorageMutationGeneration?: () => string | number
+    loadAssetManifestItems?: import('./contextResources.pocket').PocketContextAdapterDependencies['loadAssetManifestItems']
 }) {
     const native = await import('./studioCardResources.pocket')
     let selected = options.selected ?? -1
@@ -74,6 +75,7 @@ async function harness(options: {
         getAssetStorageRevision,
         getAssetStorageMutationGeneration: options.getAssetStorageMutationGeneration,
         reactiveCatalogueIndex: options.reactive,
+        loadAssetManifestItems: options.loadAssetManifestItems,
     })
     const abortController = new AbortController()
     const context = {
@@ -155,6 +157,56 @@ const captureBoundaryFixture = () => {
 }
 
 describe('Pocket Studio card native projection', () => {
+    it('rejects oversized lazy captures before requesting their manifest tuples', async () => {
+        const card = character('oversized')
+        delete card.additionalAssets
+        card.additionalAssetManifest = { id: 'm1', version: 1, count: 20_000, sha256: 'm1' }
+        const h = await harness({ characters: [card], loadAssetManifestItems: async () => {
+            throw new Error('oversized manifest must not be fetched')
+        } })
+        await expect(h.adapter.captureSource('oversized')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+    })
+
+    it('rejects card edits while detached manifest hydration is pending', async () => {
+        const card = character('lazy')
+        delete card.additionalAssets
+        card.additionalAssetManifest = { id: 'm1', version: 1, count: 1, sha256: 'm1' }
+        const h = await harness({ characters: [card], loadAssetManifestItems: async () => {
+            card.desc = 'changed during hydration'
+            return [['reference', 'assets/reference.png', 'png']]
+        } })
+        await expect(h.adapter.captureSource('lazy')).rejects.toMatchObject({ code: 'CONFLICT' })
+    })
+
+    it('hydrates nonselected group member manifests for captured reads and invalidates changed descriptors', async () => {
+        const member = character('member')
+        delete member.additionalAssets
+        member.additionalAssetManifest = { id: 'm1', version: 1, count: 1, sha256: 'm1' }
+        guardChatData(member, () => { throw new Error('must not touch chat data') })
+        const h = await harness({
+            characters: [group('party', ['member']), member],
+            loadAssetManifestItems: async () => [['reference', 'assets/reference.png', 'png']],
+        })
+        const source = await h.adapter.captureSource('party')
+        expect(source!.assets.map((asset) => asset.name)).toContain('reference')
+        const asset = source!.assets.find((asset) => asset.name === 'reference')!
+        await expect(h.adapter.readAsset(asset.locator)).resolves.toEqual(new Uint8Array([1, 2, 3]))
+        expect(h.adapter.revalidateSource!(source!)).toBe(true)
+        expect(member.additionalAssets).toBeUndefined()
+        expect(member.additionalAssetManifest.id).toBe('m1')
+        member.additionalAssetManifest = { id: 'm2', version: 2, count: 1, sha256: 'm2' }
+        expect(h.adapter.revalidateSource!(source!)).toBe(false)
+    })
+
+    it('does not capture a successful empty Studio source when manifest loading fails', async () => {
+        const card = character('lazy')
+        delete card.additionalAssets
+        card.additionalAssetManifest = { id: 'm1', version: 1, count: 1, sha256: 'm1' }
+        const h = await harness({ characters: [card],
+            loadAssetManifestItems: async () => { throw new Error('offline') } })
+        await expect(h.adapter.captureSource('lazy')).rejects.toMatchObject({ code: 'CONFLICT' })
+    })
+
     it('accepts the exact 20,000-item canonical capture envelope', async () => {
         const fixture = captureBoundaryFixture()
         const h = await harness({

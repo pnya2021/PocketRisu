@@ -7,6 +7,8 @@
  */
 
 export const helpCn = {
+    "memoryPresetBinding": "此聊天使用的长期记忆预设。\n\n- **默认**：跟随 设置 → 长期记忆 中的默认预设，并随之变化。\n- **不使用**：超出上下文的旧消息会被直接截断。\n- **选择预设**：此聊天单独使用该预设（摘要模型、比例等）。\n\n按聊天保存，不影响同一角色的其他聊天。",
+    "memoryPresetDefault": "设为“默认”的聊天使用的长期记忆预设。设为“不使用”时，只有自行选择了预设的聊天才会运行长期记忆。",
         "model": "此模型是指聊天中使用的主控模型。",
         "submodel": "辅助模型是一个用于分析情感图像、产生自动建议等的模型，推荐使用 GPT-3.5。",
         "oaiapikey": "OpenAI 的 API 密钥（Key），可在 https://platform.openai.com/account/api-keys 获取。",

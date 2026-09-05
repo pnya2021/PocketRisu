@@ -252,6 +252,8 @@ export interface ResolvedModelProfileSnapshot {
 export interface ModelPreset {
     id: string
     name: string
+    /** Optional folder membership (see `db.modelPresetFolders`). Missing means uncategorized. */
+    folderId?: string
     notes?: string
     sourceProfile?: ModelPresetSourceProfile
     migrationSource?: {
@@ -323,6 +325,10 @@ export interface ModelPreset {
     // clamped to the profile's contextWindowTokens when known. NOT the output
     // limit (that is the profile's max_tokens param).
     maxContext?: number
+    // Use an explicitly set maxContext as-is even when it exceeds the
+    // profile's contextWindowTokens (a wrong cap in a custom registry). No
+    // effect while maxContext is empty.
+    ignoreContextWindowCap?: boolean
     // Gemini explicit context caching (google-gemini adapter + AI Studio key
     // auth, main chat only). The cache boundary comes from the native
     // message.cachePoint infra (cache prompt card / automaticCachePoint), not

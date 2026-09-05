@@ -42,6 +42,7 @@ PocketRisu는 PC나 개인 서버에 띄워두고, PC·태블릿·스마트폰 �
 - [RisuAI 데이터 이전 가이드](../docs/ko/migration.md)
 - [원격 접속 가이드](../docs/ko/remote.md)
 - [Termux 설치 가이드 (Android)](../docs/ko/termux.md)
+- [플러그인 저장소 가이드](../docs/ko/plugin-storage.md)
 
 
 ## RisuAI 호환
@@ -77,6 +78,7 @@ PocketRisu는 [RisuAI](https://github.com/kwaroran/RisuAI)에서 파생되어, �
 
 - 버그 리포트 / 기능 제안: [GitHub Issues](https://github.com/PocketRisu/PocketRisu/issues)
 - 이메일: contact@pocketrisu.com
+- 후원: [Patreon](https://patreon.com/PocketRisu/membership) — 전적으로 자유이며, 후원자 이름 게시 외에 추가 기능이나 혜택은 없습니다
 
 
 ## 라이선스

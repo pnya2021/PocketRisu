@@ -1,7 +1,7 @@
 {
   "name": "pocketrisu",
   "private": true,
-  "version": "1.10.0",
+  "version": "1.11.2",
   "packageManager": "pnpm@10.34.1",
   "engines": {
     "node": ">=22.12.0"
@@ -79,7 +79,7 @@
     "sv": "^0.11.0",
     "sharp": "0.34.5",
     "svelte-awesome-color-picker": "^4.1.0",
-    "svelte-sonner": "^1.1.0",
+    "svelte-sonner": "^1.2.1",
     "tailwind-merge": "^3.5.0",
     "three": "^0.154.0",
     "tippy.js": "^6.3.7",

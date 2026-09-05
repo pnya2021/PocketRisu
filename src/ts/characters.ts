@@ -706,6 +706,15 @@ export function createBlankChar():character{
 }
 
 
+export function deselectCharacter() {
+    try {
+        localStorage.removeItem('risu-last-active-character')
+    } catch {
+        // Best effort only.
+    }
+    selectedCharID.set(-1)
+}
+
 export async function removeChar(identifier:string|number,name:string, type:'normal'|'permanent'|'permanentForce' = 'normal'){
     const db = getDatabase()
     if(type !== 'permanentForce'){
@@ -736,7 +745,7 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
     checkCharOrder()
     db.characters = chars
     requiresFullEncoderReload.state = true
-    selectedCharID.set(-1)
+    deselectCharacter()
 }
 
 export async function addCharacter(arg:{
@@ -746,7 +755,7 @@ export async function addCharacter(arg:{
     const reseter = arg.reseter ?? (() => {})
     const r = await alertAddCharacter()
     if(r === 'importFromRealm'){
-        selectedCharID.set(-1)
+        deselectCharacter()
         OpenRealmStore.set(true)
         MobileGUIStack.set(0)
         return
@@ -792,6 +801,15 @@ export function changeChar(index: number, arg:{
       });
     }
     selectedCharID.set(index);
+
+    // Remember only canonical, successfully selected characters.
+    // Android/Firefox may recreate the tab while PocketRisu is backgrounded.
+    try {
+        if (char?.chaId) {
+            localStorage.setItem('risu-last-active-character', char.chaId)
+        }
+    } catch { /* best effort only */ }
+
     const chat = getCurrentChat()
     if(chat){
         if(chat._placeholder){

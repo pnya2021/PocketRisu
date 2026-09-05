@@ -19,14 +19,22 @@ export function convertModuleToCharacter(m: RisuModule): character {
     char.lowLevelAccess = m.lowLevelAccess || false
     char.hideChatIcon = m.hideIcon || false
     char.backgroundHTML = m.backgroundEmbedding || ""
-    char.additionalAssets = m.assets || []
+    if (m.assetManifest) {
+        delete char.additionalAssets
+        char.additionalAssetManifest = m.assetManifest
+    } else {
+        char.additionalAssets = m.assets || []
+        delete char.additionalAssetManifest
+    }
+    char.moduleNamespace = m.namespace
     char.customModuleToggle = m.customModuleToggle || ""
     char.image = m.icon || ""
 
     for(let i = 0; i < char.globalLore.length; i++){
         const lore = safeStructuredClone(char.globalLore[i])
-        if(lore.content.startsWith('@@indicator phi')){
-            char.postHistoryInstructions = lore.content.replace('@@indicator phi', '').trim()
+        if(lore.content.startsWith('@@indicator replace_global_note') || lore.content.startsWith('@@indicator phi')){
+            // Backward compat: pre-rename modules stored global notes under the '@@indicator phi' marker
+            char.replaceGlobalNote = lore.content.replace(/^@@indicator\s+(?:replace_global_note|phi)/, '').trim()
             char.globalLore.splice(i, 1)
             i--
         }
@@ -61,7 +69,9 @@ export function convertCharacterToModule(c: character): RisuModule {
         lowLevelAccess: c.lowLevelAccess,
         hideIcon: c.hideChatIcon,
         backgroundEmbedding: c.backgroundHTML,
-        assets: c.additionalAssets,
+        assets: c.additionalAssetManifest ? undefined : c.additionalAssets,
+        assetManifest: c.additionalAssetManifest,
+        namespace: c.moduleNamespace,
         customModuleToggle: c.customModuleToggle,
         id: v4(),
         icon: c.image
@@ -102,13 +112,13 @@ export function convertCharacterToModule(c: character): RisuModule {
         })
     }
 
-    if(c.postHistoryInstructions){
+    if(c.replaceGlobalNote){
         mod.lorebook.push({
             key: "",
             secondkey: "",
             insertorder: 0,
-            comment: "From PHI",
-            content: `@@indicator phi\n\n${c.postHistoryInstructions}`,
+            comment: "From Global Note Replacement",
+            content: `@@indicator replace_global_note\n\n${c.replaceGlobalNote}`,
             mode: 'constant',
             alwaysActive: true,
             selective: false
@@ -118,6 +128,10 @@ export function convertCharacterToModule(c: character): RisuModule {
     return safeStructuredClone(mod)
 }
 
+// The persona converters below have no UI caller today. When one is added,
+// hydrate lazy asset manifests first (hydrateModuleAssets /
+// hydrateCharacterAssets) like the module↔character buttons do — copying a
+// descriptor makes the copy edit the source owner's manifest.
 export function convertPersonaToCharacter(p: RisuPersona): character {
     let char = createBlankChar()
 

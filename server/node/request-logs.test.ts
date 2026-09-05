@@ -213,6 +213,33 @@ describe('rotation by byte budget', () => {
             rotating.close()
         }
     })
+
+    it('rotates plugin rows by their smaller budget without deleting non-plugin rows', () => {
+        const rotating = createRequestLogs({
+            saveDir: path.join(tmpDir, 'rot-plugin'),
+            maxTotalBytes: 100_000,
+            maxPluginBytes: 7_000,
+            minRows: 2,
+            rotateEveryNRows: 1,
+        })
+        try {
+            rotating.addRequestLogBatch([
+                entry({ source: 'main', requestBody: 'M'.repeat(3000), model: 'main-1' }),
+                entry({ source: 'main', requestBody: 'M'.repeat(3000), model: 'main-2' }),
+            ])
+            for (let i = 0; i < 5; i++) {
+                rotating.addRequestLogBatch([entry({ source: 'plugin', requestBody: 'P'.repeat(3000), model: `plugin-${i}` })])
+            }
+
+            const mainRows = rotating.queryRequestLogs({ sources: ['main'], limit: 100 })
+            const pluginRows = rotating.queryRequestLogs({ sources: ['plugin'], limit: 100 })
+            expect(mainRows).toHaveLength(2)
+            expect(pluginRows.length).toBeLessThan(5)
+            expect(pluginRows[0].model).toBe('plugin-4')
+        } finally {
+            rotating.close()
+        }
+    })
 })
 
 describe('usage aggregation', () => {
@@ -301,6 +328,7 @@ describe('storage stats', () => {
         expect(stats.requestCount).toBe(1)
         expect(stats.requestBytes).toBeGreaterThan(1000)
         expect(stats.usageCount).toBe(1)
+        expect(stats.maxPluginBytes).toBeGreaterThan(0)
     })
 })
 

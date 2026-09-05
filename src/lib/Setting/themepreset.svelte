@@ -8,10 +8,9 @@
     import { updateColorScheme, updateTextThemeAndCSS } from "src/ts/gui/colorscheme";
     import { updateAnimationSpeed } from "src/ts/gui/animation";
     import { updateGuisize } from "src/ts/gui/guisize";
+    import ShSortableList from "../UI/GUI/ShSortableList.svelte";
 
     let editMode = $state(false)
-    let isDragging = $state(false)
-    let dragOverIndex = $state(-1)
 
     interface Props {
         close?: any;
@@ -19,37 +18,17 @@
 
     let { close = () => {} }: Props = $props();
 
-    function movePreset(fromIndex: number, toIndex: number) {
-        if (fromIndex === toIndex) return;
-        if (fromIndex < 0 || toIndex < 0 || fromIndex >= DBState.db.themePresets.length || toIndex > DBState.db.themePresets.length) return;
-
-        let themePresets = [...DBState.db.themePresets];
-        const movedItem = themePresets.splice(fromIndex, 1)[0];
-        if (!movedItem) return;
-
-        const adjustedToIndex = fromIndex < toIndex ? toIndex - 1 : toIndex;
-        themePresets.splice(adjustedToIndex, 0, movedItem);
-
-        const currentId = DBState.db.themePresetsId;
-        if (currentId === fromIndex) {
-            DBState.db.themePresetsId = adjustedToIndex;
-        } else if (fromIndex < currentId && adjustedToIndex >= currentId) {
-            DBState.db.themePresetsId = currentId - 1;
-        } else if (fromIndex > currentId && adjustedToIndex <= currentId) {
-            DBState.db.themePresetsId = currentId + 1;
-        }
-
-        DBState.db.themePresets = themePresets;
-    }
-
-    function handlePresetDrop(targetIndex: number, e) {
-        e.preventDefault();
-        e.stopPropagation();
-        const data = e.dataTransfer?.getData('text');
-        if (data === 'themePreset') {
-            const sourceIndex = parseInt(e.dataTransfer?.getData('presetIndex') || '0');
-            movePreset(sourceIndex, targetIndex);
-        }
+    // SortableJS (via ShSortableList) reorders the DOM and hands back the
+    // original indexes in their new order. It handles touch natively, unlike
+    // the previous HTML5 drag, which needed a polyfill that never fired on iOS.
+    function reorderPresets(orderedKeys: string[]) {
+        const presets = DBState.db.themePresets
+        const order = orderedKeys.map(Number).filter((i) => Number.isInteger(i) && i >= 0 && i < presets.length)
+        if (order.length !== presets.length || new Set(order).size !== presets.length) return
+        const selected = DBState.db.themePresetsId
+        DBState.db.themePresets = order.map((i) => presets[i])
+        const nextSelected = order.indexOf(selected)
+        if (nextSelected !== -1) DBState.db.themePresetsId = nextSelected
     }
 
     function applyThemeVisuals() {
@@ -71,27 +50,8 @@
                 </button>
             </div>
         </div>
-        {#each DBState.db.themePresets as preset, i}
-            <div class="w-full transition-all duration-200"
-                class:h-0.5={!isDragging || dragOverIndex !== i}
-                class:h-1={isDragging && dragOverIndex === i}
-                class:bg-blue-500={isDragging && dragOverIndex === i}
-                class:shadow-lg={isDragging && dragOverIndex === i}
-                class:hover:bg-gray-600={!isDragging}
-                role="listitem"
-                ondragover={(e) => {
-                    e.preventDefault()
-                    dragOverIndex = i
-                }}
-                ondragleave={(e) => {
-                    dragOverIndex = -1
-                }}
-                ondrop={(e) => {
-                    handlePresetDrop(i, e)
-                    dragOverIndex = -1
-                }}>
-            </div>
-
+        <ShSortableList className="flex flex-col" disabled={editMode} onReorder={reorderPresets}>
+        {#each DBState.db.themePresets as preset, i (i)}
             <button onclick={() => {
                 if(!editMode){
                     changeToThemePreset(i)
@@ -101,53 +61,13 @@
             }}
             class="flex items-center text-textcolor border-t-1 border-solid border-0 border-darkborderc p-2 cursor-pointer"
             class:bg-selected={i === DBState.db.themePresetsId}
-            class:draggable-preset={!editMode}
-            draggable={!editMode ? "true" : "false"}
-            ondragstart={(e) => {
-                if (editMode) {
-                    e.preventDefault()
-                    return
-                }
-                isDragging = true
-                e.dataTransfer?.setData('text', 'themePreset')
-                e.dataTransfer?.setData('presetIndex', i.toString())
-
-                const dragElement = document.createElement('div')
-                dragElement.textContent = preset?.name || 'Unnamed Theme'
-                dragElement.className = 'absolute -top-96 -left-96 px-4 py-2 bg-darkbg text-textcolor2 rounded-sm text-sm whitespace-nowrap shadow-lg pointer-events-none z-50'
-                document.body.appendChild(dragElement)
-                e.dataTransfer?.setDragImage(dragElement, 10, 10)
-
-                setTimeout(() => {
-                    document.body.removeChild(dragElement)
-                }, 0)
-            }}
-            ondragend={(e) => {
-                isDragging = false
-                dragOverIndex = -1
-            }}
-            ondragover={(e) => {
-                e.preventDefault()
-                const rect = e.currentTarget.getBoundingClientRect()
-                const mouseY = e.clientY
-                const elementCenter = rect.top + rect.height / 2
-
-                if (mouseY < elementCenter) {
-                    dragOverIndex = i
-                } else {
-                    dragOverIndex = i + 1
-                }
-            }}
-            ondrop={(e) => {
-                handlePresetDrop(dragOverIndex, e)
-                dragOverIndex = -1
-            }}>
+            data-sortable-key={i}>
                 {#if editMode}
                     <TextInput bind:value={DBState.db.themePresets[i].name} placeholder="string" padding={false}/>
                 {:else}
                     <span>{preset.name}</span>
                 {/if}
-                <div class="grow flex justify-end">
+                <div class="grow flex justify-end no-sort">
                     <div class="text-textcolor2 hover:text-primary cursor-pointer mr-2" role="button" tabindex="0" onclick={(e) => {
                         e.stopPropagation()
                         copyThemePreset(i)
@@ -194,26 +114,7 @@
                 </div>
             </button>
         {/each}
-
-        <div class="w-full transition-all duration-200"
-            class:h-0.5={!isDragging || dragOverIndex !== DBState.db.themePresets.length}
-            class:h-1={isDragging && dragOverIndex === DBState.db.themePresets.length}
-            class:bg-blue-500={isDragging && dragOverIndex === DBState.db.themePresets.length}
-            class:shadow-lg={isDragging && dragOverIndex === DBState.db.themePresets.length}
-            class:hover:bg-gray-600={!isDragging}
-            role="listitem"
-            ondragover={(e) => {
-                e.preventDefault()
-                dragOverIndex = DBState.db.themePresets.length
-            }}
-            ondragleave={(e) => {
-                dragOverIndex = -1
-            }}
-            ondrop={(e) => {
-                handlePresetDrop(DBState.db.themePresets.length, e)
-                dragOverIndex = -1
-            }}>
-        </div>
+        </ShSortableList>
 
         <div class="flex mt-2 items-center">
             <button class="text-textcolor2 hover:text-primary cursor-pointer mr-1" onclick={() => {
@@ -243,24 +144,5 @@
     .break-any{
         word-break: normal;
         overflow-wrap: anywhere;
-    }
-
-    /* Drag and drop styles */
-    .draggable-preset:hover {
-        cursor: grab;
-    }
-
-    .draggable-preset:active {
-        cursor: grabbing;
-    }
-
-    .h-0\.5 {
-        min-height: 2px;
-        height: 2px;
-    }
-
-    .h-1 {
-        min-height: 4px;
-        height: 4px;
     }
 </style>

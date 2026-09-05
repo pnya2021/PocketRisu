@@ -26,6 +26,16 @@
         executeSelfUpdate()
     }
 
+    /** A server restart mid-backup deletes the half-written file, so the
+     *  update buttons stay locked until SaveServerBackup settles. */
+    let backingUp = $state(false)
+    async function handleBackup() {
+        if (backingUp) return
+        backingUp = true
+        try { await SaveServerBackup() }
+        finally { backingUp = false }
+    }
+
     function handleDone() {
         const isDone = progress?.step === 'done'
         selfUpdateProgressStore.set(null)
@@ -145,13 +155,14 @@
         <ShButton variant="outline" onclick={dismissUpdatePopup}>
             {language.updatePopupLater}
         </ShButton>
-        <ShButton variant="outline" onclick={() => SaveServerBackup()}>
+        <ShButton variant="outline" disabled={backingUp} onclick={handleBackup}>
             <SaveIcon size={14} />
             {language.updatePopupBackup}
         </ShButton>
         {#if info.canSelfUpdate}
             <ShButton
                 variant={info.severity === 'optional' ? 'success' : 'destructive'}
+                disabled={backingUp}
                 onclick={handleSelfUpdate}
             >
                 <Download size={14} />

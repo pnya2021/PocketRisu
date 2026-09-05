@@ -5,6 +5,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import { MobileGUIStack, MobileSearch, selectedCharID, SettingsMenuIndex, MobileSideBar } from "src/ts/stores.svelte";
     import { SettingsRoute } from "src/ts/routing";
+    import { deselectCharacter } from "src/ts/characters";
 
 </script>
 <div class="w-full px-4 h-16 border-b border-b-darkborderc bg-darkbg flex justify-start items-center gap-2">
@@ -17,7 +18,7 @@
         <span class="font-bold text-lg w-2/3 truncate">{language.menu}</span>
     {:else if $selectedCharID !== -1}
         <button onclick={() => {
-            selectedCharID.set(-1)
+            deselectCharacter()
         }}>
             <ArrowLeft />
         </button>

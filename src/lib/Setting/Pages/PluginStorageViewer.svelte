@@ -3,7 +3,8 @@
     // "plugin-storage-viewer" plugin. Plugin data is stored in a single global
     // namespace (not per-plugin), so this is a flat key/value manager over the
     // three backends a plugin can write to:
-    //   - save:  db.pluginCustomStorage  (travels with the save file)
+    //   - save:  server kv via pluginStorageStore (travels with the save;
+    //            listed from the key index, values fetched only when opened)
     //   - local: localStorage `safe_plugin_*`  (device-local, strings only)
     //   - idb:   SafeLocalPluginStorage  (IndexedDB, device-local, JSON)
     // Origin plugin is best-effort: new V3 writes are tagged into a sidecar
@@ -22,8 +23,8 @@
         SaveIcon,
     } from '@lucide/svelte'
     import { alertConfirm, notifyError, notifySuccess } from 'src/ts/alert'
-    import { getDatabase } from 'src/ts/storage/database.svelte'
     import { SafeLocalStorage, SafeLocalPluginStorage } from 'src/ts/plugins/pluginSafeClass'
+    import * as pluginStorageStore from 'src/ts/plugins/pluginStorageStore'
     import { getOwners, removeOwner } from 'src/ts/plugins/pluginStorageMeta'
     import { language } from 'src/lang'
 
@@ -39,6 +40,8 @@
         size: number
         type: string
         owner?: string
+        // false for 'save' rows until opened: raw/str/type are placeholders.
+        loaded: boolean
     }
 
     const BACKENDS: { id: BackendId; label: () => string; desc: () => string }[] = [
@@ -137,9 +140,7 @@
     // ── backend access ───────────────────────────────────────────────────────
     async function backendSet(key: string, value: unknown): Promise<void> {
         if (backend === 'save') {
-            const db = getDatabase()
-            db.pluginCustomStorage ??= {}
-            db.pluginCustomStorage[key] = value
+            await pluginStorageStore.setItem(key, value)
             return
         }
         if (backend === 'local') {
@@ -154,9 +155,7 @@
         // dangling entry. (The idb instance here has no owner, so its own
         // removeItem won't touch meta — we clean it explicitly.)
         if (backend === 'save') {
-            const db = getDatabase()
-            db.pluginCustomStorage ??= {}
-            delete db.pluginCustomStorage[key]
+            await pluginStorageStore.removeItem(key)
         } else if (backend === 'local') {
             safeLocal.removeItem(key)
         } else {
@@ -178,11 +177,12 @@
             // the save backend re-snapshotted the entire DB on every key, which
             // froze the UI on large saves before anything could paint.
             let keys: string[]
-            let read: (key: string) => unknown | Promise<unknown>
+            // null for 'save': values stay on the server until a row is opened.
+            let read: ((key: string) => unknown | Promise<unknown>) | null
             if (backend === 'save') {
-                const store = $state.snapshot(getDatabase().pluginCustomStorage ?? {}) as Record<string, unknown>
-                keys = Object.keys(store)
-                read = (k) => store[k] ?? null
+                await pluginStorageStore.refreshIndex()
+                keys = pluginStorageStore.keys()
+                read = null
             } else if (backend === 'local') {
                 keys = safeLocal.keys()
                 read = (k) => safeLocal.getItem(k)
@@ -204,9 +204,13 @@
             const list: Entry[] = []
             for (let i = 0; i < keys.length; i++) {
                 const key = keys[i]
+                if (!read) {
+                    list.push({ key, raw: null, str: '', size: pluginStorageStore.size(key) ?? 0, type: '', owner: owners[key], loaded: false })
+                    continue
+                }
                 const raw = await read(key)
                 const str = valueToString(raw)
-                list.push({ key, raw, str, size: str.length * 2, type: detectType(str), owner: owners[key] })
+                list.push({ key, raw, str, size: str.length * 2, type: detectType(str), owner: owners[key], loaded: true })
                 loadProgress = i + 1
                 // Periodically yield to keep the UI responsive and let the
                 // progress bar update.
@@ -227,7 +231,24 @@
         }
     }
 
-    function openDetail(entry: Entry) {
+    // 'save' rows: fetch the value on first open only.
+    async function ensureLoaded(entry: Entry) {
+        if (entry.loaded) return
+        const raw = await pluginStorageStore.getItem(entry.key)
+        const str = valueToString(raw)
+        entry.raw = raw
+        entry.str = str
+        entry.type = detectType(str)
+        entry.loaded = true
+    }
+
+    async function openDetail(entry: Entry) {
+        try {
+            await ensureLoaded(entry)
+        } catch (e) {
+            notifyError(e instanceof Error ? e.message : String(e))
+            return
+        }
         selected = entry
         editing = false
         editText = prettyPrint(entry.str)
@@ -270,7 +291,9 @@
             await backendSet(selected.key, saveValue)
             const savedKey = selected.key
             await load()
-            selected = entries.find((e) => e.key === savedKey) ?? null
+            const saved = entries.find((e) => e.key === savedKey) ?? null
+            if (saved) await ensureLoaded(saved)
+            selected = saved
             editing = false
             if (!selected) detailOpen = false
             notifySuccess(language.pluginStorageSaved(savedKey))
@@ -311,16 +334,7 @@
         if (!ok) return
 
         try {
-            if (backend === 'save') {
-                // Drop all values in one pass to avoid re-resolving the reactive
-                // DB per key, then clean up the origin records.
-                const db = getDatabase()
-                db.pluginCustomStorage ??= {}
-                for (const e of targets) delete db.pluginCustomStorage[e.key]
-                for (const e of targets) await removeOwner('save', e.key)
-            } else {
-                for (const e of targets) await backendRemove(e.key)
-            }
+            for (const e of targets) await backendRemove(e.key)
             detailOpen = false
             await load()
             notifySuccess(language.pluginStorageBulkDeleted(targets.length))
@@ -447,7 +461,7 @@
                 {#if entry.owner}
                     <ShBadge variant="secondary" className="max-w-[35%] overflow-hidden">{entry.owner}</ShBadge>
                 {/if}
-                <span class="text-textcolor2 text-[10px] uppercase tracking-wide shrink-0 opacity-70">{entry.type}</span>
+                <span class="text-textcolor2 text-[10px] uppercase tracking-wide shrink-0 opacity-70">{entry.loaded ? entry.type : language.pluginStorageNotLoaded}</span>
                 <span class="text-textcolor2 text-xs shrink-0 tabular-nums">{formatSize(entry.size)}</span>
                 <button
                     class="shrink-0 text-textcolor2 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer p-1"

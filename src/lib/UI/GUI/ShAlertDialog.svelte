@@ -10,6 +10,7 @@
     import { AlertDialog } from 'bits-ui';
     import { cn } from 'src/lib/utils';
     import type { ShDialogTier } from './ShDialog.svelte';
+    import { handleDialogCloseAutoFocus } from './dialogFocusPolicy';
 
     interface Props {
         open?: boolean;
@@ -77,6 +78,7 @@
             class={cn(contentBase, tierClasses[tier], sizeClasses[size], contentClass)}
             escapeKeydownBehavior={closeOnEscape ? 'close' : 'ignore'}
             interactOutsideBehavior={closeOnOutsideClick ? 'close' : 'ignore'}
+            onCloseAutoFocus={handleDialogCloseAutoFocus}
         >
             {#if title || description}
                 <div class="flex flex-col gap-1">

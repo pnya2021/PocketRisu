@@ -172,7 +172,8 @@ export class PluginPermissionService {
         options: { now?: () => number; periodicReconfirmMs?: number; isPrincipalRetiring?: (principalId: string) => boolean } = {},
     ) {
         this.now = options.now ?? Date.now
-        this.periodicReconfirmMs = options.periodicReconfirmMs ?? 3 * 24 * 60 * 60 * 1000
+        // PocketRisu 1.11 keeps unchanged permission decisions until reset.
+        this.periodicReconfirmMs = options.periodicReconfirmMs ?? Infinity
         this.isPrincipalRetiring = options.isPrincipalRetiring ?? ((principalId) => pluginDataLifecycle.isRetiring(principalId))
     }
 

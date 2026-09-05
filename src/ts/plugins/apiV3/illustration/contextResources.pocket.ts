@@ -20,6 +20,7 @@ import type {
     ContextResourceAdapter,
 } from './contextResources'
 import type { ModuleActivationReason } from './moduleActivation'
+import type { AssetManifestDescriptor, AssetManifestTuple } from '../../../storage/nodeStorage'
 
 type UnknownRecord = Record<string, any>
 
@@ -52,7 +53,64 @@ export interface PocketContextAdapterDependencies {
     getActiveModulesWithReasons(): Array<{ module: UnknownRecord; activatedBy: ModuleActivationReason[] }>
     readImage(storageKey: string): Promise<Uint8Array | ArrayBuffer | ArrayBufferView | null | undefined>
     getAssetStorageRevision?(storageKey: string): string
+    loadAssetManifestItems?(manifest: AssetManifestDescriptor): Promise<AssetManifestTuple[]>
     createThumbnail?: ContextResourceAdapter['createThumbnail']
+}
+
+// Keep lazy DB records lazy. Only detached projections receive the tuples;
+// synchronous publication fences may use them only for the same descriptor.
+export function createPocketAssetManifestProjection(
+    load?: PocketContextAdapterDependencies['loadAssetManifestItems'],
+) {
+    const cache = new WeakMap<object, { revision: string; items: AssetManifestTuple[] }>()
+    const changed = () => new PluginApiError('CONFLICT', 'Asset manifest changed or is unavailable', { retryable: true })
+    const fields = (kind: 'character' | 'module') => kind === 'character'
+        ? ['additionalAssets', 'additionalAssetManifest'] as const
+        : ['assets', 'assetManifest'] as const
+    const manifestOf = (raw: UnknownRecord, kind: 'character' | 'module') => {
+        const [listKey, manifestKey] = fields(kind)
+        const list = Object.getOwnPropertyDescriptor(raw, listKey)
+        const descriptor = Object.getOwnPropertyDescriptor(raw, manifestKey)
+        if (descriptor && !('value' in descriptor)) throw changed()
+        if (!descriptor?.value || (list && 'value' in list && Array.isArray(list.value))) return undefined
+        if (list && !('value' in list)) throw changed()
+        const manifest = descriptor.value as AssetManifestDescriptor
+        if (typeof manifest.id !== 'string' || !Number.isSafeInteger(manifest.count) || manifest.count < 0) throw changed()
+        return manifest
+    }
+    const revisionOf = (manifest: AssetManifestDescriptor) => JSON.stringify(manifest)
+    return {
+        isLazy(raw: UnknownRecord, kind: 'character' | 'module') { return manifestOf(raw, kind) !== undefined },
+        async prepare(raw: UnknownRecord, kind: 'character' | 'module') {
+            const manifest = manifestOf(raw, kind)
+            if (!manifest) return
+            const revision = revisionOf(manifest)
+            if (cache.get(raw)?.revision === revision) return
+            if (!load) throw changed()
+            // The official loader may refresh its argument on a superseded
+            // manifest. Never let that mutate the live database descriptor.
+            const detached = { ...manifest }
+            let items: AssetManifestTuple[]
+            try { items = await load(detached) } catch { throw changed() }
+            const current = manifestOf(raw, kind)
+            if (!current || revisionOf(current) !== revision || revisionOf(detached) !== revision
+                || !Array.isArray(items) || items.length !== manifest.count
+                || items.some((tuple) => !Array.isArray(tuple) || tuple.length < 2 || tuple.length > 3
+                    || tuple.some((part) => typeof part !== 'string'))) throw changed()
+            cache.set(raw, { revision, items: items.map((tuple) => [...tuple] as AssetManifestTuple) })
+        },
+        project(raw: UnknownRecord, kind: 'character' | 'module'): UnknownRecord {
+            const manifest = manifestOf(raw, kind)
+            if (!manifest) return raw
+            const retained = cache.get(raw)
+            if (!retained || retained.revision !== revisionOf(manifest)) throw changed()
+            // Copy property descriptors, not values: Studio cards deliberately
+            // must not touch chat getters or other unrelated native fields.
+            const descriptors = Object.getOwnPropertyDescriptors(raw)
+            descriptors[fields(kind)[0]] = { value: retained.items, writable: false, enumerable: true, configurable: true }
+            return Object.create(Object.getPrototypeOf(raw), descriptors)
+        },
+    }
 }
 
 const extensionOf = (pathOrName?: string) => {
@@ -356,6 +414,7 @@ const assertNotAborted = (signal?: AbortSignal) => {
 export function createPocketContextResourceAdapter(
     dependencies: PocketContextAdapterDependencies,
 ): ContextResourceAdapter {
+    const manifests = createPocketAssetManifestProjection(dependencies.loadAssetManifestItems)
     const moduleLocators = new WeakMap<ContextModuleSource, ModuleSourceLocator>()
     const moduleAssetMetadataSources = new WeakSet<ContextModuleSource>()
     const assetLocators = new WeakMap<ContextAssetSource, AssetSourceLocator>()
@@ -512,6 +571,7 @@ export function createPocketContextResourceAdapter(
         signal?: AbortSignal,
     ) => {
         if (!raw || raw.id !== locator.ownerId) throw changed()
+        if (includeAssetMetadata) raw = manifests.project(raw, 'module')
         const namespace = nonEmptyString(raw.namespace) ? raw.namespace : undefined
         const description = typeof raw.description === 'string' ? raw.description : ''
         const currentAssets = includeAssetMetadata && Array.isArray(raw.assets)
@@ -546,7 +606,8 @@ export function createPocketContextResourceAdapter(
                     ? database.characters![rawSlotIndex]
                     : currentCharacter?.chaId === characterId ? currentCharacter : undefined
                 if (!raw) throw changed()
-                for (const source of mapCharacterAssets(raw, characterId, rawSlotIndex)) {
+                const projected = probe.input.include.includes('additional') ? manifests.project(raw, 'character') : raw
+                for (const source of mapCharacterAssets(projected, characterId, rawSlotIndex)) {
                     if (probe.input.include.includes(source.role)) {
                         entries.push(assetShapeKey(source, { kind: 'character', characterId }))
                     }
@@ -557,7 +618,9 @@ export function createPocketContextResourceAdapter(
             const records = currentModuleRecords(probe.input.moduleScope)
                 .filter(({ module }) => !probe.input.moduleIdsSpecified
                     || probe.input.moduleIds.includes(module?.id))
-            for (const { module, rawSlotIndex } of records) {
+            for (const record of records) {
+                const { rawSlotIndex } = record
+                const module = manifests.project(record.module, 'module')
                 if (!nonEmptyString(module?.id) || !Array.isArray(module.assets)) continue
                 for (let index = 0; index < module.assets.length; index++) {
                     const source = mapModuleAssetAt(module, rawSlotIndex, index)
@@ -590,7 +653,7 @@ export function createPocketContextResourceAdapter(
         const modules = records.flatMap(({ module, activatedBy, rawSlotIndex }) => {
             assertNotAborted(input.signal)
             const source = mapModule(
-                module,
+                includeAssetMetadata ? manifests.project(module, 'module') : module,
                 activatedBy,
                 rawSlotIndex,
                 projectionContext,
@@ -696,7 +759,7 @@ export function createPocketContextResourceAdapter(
                 ? state.database.modules?.[locator.ownerRawSlotIndex]
                 : state.activeModuleRecords?.[locator.ownerRawSlotIndex]?.module
             if (!raw || raw.id !== locator.ownerId) throw changed()
-            current = mapModuleAssetAt(raw, locator.ownerRawSlotIndex, locator.rawSlotIndex, projectionContext)
+            current = mapModuleAssetAt(manifests.project(raw, 'module'), locator.ownerRawSlotIndex, locator.rawSlotIndex, projectionContext)
         } else {
             if (probe.input.characterIds.length > 0
                 && !probe.input.characterIds.includes(locator.ownerId)) throw changed()
@@ -704,7 +767,8 @@ export function createPocketContextResourceAdapter(
                 ? state.database.characters?.[locator.ownerRawSlotIndex]
                 : state.currentCharacter
             if (!raw || raw.chaId !== locator.ownerId) throw changed()
-            current = mapCharacterAssetAt(raw, locator, projectionContext)
+            current = mapCharacterAssetAt(locator.rawCollection === 'additionalAssets'
+                ? manifests.project(raw, 'character') : raw, locator, projectionContext)
         }
         if (!current || !sameSource(current, probe.located.source)) throw changed()
         return current
@@ -802,7 +866,16 @@ export function createPocketContextResourceAdapter(
             const selectors = await selectorsFor(
                 input.characterId, input.conversationId, input.scope === 'installed', input.signal,
             )
+            await Promise.all(currentModuleRecords(input.scope).map(({ module }) => manifests.prepare(module, 'module')))
+            assertNotAborted(input.signal)
+            if (!sameSelectors(selectors, selectorsForSynchronously(
+                input.characterId, input.conversationId, input.scope === 'installed',
+            ))) throw changed()
             return captureModuleSourcesFrom(input, true, selectors)
+        },
+        async prepareModuleAssets(input: ContextModuleCollectionInput) {
+            await Promise.all(currentModuleRecords(input.scope).map(({ module }) => manifests.prepare(module, 'module')))
+            assertNotAborted(input.signal)
         },
         captureModuleSourcesSynchronously(
             input: ContextModuleCollectionInput,
@@ -878,13 +951,22 @@ export function createPocketContextResourceAdapter(
             }
             const database = dependencies.getDatabase()
             const includeCharacterAssets = input.include.some((role) => role !== 'module')
+            if (input.include.includes('additional')) {
+                await Promise.all(characterIds.map(async (characterId) => {
+                    const raw = database.characters?.find((character) => character?.chaId === characterId)
+                        ?? (currentCharacter?.chaId === characterId ? currentCharacter : undefined)
+                    if (raw) await manifests.prepare(raw, 'character')
+                }))
+                assertNotAborted(input.signal)
+            }
             const characters = (includeCharacterAssets ? characterIds : []).flatMap((characterId) => {
                 let rawSlotIndex = (database.characters ?? []).findIndex((character) => character?.chaId === characterId)
                 const raw = rawSlotIndex >= 0
                     ? database.characters![rawSlotIndex]
                     : currentCharacter?.chaId === characterId ? currentCharacter : undefined
                 if (!raw) throw new PluginApiError('NOT_FOUND', 'Character was not found')
-                const projected = mapCharacter(raw, rawSlotIndex, projectionContext)
+                const projected = mapCharacter(input.include.includes('additional')
+                    ? manifests.project(raw, 'character') : raw, rawSlotIndex, projectionContext)
                 if (!projected) throw new PluginApiError('NOT_FOUND', 'Character was not found')
                 return projected.assets.map((source) => ({
                     source,
@@ -910,9 +992,13 @@ export function createPocketContextResourceAdapter(
                             ? [{ module, activatedBy, rawSlotIndex }] : [],
                 )
             }
-            const modules = moduleRecords.flatMap(({ module, activatedBy, rawSlotIndex }) => {
+            if (input.include.includes('module')) {
+                await Promise.all(moduleRecords.map(({ module }) => manifests.prepare(module, 'module')))
                 assertNotAborted(input.signal)
-                const projected = mapModule(module, activatedBy, rawSlotIndex, projectionContext)
+            }
+            const modules = (input.include.includes('module') ? moduleRecords : []).flatMap(({ module, activatedBy, rawSlotIndex }) => {
+                assertNotAborted(input.signal)
+                const projected = mapModule(manifests.project(module, 'module'), activatedBy, rawSlotIndex, projectionContext)
                 if (!projected) return []
                 return projected.assets.map((source) => ({
                     source,
@@ -922,6 +1008,9 @@ export function createPocketContextResourceAdapter(
             const assets = [...characters, ...modules]
                 .filter(({ source }) => input.include.includes(source.role))
             assertNotAborted(input.signal)
+            if (!sameSelectors(selectors, selectorsForSynchronously(
+                characterIds[0], input.conversationId || undefined, false,
+            ))) throw changed()
             return { selectors, assets }
         },
         async revalidateAssetSource(probe: ContextAssetSourceProbe) {

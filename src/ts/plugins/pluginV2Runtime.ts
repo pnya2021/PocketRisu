@@ -5,6 +5,7 @@ export interface PluginV2RuntimeState {
     editoutput: Set<unknown>
     editprocess: Set<unknown>
     editinput: Set<unknown>
+    chatOutput?: Set<unknown>
     replacerbeforeRequest: Set<unknown>
     replacerafterRequest: Set<unknown>
     unload: Set<() => void | Promise<void>>
@@ -281,6 +282,7 @@ export async function resetPluginV2Runtime(
         runtime.editoutput.clear()
         runtime.editprocess.clear()
         runtime.editinput.clear()
+        runtime.chatOutput?.clear()
         runtime.replacerbeforeRequest.clear()
         runtime.replacerafterRequest.clear()
         clearProviderNames()

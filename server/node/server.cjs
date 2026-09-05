@@ -6,7 +6,7 @@ const path = require('path');
 const net = require('net');
 const compression = require('compression');
 const htmlparser = require('node-html-parser');
-const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync } = require('fs');
+const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } = require('fs');
 const fs = require('fs/promises')
 const nodeCrypto = require('crypto')
 const zlib = require('zlib')
@@ -24,7 +24,7 @@ const getVips = () => {
     return _vipsPromise
 }
 const { kvGet, kvSet, kvDel, kvList,
-        kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
+        kvDelPrefix, kvListWithSizes, kvListWithSizesAndUpdatedAt, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
@@ -38,6 +38,19 @@ const { createPluginModelStore } = require('./pluginModelStore.cjs');
 const { createPluginModelDownloadService, registerPluginModelRoutes } = require('./pluginModelDownload.cjs');
 const { createPluginModelSessionBroker } = require('./pluginModelSessions.cjs');
 const { registerPluginModelInferenceRoutes } = require('./pluginModelInferenceRoutes.cjs');
+const { createPatchHashCache, decodePointerSegment } = require('./patch-hash-cache.cjs');
+const { clonePatchSnapshot } = require('./patch-selective-clone.cjs');
+const pluginStorage = require('./plugin-storage-store.cjs');
+const { createAssetManifestStore } = require('./assetManifestStore.cjs');
+const {
+    stripAssetManifests,
+    hydrateAssetManifests,
+    findAssetManifestLossOwners,
+    assetManifestSummary,
+    moduleOwnerId,
+    characterOwnerId,
+    personaOwnerId,
+} = require('./assetManifestMigration.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -62,10 +75,17 @@ const enablePatchSync = true;
 // In-memory database cache for patch-based sync
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
 // fullChatStore keeps the actual chat data keyed by chaId→chatId.
+// Invariant: server code never mutates a cached database's nested branches
+// in place. /api/patch derives the next root via clonePatchSnapshot (untouched
+// top-level branches are shared with the previous root) and keeps per-branch
+// hashes in databasePatchHashCache keyed on the root object — an in-place edit
+// would silently alias into the previous snapshot and leave a stale hash.
+// Replace the branch (or the whole root) instead.
 let dbCache = {};
 let saveTimers = {};
 const SAVE_INTERVAL = 5000;
 let fullChatStore = null; // Map<chaId, Map<chatId, chatObject>> — lazy-initialized
+const databasePatchHashCache = createPatchHashCache(calculateHash);
 
 // ETag for database.bin
 let dbEtag = null;
@@ -86,6 +106,11 @@ function queueStorageOperation(operation) {
 }
 
 const DB_HEX_KEY = Buffer.from('database/database.bin', 'utf-8').toString('hex');
+const assetManifestStore = createAssetManifestStore(sqliteDb, {
+    maxCacheBytes: process.env.POCKETRISU_ASSET_MANIFEST_CACHE_BYTES
+        ? Number(process.env.POCKETRISU_ASSET_MANIFEST_CACHE_BYTES)
+        : undefined,
+});
 
 // ─── Persist failure tracking (Stage 1 visibility) ───────────────────────────
 // Debounced persist runs in setTimeout, so failures cannot be returned in the
@@ -171,10 +196,12 @@ function trimSnapshotsToLimits() {
     // Size each snapshot by its marginal disk cost (chunks not shared with the
     // live blob), not its logical size — chunked snapshots share chunks, so a
     // logical measure would over-trim ones that cost almost nothing on disk.
-    const entries = kvList(DB_BACKUP_PREFIX)
+    const entries = listSnapshotKeys()
         .map((key) => {
             const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
-            return { key, size: snapshotFootprint(key), ts: Number.isFinite(tsRaw) ? tsRaw : 0 };
+            // Plugin bytes are marginal too: blobs only this snapshot references
+            // (see plugin-storage-store.cjs snapshotBytes).
+            return { key, size: snapshotFootprint(key) + snapshotPluginBytes(key), ts: Number.isFinite(tsRaw) ? tsRaw : 0 };
         })
         .sort((a, b) => b.ts - a.ts);
 
@@ -191,8 +218,39 @@ function trimSnapshotsToLimits() {
             toDelete.push(e.key);
         }
     }
-    for (const key of toDelete) kvDel(key);
+    for (const key of toDelete) deleteSnapshot(key);
     return { kept: entries.length - toDelete.length, removed: toDelete.length };
+}
+
+// ── Snapshot ↔ plugin storage ───────────────────────────────────────────────
+// The blob under database/dbbackup-* holds an empty pluginCustomStorage once
+// the split has run, so every snapshot also carries a content-addressed map
+// of the plugin-storage/ rows (see plugin-storage-store.cjs snapshotTo).
+// These helpers keep the two halves created, sized, deleted and restored
+// together. snapshotPluginBytes is the marginal cost (blobs only that
+// snapshot references + its map row); dropping a snapshot GCs its unique
+// blobs in the same transaction.
+// Only the exact `database/dbbackup-<digits>.bin` shape names a snapshot. A
+// looser check (prefix + strip 4 chars) let `dbbackup-1234xxxx` map to plugin
+// id `1234` and GC another snapshot's blobs while its DB blob stayed behind.
+function isSnapshotKey(key) {
+    return typeof key === 'string' && DB_BACKUP_KEY_RE.test(key);
+}
+
+function snapshotPluginId(key) {
+    const m = typeof key === 'string' ? DB_BACKUP_KEY_RE.exec(key) : null;
+    if (!m) throw new Error(`Not a snapshot key: ${key}`);
+    return m[1];
+}
+
+function snapshotPluginBytes(key) {
+    return pluginStorage.snapshotBytes(snapshotPluginId(key));
+}
+
+function deleteSnapshot(key) {
+    const id = snapshotPluginId(key);
+    kvDel(key);
+    pluginStorage.dropSnapshot(id);
 }
 
 // Current snapshot count + two totals:
@@ -202,25 +260,47 @@ function trimSnapshotsToLimits() {
 //   logicalBytes — sum of each snapshot's full logical size (kvSize), i.e. what
 //                  the snapshots would cost WITHOUT dedup. Drives the "saved by
 //                  deduplication" figure; never used for trimming.
+function listSnapshotKeys() {
+    return kvList(DB_BACKUP_PREFIX).filter(isSnapshotKey);
+}
+
 function snapshotUsage() {
-    const keys = kvList(DB_BACKUP_PREFIX);
+    const keys = listSnapshotKeys();
     let bytes = 0, logicalBytes = 0;
     for (const k of keys) {
-        bytes += snapshotFootprint(k);
-        logicalBytes += (kvSize(k) || 0);
+        const id = snapshotPluginId(k);
+        bytes += snapshotFootprint(k) + pluginStorage.snapshotBytes(id);
+        logicalBytes += (kvSize(k) || 0) + pluginStorage.snapshotLogicalBytes(id);
     }
     return { count: keys.length, bytes, logicalBytes };
 }
 
-function createBackupAndRotate() {
+// `force` skips the cooldown — used before one-way migrations, where a
+// snapshot of the pre-migration blob is the only rollback path.
+function createBackupAndRotate({ force = false } = {}) {
     const now = Date.now();
-    if (lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
+    if (!force && lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
         return;
     }
-    lastBackupTime = now;
+    // Nothing to snapshot before the first database exists (fresh install
+    // importing a backup). kvCopyValue would silently skip the blob while
+    // snapshotTo still wrote a plugin-storage map row, leaving an orphan map
+    // with no snapshot behind it. The cooldown still advances, as it always
+    // has for this attempt.
+    if (kvSize('database/database.bin') === null) {
+        lastBackupTime = now;
+        return;
+    }
 
     const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
-    kvCopyValue('database/database.bin', backupKey);
+    // Blob + plugin rows land atomically so a snapshot never exists half-made.
+    sqliteDb.transaction(() => {
+        kvCopyValue('database/database.bin', backupKey);
+        pluginStorage.snapshotTo(snapshotPluginId(backupKey));
+    })();
+    // Advance the cooldown only once the snapshot is committed: a throw above
+    // must not suppress the next attempt for the whole interval.
+    lastBackupTime = now;
     trimSnapshotsToLimits();
 }
 
@@ -235,12 +315,63 @@ async function flushPendingDb() {
             const raw = kvGet('database/database.bin');
             if (raw) {
                 const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
+                const fullDb = hydrateDatabaseForDisk(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
                 kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(fullDb)));
             }
         }
         createBackupAndRotate();
     }
+}
+
+// ── /api/patch × plugin storage ─────────────────────────────────────────────
+// During the mixed old/new client window, an older client still patches
+// `/pluginCustomStorage/<key>` in database.bin. Applying those to dbCache
+// would land them in the blob, where the next cold decode discards them
+// (kv-wins re-migration). So direct-child add/replace/remove ops are routed
+// to the kv store and stripped from the DB patch; anything else touching the
+// subtree (deeper paths, the field itself, move/copy/test) is rejected so
+// the client falls back to a full write, which splits DB-wins.
+const PLUGIN_STORAGE_POINTER = '/pluginCustomStorage';
+const PLUGIN_STORAGE_KV_OPS = new Set(['add', 'replace', 'remove']);
+
+function partitionPluginStorageOps(patch) {
+    const kvOps = [];
+    const rejected = [];
+    const rest = [];
+    for (const op of Array.isArray(patch) ? patch : []) {
+        const path = typeof op?.path === 'string' ? op.path : '';
+        const from = typeof op?.from === 'string' ? op.from : '';
+        const inSubtree = (p) => p === PLUGIN_STORAGE_POINTER || p.startsWith(`${PLUGIN_STORAGE_POINTER}/`);
+        if (!inSubtree(path) && !inSubtree(from)) {
+            rest.push(op);
+            continue;
+        }
+        const tail = path.slice(PLUGIN_STORAGE_POINTER.length + 1);
+        const directChild = path.startsWith(`${PLUGIN_STORAGE_POINTER}/`) && !tail.includes('/');
+        if (directChild && PLUGIN_STORAGE_KV_OPS.has(op.op) && !from) {
+            kvOps.push({ op: op.op, key: decodePointerSegment(tail), value: op.value });
+        } else {
+            rejected.push(op);
+        }
+    }
+    return { kvOps, rejected, rest };
+}
+
+// Cold-load database.bin into dbCache (stripped) + fullChatStore. Every
+// caller must run this inside queueStorageOperation: /api/read used to decode
+// outside the queue, so a concurrent /api/patch could cold-load, apply and
+// cache first, then be overwritten by the read's older snapshot — losing an
+// acknowledged patch on the next persist. Re-checks the cache inside the
+// queue so a load that already happened while waiting is not repeated.
+// Returns false when there is no blob on disk.
+async function loadDbCacheIfMissing({ createBackup = false } = {}) {
+    if (dbCache[DB_HEX_KEY]) return true;
+    const raw = kvGet('database/database.bin');
+    if (!raw) return false;
+    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup });
+    initChatStore(dbObj);
+    dbCache[DB_HEX_KEY] = normalizeJSON(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
+    return true;
 }
 
 function invalidateDbCache() {
@@ -333,8 +464,44 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         }
     }
 
+    // One-time move of pluginCustomStorage into kv (plugin-storage/*). Runs on
+    // every cold decode (boot, /api/read, /api/patch, import, snapshot restore)
+    // so a blob written by an older build or upstream is split on first load.
+    // Throws leave dbObj and the blob untouched; the next load retries.
+    // Not on the migrationResult failure path: a failed migration keeps the
+    // data in the blob, which is still a fully working state.
+    // kvWinsOnRemigration: if the marker already exists, the blob still
+    // holding data means the emptied blob never persisted; kv has since been
+    // the live copy, so it must not be clobbered (see store comment).
+    let pluginSplit = false;
+    try {
+        const pluginMigration = pluginStorage.migrateFromDb(dbObj, {
+            createSnapshot: () => createBackupAndRotate({ force: true }),
+            kvWinsOnRemigration: true,
+        });
+        if (pluginMigration.migrated) {
+            dbObj.pluginCustomStorage = {};
+            needsPersist = true;
+            pluginSplit = true;
+            logger.info(`[PluginStorage] Migrated ${pluginMigration.keys} key(s), ${(pluginMigration.bytes / 1024 / 1024).toFixed(1)}MB from database.bin to kv`);
+        }
+    } catch (e) {
+        logger.error('[PluginStorage] Migration failed; plugin data stays in database.bin', e);
+    }
+
     if (needsPersist) {
-        kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(dbObj)));
+        try {
+            kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(dbObj)));
+        } catch (e) {
+            // The split already committed to kv, so the decoded (emptied) DB is
+            // the correct live state even if the blob could not be rewritten
+            // (e.g. size limit). Serve it rather than failing the request;
+            // the next cold decode re-splits the stale blob kv-wins.
+            if (!pluginSplit) throw e;
+            logger.error('[PluginStorage] Blob persist after split failed; serving from kv', e);
+            recordPersistFailure(e, 'decode:plugin-split');
+            return dbObj;
+        }
         if (createBackup) {
             createBackupAndRotate();
         }
@@ -419,6 +586,24 @@ function stripChatsFromDb(dbObj) {
         return { ...char, chats: char.chats.map(chatToStub) };
     });
     return stripped;
+}
+
+/**
+ * Browser runtime view: chat bodies and large asset-reference arrays are kept
+ * server-side. The on-disk database remains legacy-compatible until the
+ * explicit slim-database cutover is implemented and verified.
+ */
+function stripDatabaseForClient(dbObj, { reconcileManifests = false } = {}) {
+    const chatStripped = stripChatsFromDb(dbObj);
+    return stripAssetManifests(chatStripped, assetManifestStore, {
+        activate: reconcileManifests ? 'reconcile' : true,
+    }).db;
+}
+
+/** Rebuild the exact legacy shape before any database.bin disk write. */
+function hydrateDatabaseForDisk(clientDb) {
+    const chatsHydrated = reassembleFullDb(clientDb);
+    return hydrateAssetManifests(chatsHydrated, assetManifestStore);
 }
 
 /**
@@ -697,7 +882,7 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
     const strippedDb = dbCache[filePath];
     if (!strippedDb) return;
     await ensureChatStore();
-    const fullDb = reassembleFullDb(strippedDb);
+    const fullDb = hydrateDatabaseForDisk(strippedDb);
 
     // Disk protection guard: abort persist when reassemble produced metadata-only
     // chats. Writing them would lock the loss in (next /api/read returns the
@@ -737,6 +922,80 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
     if (decodedKey === 'database/database.bin') {
         initChatStore(fullDb);
     }
+}
+
+function scheduleDatabasePersist(source = 'database') {
+    if (saveTimers[DB_HEX_KEY]) clearTimeout(saveTimers[DB_HEX_KEY]);
+    const timer = setTimeout(() => {
+        queueStorageOperation(async () => {
+            if (saveTimers[DB_HEX_KEY] !== timer) return;
+            try {
+                await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
+                clearPersistFailure();
+                try { createBackupAndRotate(); }
+                catch (backupError) { logger.warn(`[${source}] Backup rotation failed:`, backupError); }
+            } catch (error) {
+                logger.error(`[${source}] Error saving database.bin:`, error);
+                recordPersistFailure(error, source);
+            } finally {
+                if (saveTimers[DB_HEX_KEY] === timer) delete saveTimers[DB_HEX_KEY];
+            }
+        }).catch((error) => logger.error(`[${source}] Storage queue failed:`, error));
+    }, SAVE_INTERVAL);
+    saveTimers[DB_HEX_KEY] = timer;
+}
+
+// Manifest edits need the canonical client-view cache. Reuses the shared cold
+// loader so the decode/strip path stays identical to /api/read and /api/patch;
+// callers must already hold the storage queue.
+async function ensureDatabaseCache() {
+    if (!(await loadDbCacheIfMissing())) throw new Error('Database not found');
+    return dbCache[DB_HEX_KEY];
+}
+
+function locateAssetManifestOwner(database, kind, ownerId) {
+    if (kind === 'module') {
+        const index = (database.modules || []).findIndex((owner, i) => moduleOwnerId(owner, i) === ownerId);
+        return { collectionKey: 'modules', index, descriptorKey: 'assetManifest', nested: false };
+    }
+    if (kind === 'character') {
+        const index = (database.characters || []).findIndex((owner, i) => characterOwnerId(owner, i) === ownerId);
+        return { collectionKey: 'characters', index, descriptorKey: 'additionalAssetManifest', nested: false };
+    }
+    if (kind === 'persona-module') {
+        const index = (database.personas || []).findIndex((owner, i) => personaOwnerId(owner, i) === ownerId);
+        return { collectionKey: 'personas', index, descriptorKey: 'assetManifest', nested: true };
+    }
+    return null;
+}
+
+function replaceCachedAssetManifestDescriptor(database, kind, ownerId, descriptor) {
+    const location = locateAssetManifestOwner(database, kind, ownerId);
+    if (!location || location.index < 0) {
+        const error = new Error(`Asset manifest owner not found in database cache: ${kind}/${ownerId}`);
+        error.code = 'MANIFEST_VALIDATION';
+        throw error;
+    }
+    const currentList = database[location.collectionKey];
+    const currentOwner = currentList[location.index];
+    let nextOwner;
+    if (location.nested) {
+        nextOwner = {
+            ...currentOwner,
+            embeddedModule: {
+                ...currentOwner.embeddedModule,
+                [location.descriptorKey]: descriptor,
+            },
+        };
+    } else {
+        nextOwner = { ...currentOwner, [location.descriptorKey]: descriptor };
+    }
+    const nextList = currentList.slice();
+    nextList[location.index] = nextOwner;
+    return {
+        nextDatabase: { ...database, [location.collectionKey]: nextList },
+        collectionKey: location.collectionKey,
+    };
 }
 
 function shouldCompress(req, res) {
@@ -783,6 +1042,91 @@ app.use('/assets', express.static(path.join(process.cwd(), 'dist/assets'), {
 }));
 app.use(express.static(path.join(process.cwd(), 'dist'), {index: false, maxAge: 0}));
 app.use(express.json({ limit: '100mb' }));
+
+// PocketRisu -> Termux native Android notification
+app.post('/api/termux-notify', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+
+    // A request relayed through a local reverse proxy arrives with a loopback
+    // remoteAddress even when the browser is remote, so any forwarded request
+    // counts as non-local.
+    const addr = String(req.socket.remoteAddress || '');
+    const isLoopback =
+        !req.headers['x-forwarded-for'] && (
+            addr === '127.0.0.1' ||
+            addr === '::1' ||
+            addr === '::ffff:127.0.0.1'
+        );
+
+    if (!isLoopback) {
+        return res.status(403).json({ error: 'localhost only' });
+    }
+
+    const prefix = process.env.PREFIX;
+
+    if (!prefix) {
+        return res.status(503).json({
+            error: 'Termux environment not available'
+        });
+    }
+
+    const bin = path.join(prefix, 'bin', 'termux-notification');
+
+    if (!existsSync(bin)) {
+        return res.status(503).json({
+            error: 'termux-notification not installed'
+        });
+    }
+
+    const elapsedMs = Number(req.body?.elapsedMs);
+
+    const elapsedText = Number.isFinite(elapsedMs)
+        ? `${(elapsedMs / 1000).toFixed(1)}s`
+        : 'time unavailable';
+
+    const character =
+        typeof req.body?.character === 'string'
+            ? req.body.character.trim().slice(0, 80)
+            : '';
+
+    const title = character
+        ? `PocketRisu · ${character}`
+        : 'PocketRisu';
+
+    // Reuse one notification slot so repeated responses do not stack.
+    const child = spawn(bin, [
+        '--id', '8472',
+        '--title', title,
+        '--content', `Response complete · ${elapsedText}`,
+        '--priority', 'high',
+        '--sound'
+    ], {
+        stdio: 'ignore'
+    });
+
+    let replied = false;
+
+    child.once('error', (error) => {
+        console.error('[TermuxNotify]', error);
+
+        if (!replied) {
+            replied = true;
+            res.status(500).json({
+                error: 'notification failed'
+            });
+        }
+    });
+
+    child.once('close', (code) => {
+        if (!replied) {
+            replied = true;
+            res.status(code === 0 ? 200 : 500).json({
+                ok: code === 0
+            });
+        }
+    });
+});
+
 app.use((req, res, next) => {
     // Skip express.raw() for backup import — it must stream, not buffer into memory
     if (req.path === '/api/backup/import') return next();
@@ -845,6 +1189,37 @@ if(!existsSync(backupsDir)){
 }
 writeBackupPathMarker(backupsDir);
 const BACKUP_FILENAME_REGEX = /^risu-backup-\d+\.bin$/;
+
+// A server restart mid-save (the update popup lets a user start a backup and
+// then update) leaves `risu-backup-<ts>.bin.tmp` behind: invisible in the
+// backup list, never cleaned. Sweep only stale ones — a fresh .tmp may belong
+// to a save still running in another instance.
+function sweepStaleBackupTmp() {
+    const STALE_MS = 60 * 60 * 1000;
+    try {
+        for (const name of readdirSync(backupsDir)) {
+            if (!/^risu-backup-\d+\.bin\.tmp$/.test(name)) continue;
+            const full = path.join(backupsDir, name);
+            try {
+                if (Date.now() - statSync(full).mtimeMs < STALE_MS) continue;
+                unlinkSync(full);
+                console.log(`[Server Backup] Removed stale temp file: ${name}`);
+            } catch { /* in use or already gone */ }
+        }
+    } catch { /* directory unreadable: nothing to sweep */ }
+}
+sweepStaleBackupTmp();
+
+// Top-level app-root entry holding a custom backup directory (null when the
+// directory is the default, outside the app root, or inside managed files),
+// so an in-app self-update preserves it exactly like scripts/updater.cjs does.
+function customBackupKeepEntry(rootDir) {
+    const rel = path.relative(rootDir, path.resolve(backupsDir));
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    const top = rel.split(path.sep)[0];
+    if (!top || MANAGED_BACKUP_PATH_ROOTS.has(top)) return null;
+    return top;
+}
 
 const passwordPath = path.join(process.cwd(), 'save', '__password')
 if(existsSync(passwordPath)){
@@ -1507,6 +1882,13 @@ const loginRouteLimiter = rateLimit({
     message: { error: 'Too many attempts. Please wait and try again later.' },
     validate: { xForwardedForHeader: false }
 });
+
+// Hex `file-path` headers are case-insensitive to decode but dbCache is keyed
+// by the raw string, so an upper-case header would get its own cache entry
+// and dodge every check that reads the canonical (lower-case) key.
+function normalizeFilePathHeader(value) {
+    return typeof value === 'string' ? value.trim().toLowerCase() : value;
+}
 
 function isHex(str) {
     return hexRegex.test(str.toUpperCase().trim()) || str === '__password';
@@ -2236,6 +2618,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     kvDelPrefix('inlay_meta/');
     kvDelPrefix('inlay_info/');
     kvDelPrefix('coldstorage/');
+    // NOTE: plugin-storage/ is NOT cleared here — see the final COMMIT below.
     // Composer drafts are session/device-local and not carried in the backup;
     // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
     kvDelPrefix('drafts/');
@@ -2390,6 +2773,16 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                 writeStagingSidecarSync(id, info);
             }
         }
+        // Backup = full replace, same as assets/. The .bin carries plugin
+        // storage inside database.risudat (export reassembles it there, never
+        // as kv entries), so decodeDatabaseWithPersistentChatIds below
+        // re-splits it. Cleared only in the FINAL transaction, after the
+        // stream validated: entries are committed in BATCH_SIZE batches, so a
+        // delete in the first batch would survive a later truncation failure
+        // and leave the old database.bin with its plugin rows gone. Dropping
+        // the marker with the prefix makes the re-split a first migration
+        // (DB-wins), which is what a full replace means.
+        kvDelPrefix(pluginStorage.PREFIX);
         sqliteDb.exec('COMMIT');
     } catch (error) {
         try { sqliteDb.exec('ROLLBACK'); } catch (_) {}
@@ -3316,7 +3709,7 @@ app.get('/api/read', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
-    const filePath = req.headers['file-path'];
+    const filePath = normalizeFilePathHeader(req.headers['file-path']);
     if (!filePath) {
         console.log('no path')
         res.status(400).send({ error:'File path required' });
@@ -3341,20 +3734,21 @@ app.get('/api/read', async (req, res, next) => {
         if (value === null) {
             value = kvGet(key);
         }
-        if(value === null){
+        if (value === null) {
             res.send();
         } else {
-            // Strip chat payloads from database.bin — client gets stubs only
+            // Strip chat payloads and asset manifests from database.bin — the
+            // client gets stubs and descriptors only.
             if (key === 'database/database.bin') {
                 try {
-                    const dbObj = await decodeDatabaseWithPersistentChatIds(value, {
-                        createBackup: true,
-                    });
-                    initChatStore(dbObj);
-                    const stripped = normalizeJSON(stripChatsFromDb(dbObj));
-                    // Populate dbCache so patch endpoint uses the same data
-                    dbCache[filePath] = stripped;
-                    value = Buffer.from(encodeRisuSaveLegacy(stripped));
+                    // Cold load runs under the storage queue so it cannot
+                    // race a cold /api/patch (see loadDbCacheIfMissing). A
+                    // warm cache is served directly without queueing, so a
+                    // read can never re-activate a superseded manifest.
+                    if (!dbCache[filePath]) {
+                        await queueStorageOperation(() => loadDbCacheIfMissing({ createBackup: true }));
+                    }
+                    value = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
                 } catch (e) {
                     // Log the Error itself (not just e.message) so logger.*
                     // tags it and the Express middleware won't re-log after next().
@@ -3371,6 +3765,51 @@ app.get('/api/read', async (req, res, next) => {
             res.send(value);
         }
     } catch (error) {
+        logger.error('[Read] Failed to read stored data', error);
+        next(error);
+    }
+});
+
+// Names + sizes of every plugin-storage key, no values. Backs the client's
+// synchronous keys()/length and the storage viewer. `migrated` is whether the
+// DB→kv split has ever run on this instance (marker present).
+app.get('/api/plugin-storage/index', async (req, res, next) => {
+    if(!await checkAuth(req, res)){
+        return;
+    }
+    try {
+        res.json({ entries: pluginStorage.list(), migrated: pluginStorage.isMigrated() });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// Every plugin-storage value, streamed as NDJSON lines `[key, json]` straight
+// from kv so the set is never materialized as one object. Backs the V2
+// preload: the V2 API is synchronous, so every key has to be in the client
+// cache before a V2 plugin runs, and fetching N keys one GET at a time made
+// plugin loading take minutes over a remote link (v1.11.0 report).
+app.get('/api/plugin-storage/all', async (req, res, next) => {
+    if(!await checkAuth(req, res)){
+        return;
+    }
+    try {
+        res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+        let closed = false;
+        res.once('close', () => { closed = true; });
+        for (const entry of pluginStorage.entriesRaw()) {
+            if (closed) return;
+            const ok = res.write(JSON.stringify([entry.key, entry.text]) + '\n');
+            // Wait for backpressure to clear, but stop if the client went away.
+            if (!ok) await new Promise((resolve) => {
+                const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+                res.once('drain', done);
+                res.once('close', done);
+            });
+        }
+        res.end();
+    } catch (error) {
+        if (res.headersSent) { res.destroy(error); return; }
         next(error);
     }
 });
@@ -3379,7 +3818,7 @@ app.get('/api/remove', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
-    const filePath = req.headers['file-path'];
+    const filePath = normalizeFilePathHeader(req.headers['file-path']);
     if (!filePath) {
         res.status(400).send({ error:'File path required' });
         return;
@@ -3390,6 +3829,9 @@ app.get('/api/remove', async (req, res, next) => {
     }
     try {
         const key = Buffer.from(filePath, 'hex').toString('utf-8');
+        if (key.startsWith('assets/') || key.startsWith('remotes/')) {
+            return res.status(409).send({ error: 'asset removal must go through server-side cleanup' });
+        }
         if (key.startsWith('inlay/')) {
             const id = key.slice('inlay/'.length)
             await deleteInlayFile(id)
@@ -3400,6 +3842,12 @@ app.get('/api/remove', async (req, res, next) => {
         }
         if (key.startsWith('inlay_info/')) {
             await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
+        }
+        // A DB snapshot owns a plugin-storage map row + blobs; a raw kvDel
+        // would orphan them (never GC'd, never counted).
+        if (isSnapshotKey(key)) {
+            deleteSnapshot(key);
+            return res.send({ success: true });
         }
         kvDel(key);
         res.send({ success: true });
@@ -3511,7 +3959,7 @@ app.post('/api/write', async (req, res, next) => {
         return;
     }
     if (!checkActiveSession(req, res)) return;
-    const filePath = req.headers['file-path'];
+    const filePath = normalizeFilePathHeader(req.headers['file-path']);
     const fileContent = req.body;
     if (!filePath || !fileContent) {
         res.status(400).send({ error:'File path required' });
@@ -3528,6 +3976,13 @@ app.post('/api/write', async (req, res, next) => {
             // ETag conflict detection for database.bin
             if (key === 'database/database.bin') {
                 const ifMatch = req.headers['x-if-match'];
+                // dbEtag is null after a restart or cache invalidation until
+                // a /api/read recomputes it; a stale client's full write must
+                // not slip through that window, so derive it from the current
+                // client view when the writer sent a precondition.
+                if (ifMatch && !dbEtag && (await loadDbCacheIfMissing())) {
+                    dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[DB_HEX_KEY])));
+                }
                 if (ifMatch && dbEtag && ifMatch !== dbEtag) {
                     res.status(409).send({
                         error: 'ETag mismatch - concurrent modification detected',
@@ -3563,9 +4018,11 @@ app.post('/api/write', async (req, res, next) => {
             } else if (key === 'database/database.bin') {
                 // Client sends stubs-only DB — merge full chats from server before persisting
                 try {
+                    // eslint-disable-next-line no-var
+                    var persistedEtag;
                     const incomingDb = await decodeRisuSave(fileContent);
                     await ensureChatStore();
-                    const fullDb = reassembleFullDb(incomingDb);
+                    const fullDb = hydrateDatabaseForDisk(incomingDb);
 
                     // Mirror the patch-persist guard (persistDbCacheWithChats):
                     // a malformed full-write payload could carry chats with
@@ -3590,10 +4047,55 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
 
+                    // Same boundary for lazy asset manifests (see
+                    // findAssetManifestLossOwners). Compared against the
+                    // stripped client view; load it from disk when the cache
+                    // is cold (restart, or a writer that never called
+                    // /api/read) so only a first-ever write is unguarded.
+                    const manifestLosses = (await loadDbCacheIfMissing())
+                        ? findAssetManifestLossOwners(dbCache[DB_HEX_KEY], incomingDb)
+                        : [];
+                    if (manifestLosses.length > 0) {
+                        const sample = manifestLosses.slice(0, 3).map(l => `${l.kind}:${l.ownerId}`).join(', ');
+                        const err = new Error(
+                            `write aborted: ${manifestLosses.length} owner(s) would lose their asset manifest `
+                            + `without an inline asset list. sample=[${sample}]`
+                        );
+                        recordPersistFailure(err, '/api/write:asset-manifest-loss');
+                        logger.error(`[Write] ${err.message}`);
+                        res.status(500).json({ error: 'Write aborted: asset manifest integrity check failed' });
+                        return;
+                    }
+
+                    // A client that still ships a populated pluginCustomStorage
+                    // (older build, or one that never reloaded after the
+                    // split) is the only writer of that data — split it into
+                    // kv now, DB-wins, so the blob on disk never carries
+                    // plugin data. Without this the next cold decode would
+                    // re-migrate it over kv values written by newer clients.
+                    // A throw here rolls the kv rows back and aborts the
+                    // write below, leaving disk untouched.
+                    const pluginMigration = pluginStorage.migrateFromDb(fullDb, {
+                        createSnapshot: () => createBackupAndRotate({ force: true }),
+                    });
+                    if (pluginMigration.migrated) {
+                        // fullDb is a fresh decode, not the dbCache root — no
+                        // hash-cache aliasing concern; dbCache is dropped below.
+                        fullDb.pluginCustomStorage = {};
+                        logger.info(`[PluginStorage] Split ${pluginMigration.keys} key(s) from a full database.bin write into kv`);
+                    }
+
                     const mergedContent = Buffer.from(encodeRisuSaveLegacy(fullDb));
                     // Re-init chat store from merged result
                     initChatStore(fullDb);
                     kvSet(key, mergedContent);
+                    // ETag of what the next /api/read will serve: the
+                    // PERSISTED DB, stripped. Not the request bytes — the
+                    // split above may have emptied pluginCustomStorage, so
+                    // the client's copy and the served copy differ.
+                    persistedEtag = computeDatabaseEtagFromObject(
+                        normalizeJSON(stripDatabaseForClient(fullDb, { reconcileManifests: true })),
+                    );
                 } catch (e) {
                     logger.error('[Write] Failed to merge chats into database.bin:', e.message);
                     // Do NOT write stubs-only to disk — that would permanently
@@ -3612,8 +4114,7 @@ app.post('/api/write', async (req, res, next) => {
                     clearTimeout(saveTimers[DB_HEX_KEY]);
                     delete saveTimers[DB_HEX_KEY];
                 }
-                // ETag based on stripped version (what client sees)
-                dbEtag = computeBufferEtag(fileContent);
+                dbEtag = persistedEtag;
                 createBackupAndRotate();
             }
 
@@ -3655,8 +4156,8 @@ app.post('/api/patch', async (req, res, next) => {
         return;
     }
     if (!checkActiveSession(req, res)) return;
-    const filePath = req.headers['file-path'];
-    const patch = req.body.patch;
+    const filePath = normalizeFilePathHeader(req.headers['file-path']);
+    let patch = req.body.patch;
     const expectedHash = req.body.expectedHash;
 
     if (!filePath || !patch || !expectedHash) {
@@ -3678,19 +4179,13 @@ app.post('/api/patch', async (req, res, next) => {
             // Load database into memory if not already cached
             // For database.bin, cache holds the STRIPPED version (stubs only)
             if (!dbCache[filePath]) {
-                const fileContent = kvGet(decodedKey);
-                if (fileContent) {
-                    const decoded = decodedKey === 'database/database.bin'
-                        ? await decodeDatabaseWithPersistentChatIds(fileContent)
-                        : normalizeJSON(await decodeRisuSave(fileContent));
-                    if (decodedKey === 'database/database.bin') {
-                        initChatStore(decoded);
-                        dbCache[filePath] = normalizeJSON(stripChatsFromDb(decoded));
-                    } else {
-                        dbCache[filePath] = decoded;
-                    }
+                if (decodedKey === 'database/database.bin') {
+                    if (!(await loadDbCacheIfMissing())) dbCache[filePath] = {};
                 } else {
-                    dbCache[filePath] = {};
+                    const fileContent = kvGet(decodedKey);
+                    dbCache[filePath] = fileContent
+                        ? normalizeJSON(await decodeRisuSave(fileContent))
+                        : {};
                 }
             }
 
@@ -3727,8 +4222,33 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
+            // Plugin-storage ops (old clients): see partitionPluginStorageOps.
+            let pluginKvOps = [];
+            if (decodedKey === 'database/database.bin') {
+                const partition = partitionPluginStorageOps(patch);
+                if (partition.rejected.length > 0) {
+                    const sample = partition.rejected.slice(0, 5).map(v => `${v.op} ${v.path}`).join(', ');
+                    logger.warn(`[Patch] Rejected ${partition.rejected.length} plugin-storage op(s) (client must full-write): ${sample}`);
+                    let currentEtag;
+                    try {
+                        currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                        dbEtag = currentEtag;
+                    } catch {}
+                    res.status(409).send({
+                        error: 'Patch rejected: unsupported op on pluginCustomStorage',
+                        code: 'PLUGIN_STORAGE_OPS_REJECTED',
+                        currentEtag,
+                    });
+                    return;
+                }
+                pluginKvOps = partition.kvOps;
+                patch = partition.rest;
+            }
+
             patchStage = 'hash';
-            const serverHash = calculateHash(dbCache[filePath]).toString(16);
+            const serverHash = decodedKey === 'database/database.bin'
+                ? databasePatchHashCache.hash(dbCache[filePath]).toString(16)
+                : calculateHash(dbCache[filePath]).toString(16);
 
             if (expectedHash !== serverHash) {
                 console.log(`[Patch] Hash mismatch for ${decodedKey}: expected=${expectedHash}, server=${serverHash}`);
@@ -3747,6 +4267,49 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
+            // Ordering with the plugin kv ops (old clients): the DB patch is
+            // cloned/applied/validated FIRST and the kv ops are written only
+            // after it succeeded, so a patch whose DB part fails (bad op,
+            // non-object root) leaves kv untouched. The kv writes are single
+            // rows and not transactional with dbCache; a kv failure after the
+            // DB patch landed is the remaining non-atomic window — it is
+            // logged + recorded as a persist warning and the client's next
+            // full write re-splits.
+            const applyPluginKvOps = () => {
+                if (pluginKvOps.length === 0) return;
+                patchStage = 'plugin-storage';
+                try {
+                    for (const kvOp of pluginKvOps) {
+                        if (kvOp.op === 'remove') pluginStorage.remove(kvOp.key);
+                        else pluginStorage.set(kvOp.key, kvOp.value);
+                    }
+                } catch (kvErr) {
+                    logger.error('[Patch] Plugin-storage op failed after the DB patch was applied:', kvErr);
+                    recordPersistFailure(kvErr, 'patch:plugin-storage');
+                    throw kvErr;
+                }
+            };
+
+            // Nothing to apply: the client already matches the server. Skip the
+            // clone/apply/persist work and hand back the current revision.
+            // (Also the case when every op was a plugin-storage op — the DB
+            // root is unchanged, so hash cache and etag stay valid.)
+            if (Array.isArray(patch) && patch.length === 0) {
+                applyPluginKvOps();
+                if (pluginKvOps.length > 0 && decodedKey === 'database/database.bin') {
+                    dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                }
+                const emptyPayload = {
+                    success: true,
+                    appliedOperations: pluginKvOps.length,
+                    etag: decodedKey === 'database/database.bin' ? dbEtag : undefined,
+                };
+                const emptyWarning = currentPersistWarning();
+                if (emptyWarning) emptyPayload.persistWarning = emptyWarning;
+                res.send(emptyPayload);
+                return;
+            }
+
             // Apply patch to in-memory database (clone first to prevent partial
             // mutation on failure). structuredClone instead of a JSON round-trip:
             // stringifying the whole DB into one JS string hits V8's ~512MB
@@ -3754,7 +4317,9 @@ app.post('/api/patch', async (req, res, next) => {
             // length), which rejected every patch. The cache is normalized to
             // plain JSON values at load, so the clone semantics are identical.
             patchStage = 'clone';
-            const snapshot = structuredClone(dbCache[filePath]);
+            const snapshot = decodedKey === 'database/database.bin'
+                ? clonePatchSnapshot(dbCache[filePath], patch)
+                : structuredClone(dbCache[filePath]);
             patchStage = 'apply';
             let result;
             try {
@@ -3764,7 +4329,47 @@ app.post('/api/patch', async (req, res, next) => {
                 delete dbCache[filePath];
                 throw patchErr;
             }
-            dbCache[filePath] = snapshot;
+            // Root-level ops (path "") replace the document instead of mutating
+            // the snapshot, so the applied result must be taken from newDocument.
+            const next = result.newDocument;
+            // A root op may hand back a primitive/null/array; that is never a
+            // valid document and must not reach the cache or disk.
+            const validRoot = next !== null && typeof next === 'object'
+                && (decodedKey !== 'database/database.bin' || !Array.isArray(next));
+            if (!validRoot) {
+                res.status(400).send({ error: 'Patch must leave the document as an object' });
+                return;
+            }
+            // Lazy asset manifest guard (partner of the chat guard above): an
+            // owner that had a descriptor must still have it or an inline
+            // array, otherwise hydrate would write it to disk without its
+            // assets. 409 so the client rebases; a full write with the same
+            // shape is stopped at /api/write.
+            if (decodedKey === 'database/database.bin') {
+                const manifestLosses = findAssetManifestLossOwners(dbCache[filePath], next);
+                if (manifestLosses.length > 0) {
+                    const sample = manifestLosses.slice(0, 5).map(l => `${l.kind}:${l.ownerId}`).join(', ');
+                    logger.warn(`[Patch] Rejected: ${manifestLosses.length} owner(s) would lose their asset manifest: ${sample}`);
+                    let currentEtag;
+                    try {
+                        currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                        dbEtag = currentEtag;
+                    } catch {}
+                    res.status(409).send({
+                        error: 'Patch rejected: owner would lose its asset manifest without an inline asset list',
+                        code: 'ASSET_MANIFEST_GUARD_REJECTED',
+                        assetManifestGuardRejected: true,
+                        currentEtag,
+                    });
+                    return;
+                }
+            }
+            if (decodedKey === 'database/database.bin') {
+                databasePatchHashCache.update(dbCache[filePath], next, patch);
+            }
+            dbCache[filePath] = next;
+            // DB patch is in; now the kv half (see ordering note above).
+            applyPluginKvOps();
 
             // Schedule save to KV (debounced) — merge full chats back for database.bin
             if (saveTimers[filePath]) {
@@ -3811,7 +4416,7 @@ app.post('/api/patch', async (req, res, next) => {
 
             const responsePayload = {
                 success: true,
-                appliedOperations: result.length,
+                appliedOperations: result.length + pluginKvOps.length,
                 etag: decodedKey === 'database/database.bin' ? dbEtag : undefined,
             };
             const persistWarning = currentPersistWarning();
@@ -3830,6 +4435,123 @@ app.post('/api/patch', async (req, res, next) => {
         res.status(500).send({
             error: 'Patch application failed: ' + (error && error.message ? error.message : error)
         });
+    }
+});
+
+// ─── Asset manifest endpoints ─────────────────────────────────────────────────
+// Large module/character asset-reference arrays live here instead of in the
+// browser's reactive database. Binary assets remain untouched in assets/*.
+app.get('/api/asset-manifests/stats', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        res.json({
+            ...assetManifestStore.stats(),
+            migration: assetManifestStore.listMigrationState(),
+            runtime: dbCache[DB_HEX_KEY] ? assetManifestSummary(dbCache[DB_HEX_KEY]) : null,
+        });
+    } catch (error) { next(error); }
+});
+
+app.get('/api/asset-manifests/owner/:kind/:ownerId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const descriptor = assetManifestStore.getLiveDescriptor(req.params.kind, req.params.ownerId);
+        if (!descriptor) return res.status(404).json({ error: 'Asset manifest owner not found' });
+        res.json({ ...descriptor, ownerKind: req.params.kind, ownerId: req.params.ownerId });
+    } catch (error) { next(error); }
+});
+
+app.get('/api/asset-manifests/:manifestId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const page = assetManifestStore.getPage(req.params.manifestId, {
+            offset: req.query.offset,
+            limit: req.query.limit,
+            search: req.query.search,
+        });
+        if (!page) return res.status(404).json({ error: 'Asset manifest not found' });
+        res.json(page);
+    } catch (error) { next(error); }
+});
+
+app.post('/api/asset-manifests/resolve', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const owners = Array.isArray(req.body?.owners) ? req.body.owners : [];
+        const names = Array.isArray(req.body?.names) ? req.body.names : [];
+        if (owners.length > 200 || names.length > 1000) {
+            return res.status(413).json({ error: 'Too many asset manifest owners or names' });
+        }
+        const fuzzy = new Set();
+        const resolved = assetManifestStore.resolveNames(owners, names, {
+            maxDistance: req.body?.maxDistance,
+            fuzzyNamesOut: fuzzy,
+        });
+        res.json({ resolved, fuzzy: [...fuzzy] });
+    } catch (error) { next(error); }
+});
+
+app.patch('/api/asset-manifests/owner/:kind/:ownerId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const descriptor = await queueStorageOperation(async () => {
+            const currentDb = await ensureDatabaseCache();
+            // Validate that the owner exists in the canonical cache before the
+            // SQLite live pointer advances. This keeps a malformed request from
+            // creating a manifest revision the database cannot reference.
+            const location = locateAssetManifestOwner(currentDb, req.params.kind, req.params.ownerId);
+            if (!location || location.index < 0) {
+                const error = new Error(`Asset manifest owner not found: ${req.params.kind}/${req.params.ownerId}`);
+                error.code = 'MANIFEST_VALIDATION';
+                throw error;
+            }
+            const nextDescriptor = assetManifestStore.applyOperations(
+                req.params.kind,
+                req.params.ownerId,
+                req.body?.expectedManifestId,
+                req.body?.operations,
+            );
+            const enriched = {
+                ...nextDescriptor,
+                ownerKind: req.params.kind,
+                ownerId: req.params.ownerId,
+            };
+            const { nextDatabase, collectionKey } = replaceCachedAssetManifestDescriptor(
+                currentDb,
+                req.params.kind,
+                req.params.ownerId,
+                enriched,
+            );
+            databasePatchHashCache.update(currentDb, nextDatabase, [{
+                op: 'replace',
+                path: `/${collectionKey}`,
+                value: nextDatabase[collectionKey],
+            }]);
+            dbCache[DB_HEX_KEY] = nextDatabase;
+            // The client view changed, so a full write carrying the
+            // pre-edit etag must conflict instead of reconciling its stale
+            // inline asset list over this manifest revision.
+            dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(nextDatabase)));
+            scheduleDatabasePersist('asset-manifest');
+            return enriched;
+        });
+        res.json({ ...descriptor, ownerKind: req.params.kind, ownerId: req.params.ownerId });
+    } catch (error) {
+        if (error?.code === 'MANIFEST_CONFLICT') {
+            return res.status(409).json({
+                error: error.message,
+                current: error.current ? {
+                    ...error.current,
+                    ownerKind: req.params.kind,
+                    ownerId: req.params.ownerId,
+                } : null,
+            });
+        }
+        if (error?.code === 'MANIFEST_VALIDATION') {
+            return res.status(400).json({ error: error.message });
+        }
+        next(error);
     }
 });
 
@@ -4005,6 +4727,38 @@ async function buildSettingsOnlyPlan({ includeModuleAssets = true } = {}) {
     };
 }
 
+/**
+ * database.risudat bytes for a full export: the live blob with
+ * pluginCustomStorage re-embedded from plugin-storage/ kv so the .bin decodes
+ * to a complete DB in upstream RisuAI and in older NodeOnly builds.
+ *
+ * The blob is one msgpack document (encodeRisuSaveLegacy), not block-based,
+ * so there is no "replace one block" path: this decodes and re-encodes the
+ * whole DB and materializes every plugin value. Memory cost is roughly the
+ * decoded DB plus plugin storage twice (object + encoded buffer). Skipped
+ * entirely when kv holds no plugin keys, which keeps the raw-blob fast path
+ * for everyone else. Blob values win over kv on overlap — same rule as the
+ * migration, since a still-populated blob means a newer write.
+ */
+async function buildFullExportDbValue() {
+    const raw = kvGet('database/database.bin');
+    if (!raw) return null;
+    if (pluginStorage.list().length === 0) return raw;
+    const dbObj = await decodeRisuSave(raw);
+    const fromDb = dbObj.pluginCustomStorage;
+    const merged = pluginStorage.readAll();
+    if (fromDb && typeof fromDb === 'object') {
+        for (const key of Object.keys(fromDb)) {
+            Object.defineProperty(merged, key, {
+                value: Object.getOwnPropertyDescriptor(fromDb, key).value,
+                enumerable: true, writable: true, configurable: true,
+            });
+        }
+    }
+    dbObj.pluginCustomStorage = merged;
+    return Buffer.from(encodeRisuSaveLegacy(dbObj));
+}
+
 // Size breakdown for the settings-only confirm dialog. Kept separate from
 // /api/db/stats because it has to decode and re-encode the DB, which that
 // dashboard poll should not pay for on every load.
@@ -4055,6 +4809,11 @@ app.get('/api/backup/export', async (req, res, next) => {
             settingsDbValue = plan.dbValue;
             settingsAssetNames = plan.keepNames;
         }
+        // Full export ships plugin storage inside database.risudat (see
+        // buildFullExportDbValue) — never as plugin-storage/ kv entries, which
+        // would duplicate it. Settings-only keeps the trimmed blob's empty
+        // field: plugin data is chat-scoped and does not travel with settings.
+        const exportDbValue = settingsOnly ? settingsDbValue : await buildFullExportDbValue();
 
         // Inlay images only ever attach to chat messages, so a settings-only
         // export skips those namespaces for the same reason upstream does.
@@ -4113,7 +4872,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
-        const dbSize = settingsOnly ? settingsDbValue.length : kvSize('database/database.bin');
+        const dbSize = exportDbValue ? exportDbValue.length : 0;
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
         }, 0) + (dbSize ? 8 + Buffer.byteLength('database.risudat', 'utf-8') + dbSize : 0);
@@ -4162,7 +4921,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         }
 
         if (!closed && dbSize) {
-            const dbValue = settingsOnly ? settingsDbValue : kvGet('database/database.bin');
+            const dbValue = exportDbValue;
             if (dbValue) {
                 const ok = res.write(encodeBackupEntry('database.risudat', dbValue));
                 if (!ok) {
@@ -4397,7 +5156,9 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                         }
                     }
                     if (closed) throw new Error('Client disconnected during backup save');
-                    const dbValue = kvGet('database/database.bin');
+                    // Same reassembly as /api/backup/export — plugin storage
+                    // rides inside database.risudat, not as kv entries.
+                    const dbValue = await buildFullExportDbValue();
                     if (dbValue) {
                         const ok = writeStream.write(encodeBackupEntry('database.risudat', dbValue));
                         if (!ok) await new Promise(r => writeStream.once('drain', r));
@@ -4414,7 +5175,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
 
             const stat = await fs.stat(finalPath);
             console.log(`[Server Backup] Saved: ${filename} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
-            res.write(JSON.stringify({ type: 'done', ok: true, filename, size: stat.size }) + '\n');
+            res.write(JSON.stringify({ type: 'done', ok: true, filename, size: stat.size, dir: backupsDir }) + '\n');
             res.end();
         } catch (innerError) {
             // Clean up incomplete temp file
@@ -4804,7 +5565,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                         const raw = kvGet('database/database.bin');
                         if (raw) {
                             const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                            const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
+                            const fullDb = hydrateDatabaseForDisk(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
                             const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
                             try {
                                 kvSet('database/database.bin', encoded);
@@ -4883,6 +5644,12 @@ function clearExistingData() {
     // (importBackupFromSource) already clears these; the save-folder path did not,
     // leaving orphans that no dashboard or Optimize pass ever reclaims.
     kvDelPrefix('coldstorage/');
+    // Plugin storage is a full replace too: the incoming save folder either
+    // carries its own plugin-storage/ rows (INSERT OR REPLACE lands them
+    // after this delete, inside the same transaction) or has the data inside
+    // its database.bin, which the next cold decode re-splits. Runs inside the
+    // importer's transaction, so a failed import rolls this back with the DB.
+    kvDelPrefix(pluginStorage.PREFIX);
     // Clear remote-block migration marker — newly imported database.bin may
     // contain REMOTE blocks (it usually does, since save-folder imports
     // preserve upstream's split-character format) and we want the migration
@@ -5113,7 +5880,11 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
 
 const DB_BLOB_KEY = 'database/database.bin';
 const DB_BACKUP_PREFIX = 'database/dbbackup-';
+// createBackupAndRotate names snapshots `${DB_BACKUP_PREFIX}${digits}.bin`;
+// the digits double as the plugin-storage snapshot id.
+const DB_BACKUP_KEY_RE = /^database\/dbbackup-(\d+)\.bin$/;
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
+const AUTO_SWEEP_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function statsBasename(s) {
     if (!s) return '';
@@ -5137,7 +5908,9 @@ function extractAssetRefsFromText(value) {
 // can union it with buildUncleanableSet before deciding what is orphaned.
 function collectPluginStorageAssetRefs() {
     const set = new Set();
-    for (const key of kvList('cache/plugin-storage/')) {
+    // plugin-storage/ is the former db.pluginCustomStorage; the DB blob's
+    // field is now always empty, so it must be scanned here instead.
+    for (const key of [...kvList('cache/plugin-storage/'), ...kvList(pluginStorage.PREFIX)]) {
         try {
             const raw = kvGet(key);
             if (!raw) continue;
@@ -5149,6 +5922,25 @@ function collectPluginStorageAssetRefs() {
         } catch { /* unreadable entry — skip */ }
     }
     return set;
+}
+
+// The persisted blob is currently hydrated for upstream compatibility, but
+// manifests are authoritative for the lazy client view and will remain so
+// after a future slim-database cutover. Union live manifest paths so a
+// partial/stripped object (the warm dbCache always is) can never make
+// referenced assets look orphaned. Throws when a manifest fails to verify —
+// callers must then refuse to purge / report the count as unavailable.
+function addLiveManifestRefs(uncleanable) {
+    for (const descriptor of assetManifestStore.listLiveDescriptors()) {
+        const verified = assetManifestStore.verifyManifest(descriptor.id);
+        if (!verified.ok) {
+            throw new Error(`Asset manifest verification failed: ${descriptor.id} (${verified.error})`);
+        }
+        for (const item of assetManifestStore.loadItems(descriptor.id) || []) {
+            const basename = statsBasename(item?.[1]);
+            if (basename) uncleanable.add(basename);
+        }
+    }
 }
 
 // Every asset reference reachable from the DB. Mirrors
@@ -5231,6 +6023,114 @@ function buildUncleanableSet(dbObj, { includeModuleAssets = true } = {}) {
     return set;
 }
 
+function decodeRemoteMetaLastUsed(raw) {
+    try {
+        if (!raw) return null;
+        const text = Buffer.isBuffer(raw) ? raw.toString('utf-8') : String(raw);
+        const parsed = JSON.parse(text);
+        const lastUsed = Number(parsed?.lastUsed);
+        return Number.isFinite(lastUsed) ? lastUsed : null;
+    } catch {
+        return null;
+    }
+}
+
+async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemotes = false, checkpointLabel = 'AssetSweep' } = {}) {
+    await flushPendingDb();
+    const raw = kvGet(DB_BLOB_KEY);
+    if (!raw) return { error: 'No database blob' };
+    const dbObj = await decodeRisuSave(raw);
+    if (!dbObj || !Array.isArray(dbObj.characters)) return { error: 'Database decode failed' };
+
+    const uncleanable = buildUncleanableSet(dbObj);
+    const assets = includeAssets ? kvListWithSizesAndUpdatedAt('assets/') : [];
+
+    try {
+        addLiveManifestRefs(uncleanable);
+    } catch (error) {
+        return { error: `Manifest reference scan failed — refusing to purge: ${error?.message || error}` };
+    }
+
+    // A walker that returns nothing while assets exist means the decode
+    // produced a shape we do not understand — every asset would look orphaned.
+    // Refuse rather than delete the library. Checked before plugin-storage refs
+    // are unioned in so those can't mask a bad walk.
+    if (uncleanable.size === 0 && assets.length > 0) {
+        return { error: 'Reference scan produced no references — refusing to purge' };
+    }
+    for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
+
+    const now = Date.now();
+    const assetVictims = includeAssets
+        ? assets.filter((it) => {
+            if (uncleanable.has(statsBasename(it.key))) return false;
+            if (assetGraceMs > 0 && now - Number(it.updated_at || 0) <= assetGraceMs) return false;
+            return true;
+        })
+        : [];
+
+    const remoteVictims = [];
+    const remoteMetaCreates = [];
+    let remotesScanned = 0;
+    if (includeRemotes) {
+        const characterIds = new Set(dbObj.characters.map((v) => v?.chaId).filter(Boolean));
+        const remoteRows = kvListWithSizesAndUpdatedAt('remotes/');
+        const remoteByKey = new Map(remoteRows.map((it) => [it.key, it]));
+        for (const it of remoteRows) {
+            if (it.key.endsWith('.meta')) continue;
+            remotesScanned++;
+            const base = statsBasename(it.key);
+            if (!base.endsWith('.local.bin')) continue;
+            const chaId = base.slice(0, -'.local.bin'.length);
+            if (characterIds.has(chaId)) continue;
+
+            const metaKey = `${it.key}.meta`;
+            const meta = remoteByKey.get(metaKey);
+            if (!meta) {
+                remoteMetaCreates.push(metaKey);
+                continue;
+            }
+            const lastUsed = decodeRemoteMetaLastUsed(kvGet(metaKey));
+            const newestUse = Math.max(Number(it.updated_at || 0), lastUsed ?? 0);
+            if (now - newestUse > AUTO_SWEEP_GRACE_MS) {
+                remoteVictims.push(it);
+                remoteVictims.push(meta);
+            }
+        }
+
+        for (const it of remoteRows) {
+            if (!it.key.endsWith('.meta')) continue;
+            const remoteKey = it.key.slice(0, -'.meta'.length);
+            if (!remoteByKey.has(remoteKey)) {
+                remoteVictims.push(it);
+            }
+        }
+    }
+
+    const victims = [...assetVictims, ...remoteVictims];
+    sqliteDb.transaction(() => {
+        for (const key of remoteMetaCreates) {
+            kvSet(key, Buffer.from(JSON.stringify({ lastUsed: now })));
+        }
+        for (const it of victims) kvDel(it.key);
+    })();
+
+    const deleted = victims.length;
+    const bytes = victims.reduce((sum, it) => sum + it.size, 0);
+    if (deleted > 0) {
+        try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn(`[${checkpointLabel}] checkpoint failed:`, e?.message || e); }
+    }
+
+    return {
+        ok: true,
+        deleted: assetVictims.length,
+        assetsDeleted: assetVictims.length,
+        remotesDeleted: remoteVictims.length,
+        bytes,
+        scanned: assets.length + remotesScanned,
+    };
+}
+
 function statSafe(p) {
     try { return require('fs').statSync(p); } catch { return null; }
 }
@@ -5271,6 +6171,8 @@ async function sumInlayFsBytes() {
 async function estimateServerBackupSize() {
     let total = 0;
     total += kvSize(DB_BLOB_KEY) || 0;
+    // Plugin storage is re-embedded into database.risudat on export.
+    for (const it of pluginStorage.list()) total += it.size;
     for (const it of kvListWithSizes('assets/')) total += it.size;
     for (const it of kvListWithSizes('inlay_meta/')) total += it.size;
     for (const e of listColdStorageBackupEntries()) total += e.size;
@@ -5338,7 +6240,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         let backupTotal = 0;
         let backupOldest = null, backupNewest = null;
         for (const k of backupKeys) {
-            const sz = kvSize(k) || 0;
+            const sz = (kvSize(k) || 0) + snapshotPluginBytes(k);
             backupTotal += sz;
             const tsRaw = parseInt(k.slice(DB_BACKUP_PREFIX.length, -4), 10);
             if (Number.isFinite(tsRaw)) {
@@ -5390,16 +6292,26 @@ app.get('/api/db/stats', async (req, res, next) => {
         // `characters` must be an array: a decode failure parks `{}` in dbCache,
         // and walking that yields an empty reference set — which would report
         // every stored asset as an orphan.
+        // dbCache holds the stripped (manifest-descriptor) shape, so the
+        // walker alone misses every lazy character/module asset — union the
+        // live manifests exactly like the purge path does, or the dashboard
+        // reports the whole library as orphaned while purge deletes nothing.
         if (stripped && Array.isArray(stripped.characters)) {
-            const uncleanable = buildUncleanableSet(stripped);
-            for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
-            for (const it of kvListWithSizes('assets/')) {
-                if (!uncleanable.has(statsBasename(it.key))) {
-                    orphan.count++;
-                    orphan.totalSize += it.size;
+            try {
+                const uncleanable = buildUncleanableSet(stripped);
+                addLiveManifestRefs(uncleanable);
+                for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
+                for (const it of kvListWithSizes('assets/')) {
+                    if (!uncleanable.has(statsBasename(it.key))) {
+                        orphan.count++;
+                        orphan.totalSize += it.size;
+                    }
                 }
+                orphan.available = true;
+            } catch (error) {
+                logger.warn(`[Stats] orphan scan skipped: ${error?.message || error}`);
+                orphan = { count: 0, totalSize: 0, available: false };
             }
-            orphan.available = true;
         }
 
         const estimatedBackupSize = await estimateServerBackupSize();
@@ -5507,6 +6419,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
         }
 
         const uncleanable = buildUncleanableSet(dbObj);
+        addLiveManifestRefs(uncleanable);
         for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
         let orphanCount = 0, orphanTotal = 0;
         for (const it of kvListWithSizes('assets/')) {
@@ -5591,41 +6504,31 @@ app.post('/api/db/assets/purge-orphans', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         const result = await queueStorageOperation(async () => {
-            // Land any debounced write first — otherwise the blob we walk is
-            // older than the assets the client just attached.
-            await flushPendingDb();
-            const raw = kvGet(DB_BLOB_KEY);
-            if (!raw) return { error: 'No database blob' };
-            const dbObj = await decodeRisuSave(raw);
-            if (!dbObj || !Array.isArray(dbObj.characters)) return { error: 'Database decode failed' };
-
-            const uncleanable = buildUncleanableSet(dbObj);
-            const assets = kvListWithSizes('assets/');
-            // A walker that returns nothing while assets exist means the decode
-            // produced a shape we do not understand — every asset would look
-            // orphaned. Refuse rather than delete the library. Checked before
-            // plugin-storage refs are unioned in so those can't mask a bad walk.
-            if (uncleanable.size === 0 && assets.length > 0) {
-                return { error: 'Reference scan produced no references — refusing to purge' };
-            }
-            for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
-
-            const victims = assets.filter((it) => !uncleanable.has(statsBasename(it.key)));
-            // One commit for the whole sweep: thousands of autocommitted deletes
-            // would each hit the WAL, and a crash mid-loop would leave the
-            // library half-swept.
-            sqliteDb.transaction(() => {
-                for (const it of victims) kvDel(it.key);
-            })();
-            const deleted = victims.length;
-            const bytes = victims.reduce((sum, it) => sum + it.size, 0);
-            if (deleted > 0) {
-                try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[PurgeOrphans] checkpoint failed:', e?.message || e); }
-            }
-            return { ok: true, deleted, bytes, scanned: assets.length };
+            const sweep = await computeAssetSweep({ includeAssets: true, checkpointLabel: 'PurgeOrphans' });
+            if (sweep.error) return sweep;
+            return { ok: true, deleted: sweep.deleted, bytes: sweep.bytes, scanned: sweep.scanned };
         });
         if (result.error) return res.status(400).json(result);
         logger.info(`[PurgeOrphans] removed ${result.deleted}/${result.scanned} assets (${result.bytes} bytes)`);
+        res.json(result);
+    } catch (err) { next(err); }
+});
+
+app.post('/api/db/assets/auto-sweep', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const includeAssets = req.body?.assets === true;
+        const result = await queueStorageOperation(async () => {
+            return computeAssetSweep({
+                includeAssets,
+                assetGraceMs: AUTO_SWEEP_GRACE_MS,
+                includeRemotes: true,
+                checkpointLabel: 'AutoSweep',
+            });
+        });
+        if (result.error) return res.status(400).json(result);
+        logger.info(`[AutoSweep] removed assets=${result.assetsDeleted}, remotes=${result.remotesDeleted}, scanned=${result.scanned}, bytes=${result.bytes}`);
         res.json(result);
     } catch (err) { next(err); }
 });
@@ -5771,7 +6674,7 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
 app.get('/api/db/snapshots', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const out = kvList(DB_BACKUP_PREFIX).map((key) => {
+        const out = listSnapshotKeys().map((key) => {
             const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
             const ts = Number.isFinite(tsRaw) ? tsRaw * 100 : null;
             // Logical size — the full data this snapshot represents (the whole DB),
@@ -5780,7 +6683,7 @@ app.get('/api/db/snapshots', async (req, res, next) => {
             // (kvSize reassembles via the manifest; the marker's 13 bytes are not
             // what a user wants to see for a full backup.) Trimming still sizes by
             // snapshotFootprint in db.cjs, so this display change can't over-trim.
-            return { key, size: kvSize(key) || 0, timestamp: ts };
+            return { key, size: (kvSize(key) || 0) + snapshotPluginBytes(key), timestamp: ts };
         }).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
         res.json({ snapshots: out });
     } catch (err) { next(err); }
@@ -5791,11 +6694,12 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         const key = typeof req.query?.key === 'string' ? req.query.key : '';
-        // Restrict to snapshot prefix — never let this endpoint touch other kv keys.
-        if (!key.startsWith(DB_BACKUP_PREFIX)) {
+        // Exact snapshot shape only — never let this endpoint touch other kv
+        // keys, nor derive a plugin snapshot id from a malformed name.
+        if (!isSnapshotKey(key)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
-        kvDel(key);
+        deleteSnapshot(key);
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -5809,7 +6713,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
-        if (!key.startsWith(DB_BACKUP_PREFIX)) {
+        if (!isSnapshotKey(key)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
         const blob = kvGet(key);
@@ -5821,7 +6725,13 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // /api/db/optimize. Without this, an in-flight save could land
             // after kvCopyValue and overwrite the restored snapshot.
             await flushPendingDb();
-            kvCopyValue(key, DB_BLOB_KEY);
+            // Blob and plugin rows come back together: the live plugin set is
+            // replaced by exactly the snapshot's (empty for a pre-split
+            // snapshot, whose data the decode below re-splits from the blob).
+            sqliteDb.transaction(() => {
+                kvCopyValue(key, DB_BLOB_KEY);
+                pluginStorage.restoreFrom(snapshotPluginId(key));
+            })();
             invalidateDbCache();
             // Snapshot may pre-date the remote-block migration. Clear the marker
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
@@ -6020,6 +6930,25 @@ app.get('/api/public-stats', async (req, res) => {
     }
 });
 
+// ── Supporters proxy (Patreon list via update worker) ───────────────────────
+const SUPPORTERS_URL = UPDATE_CHECK_URL.replace(/\/check$/, '/supporters');
+const SUPPORTER_NAME_URL = UPDATE_CHECK_URL.replace(/\/check$/, '/patreon/name');
+let supportersCache = { at: 0, data: null };
+app.get('/api/supporters', async (req, res) => {
+    if (UPDATE_CHECK_DISABLED) { res.json({ disabled: true, supporters: [], tiers: [] }); return; }
+    if (supportersCache.data && Date.now() - supportersCache.at < 60_000) { res.json(supportersCache.data); return; }
+    try {
+        const r = await fetch(SUPPORTERS_URL);
+        if (!r.ok) { res.status(r.status).json({ error: 'upstream error' }); return; }
+        const data = await r.json();
+        data.nameUrl = SUPPORTER_NAME_URL;
+        supportersCache = { at: Date.now(), data };
+        res.json(data);
+    } catch {
+        res.status(502).json({ error: 'fetch failed' });
+    }
+});
+
 // ── Update check endpoint ────────────────────────────────────────────────────
 app.get('/api/update-check', async (req, res) => {
     const currentVersion = getCurrentVersion();
@@ -6194,17 +7123,57 @@ app.post('/api/self-update', async (req, res) => {
         } catch { /* no user certs */ }
 
         // Keep set — matches updater.cjs + user data/config that must survive updates
-        const keep = new Set(['save', 'backups', 'model-cache', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
+        const keep = new Set(['save', 'backups', 'model-cache', '.installed-version', '.installed-manifest', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
         if (isWin) keep.add('bin');
+        const customBackupKeep = customBackupKeepEntry(appDir);
+        if (customBackupKeep && !keep.has(customBackupKeep)) {
+            console.log(`[Self-Update] Preserving custom backup directory: ${customBackupKeep}/`);
+            keep.add(customBackupKeep);
+        }
+
+        // Managed set — only entries the app shipped (new package contents ∪
+        // previously recorded manifest) may be removed. Anything else in the
+        // app root is a user file and must survive the update untouched.
+        const manifestPath = path.join(appDir, '.installed-manifest');
+        let oldManifest = [];
+        let hasOldManifest = false;
+        try {
+            oldManifest = (await fs.readFile(manifestPath, 'utf-8'))
+                .split('\n').map(s => s.trim()).filter(Boolean);
+            hasOldManifest = true;
+        } catch { /* pre-manifest install */ }
+        const newEntries = await fs.readdir(sourceDir);
+        const managed = new Set([...newEntries, ...oldManifest]);
+
+        // A user file whose name collides with an entry the new release
+        // introduces would be overwritten in Phase 2 — evacuate it to backups/
+        // instead of losing it. Only decidable when a previous manifest exists.
+        const isConflict = (e) => hasOldManifest
+            && !oldManifest.includes(e) && newEntries.includes(e);
+        const conflictDir = path.join(appDir, 'backups', `update-conflict-v${targetVersion}`);
+        // A retried update may have evacuated the same name before — never overwrite
+        const conflictDest = (e) => {
+            let dest = path.join(conflictDir, e);
+            for (let n = 1; existsSync(dest); n++) dest = path.join(conflictDir, `${e}.${n}`);
+            return dest;
+        };
 
         // Phase 1: move old files to backup — rollback immediately on any failure
         const backupDir = path.join(updateTmp, 'backup');
         await fs.mkdir(backupDir, { recursive: true });
 
+        const preserved = [];
         const oldEntries = await fs.readdir(appDir);
         for (const e of oldEntries) {
             if (keep.has(e)) continue;
+            if (!managed.has(e)) { preserved.push(e); continue; }
             try {
+                if (isConflict(e)) {
+                    console.log(`[Update] User file "${e}" collides with a new app file — moving it to backups/update-conflict-v${targetVersion}/`);
+                    await fs.mkdir(conflictDir, { recursive: true });
+                    await moveAcrossVolumes(path.join(appDir, e), conflictDest(e));
+                    continue;
+                }
                 await fs.rename(path.join(appDir, e), path.join(backupDir, e));
             } catch (backupErr) {
                 logger.error(`[Update] Failed to back up ${e}: ${backupErr.message}`);
@@ -6215,13 +7184,15 @@ app.post('/api/self-update', async (req, res) => {
                     : 'Update failed: some files are in use. Stop the server first, then try again.');
             }
         }
+        if (preserved.length) {
+            console.log(`[Update] Preserving user files: ${preserved.join(', ')}`);
+        }
 
         // Phase 2: move new files from extracted to app root
         const skipMove = new Set(['save', 'scripts', 'model-cache']);
         if (isWin) skipMove.add('bin');
         const moved = [];
         try {
-            const newEntries = await fs.readdir(sourceDir);
             for (const e of newEntries) {
                 if (skipMove.has(e)) continue;
                 const dest = path.join(appDir, e);
@@ -6256,6 +7227,10 @@ app.post('/api/self-update', async (req, res) => {
                 await fs.copyFile(path.join(newScripts, f), path.join(appDir, 'scripts', f));
             }
         } catch { /* no scripts in release */ }
+
+        // Record what this release shipped, so the next update knows which
+        // entries are app-managed and leaves everything else alone.
+        await fs.writeFile(manifestPath, newEntries.join('\n') + '\n').catch(() => {});
 
         // Phase 4 (Windows): stage bin/ for restart script to apply after exit
         if (isWin) {

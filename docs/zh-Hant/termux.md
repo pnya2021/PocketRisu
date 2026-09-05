@@ -8,7 +8,7 @@
 
 本指南介紹如何透過 Termux 在 Android 手機上直接建置並執行 PocketRisu。預期使用方式是在同一支手機的瀏覽器中開啟 `http://localhost:6001`。
 
-- [1. 準備工作](#1-準備工作) — F-Droid Termux 與系統需求
+- [1. 準備工作](#1-準備工作) — Termux 與系統需求
 - [2. 安裝與建置](#2-安裝與建置) — 一條命令完成
 - [3. 執行與連線](#3-執行與連線) — 從手機瀏覽器開啟
 - [4. 保持執行](#4-保持執行) — 螢幕關閉時也保持執行
@@ -32,17 +32,13 @@ PocketRisu 不為 Termux 提供預先編譯的二進位檔,因此由手機自行
 
 ## 1. 準備工作
 
-### 使用 F-Droid 或 GitHub Releases 版本的 Termux
-
-> ⚠️ **Play Store 版本的 Termux 無法使用。**
-> Termux 維護者已於 2020 年停止更新 Play Store 版本,無法再安裝 PocketRisu 所需的最新套件(Node.js 22+)。
+### 安裝 Termux
 
 請從以下任一來源安裝 Termux:
 
 - **F-Droid(建議)**: https://f-droid.org/packages/com.termux/
 - **GitHub Releases**: https://github.com/termux/termux-app/releases
-
-如果已經安裝了 Play Store 版本,請先解除安裝,然後從上述任一來源重新安裝。
+- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=zh-TW&pli=1
 
 
 ---

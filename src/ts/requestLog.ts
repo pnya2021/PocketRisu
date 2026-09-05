@@ -39,6 +39,7 @@ export interface RequestLogScopeInit {
     generationId?: string
     model?: string
     provider?: string
+    logPlugin?: string
     route?: RequestLogRoute
     streaming?: boolean
 }
@@ -102,12 +103,71 @@ export function requestLogEnabled(): boolean {
 
 // Inlined media turns a 300KB prompt into a multi-MB one and is worthless to
 // read back, so it is replaced before the body ever leaves the browser.
-function stripInlineMedia(body: string): string {
+export function stripInlineMedia(body: string): string {
     return body.replace(
         /"data:([a-z]+)\/([a-z0-9.+-]+);base64,[A-Za-z0-9+/=]+"/gi,
         (match, type: string, subtype: string) =>
             `"[${type}/${subtype}: ${Math.round(match.length * 0.75 / 1024)} KB omitted]"`,
     )
+}
+
+function numeric(value: unknown): number | undefined {
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+    return value && typeof value === 'object' ? value as Record<string, unknown> : undefined
+}
+
+export function extractLegacyUsage(response: unknown): RequestLogUsage | undefined {
+    const root = objectValue(response)
+    if (!root) return undefined
+
+    const usage = objectValue(root.usage)
+    if (usage) {
+        const promptTokens = numeric(usage.prompt_tokens)
+        const completionTokens = numeric(usage.completion_tokens)
+        if (promptTokens !== undefined || completionTokens !== undefined) {
+            const promptDetails = objectValue(usage.prompt_tokens_details)
+            const completionDetails = objectValue(usage.completion_tokens_details)
+            return {
+                inputTokens: promptTokens,
+                outputTokens: completionTokens,
+                cachedTokens: numeric(promptDetails?.cached_tokens),
+                reasoningTokens: numeric(completionDetails?.reasoning_tokens),
+            }
+        }
+
+        const inputTokens = numeric(usage.input_tokens)
+        const outputTokens = numeric(usage.output_tokens)
+        const cacheRead = numeric(usage.cache_read_input_tokens) ?? 0
+        const cacheCreation = numeric(usage.cache_creation_input_tokens) ?? 0
+        if (inputTokens !== undefined || outputTokens !== undefined || cacheRead > 0 || cacheCreation > 0) {
+            return {
+                inputTokens: (inputTokens ?? 0) + cacheRead + cacheCreation,
+                outputTokens,
+                cachedTokens: cacheRead,
+            }
+        }
+    }
+
+    const usageMetadata = objectValue(root.usageMetadata)
+    if (usageMetadata) {
+        const inputTokens = numeric(usageMetadata.promptTokenCount)
+        const outputTokens = numeric(usageMetadata.candidatesTokenCount)
+        const cachedTokens = numeric(usageMetadata.cachedContentTokenCount)
+        const reasoningTokens = numeric(usageMetadata.thoughtsTokenCount)
+        if (
+            inputTokens !== undefined
+            || outputTokens !== undefined
+            || cachedTokens !== undefined
+            || reasoningTokens !== undefined
+        ) {
+            return { inputTokens, outputTokens, cachedTokens, reasoningTokens }
+        }
+    }
+
+    return undefined
 }
 
 function bodyToString(body: unknown): string | undefined {
@@ -305,6 +365,7 @@ export interface RequestLogStorageStats {
     requestBytes: number
     usageCount: number
     maxTotalBytes: number
+    maxPluginBytes: number
 }
 
 export async function fetchRequestLogStats(): Promise<RequestLogStorageStats | null> {
@@ -372,7 +433,8 @@ export function createRequestLogScope(init: RequestLogScopeInit): RequestLogScop
                 chatId: init.chatId,
                 generationId: init.generationId,
                 model: init.model,
-                provider: init.provider,
+                // A plugin's own fetch is attributed to the plugin, not a vendor.
+                provider: init.logPlugin ?? init.provider,
                 url,
                 method: reqInit?.method ?? 'POST',
                 success: false,
@@ -486,7 +548,10 @@ export function createRequestLogScope(init: RequestLogScopeInit): RequestLogScop
             // Image providers return base64 payloads inside JSON, so the same
             // stripping the request body gets applies here — otherwise a single
             // generated image would occupy megabytes of the byte budget.
-            const stripped = stripInlineMedia(text)
+            // OpenRouter pads a non-streaming response with kilobytes of
+            // keep-alive whitespace before the JSON; kept verbatim it fills the
+            // viewer's response box with blank lines and looks like no response.
+            const stripped = stripInlineMedia(text.trimStart())
             entry.responseBody = overflowed ? stripped + '\n...[truncated by client]' : stripped
             entry.durationMs = Date.now() - started
         }

@@ -78,15 +78,57 @@ EXTRACTED_DIR=$(find "$TMP_DIR" -maxdepth 1 -type d \
     -print -quit)
 [ -d "$EXTRACTED_DIR" ] || error "Extraction failed."
 
-# ── Replace files (preserve save/) ─────────────────────────────────────────────
+# ── Replace files (preserve save/ and user files) ──────────────────────────────
 
 info "Updating files..."
 
-# Remove old app files but keep save/ and backups/
-find "$SCRIPT_DIR" -mindepth 1 -maxdepth 1 ! -name 'save' ! -name 'backups' ! -name '.installed-version' -exec rm -rf {} +
+# Only entries the app shipped may be removed: entries present in the new
+# package, plus entries recorded in .installed-manifest (shipped by a previous
+# release but since removed). Anything else is a user file — leave it alone.
+MANIFEST_FILE="$SCRIPT_DIR/.installed-manifest"
+is_managed() {
+    [ -e "$EXTRACTED_DIR/$1" ] && return 0
+    in_manifest "$1" && return 0
+    return 1
+}
+in_manifest() {
+    [ -f "$MANIFEST_FILE" ] && grep -Fxq "$1" "$MANIFEST_FILE"
+}
+# A user file whose name collides with an entry the new release introduces
+# would be overwritten below — evacuate it to backups/ instead of losing it.
+# Only decidable when a previous manifest exists.
+CONFLICT_DIR="$SCRIPT_DIR/backups/update-conflict-$LATEST"
+
+# Capture the new package's top-level listing before entries are moved out
+ls -A "$EXTRACTED_DIR" > "$TMP_DIR/new-manifest"
+
+while IFS= read -r -d '' entry; do
+    name=$(basename "$entry")
+    case "$name" in
+        save|backups|.installed-version|.installed-manifest) continue ;;
+    esac
+    if ! is_managed "$name"; then
+        info "Preserving user file: $name"
+        continue
+    fi
+    if [ -f "$MANIFEST_FILE" ] && ! in_manifest "$name" && [ -e "$EXTRACTED_DIR/$name" ]; then
+        warn "User file \"$name\" collides with a new app file — moving it to backups/update-conflict-$LATEST/"
+        mkdir -p "$CONFLICT_DIR"
+        # A retried update may have evacuated the same name before — never overwrite
+        dest="$CONFLICT_DIR/$name"
+        i=1
+        while [ -e "$dest" ]; do dest="$CONFLICT_DIR/$name.$i"; i=$((i+1)); done
+        mv "$entry" "$dest"
+        continue
+    fi
+    rm -rf "$entry"
+done < <(find "$SCRIPT_DIR" -mindepth 1 -maxdepth 1 -print0)
 
 # Move new files in
 mv "$EXTRACTED_DIR"/* "$EXTRACTED_DIR"/.[!.]* "$SCRIPT_DIR/" 2>/dev/null || true
+
+# Record what this release shipped for the next update's managed-entry check
+cp "$TMP_DIR/new-manifest" "$MANIFEST_FILE"
 
 # Restore save/
 if [ -d "$TMP_DIR/_save_backup" ]; then

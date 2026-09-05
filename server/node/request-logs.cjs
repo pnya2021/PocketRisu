@@ -32,6 +32,7 @@ const { maskSensitive } = require('./logs.cjs');
 // prompt size. MIN_ROWS guarantees the most recent requests survive even if
 // each one alone exceeds the budget.
 const MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+const MAX_PLUGIN_BYTES = 32 * 1024 * 1024;
 const MIN_ROWS = 50;
 // Per-entry cap. ~2MB is well past the largest real prompt (a 200k-token
 // context is ~800KB of JSON), so truncation only fires on genuinely abnormal
@@ -239,6 +240,7 @@ function createRequestLogs(opts = {}) {
     db.pragma('auto_vacuum = INCREMENTAL');
 
     const maxTotalBytes = opts.maxTotalBytes ?? MAX_TOTAL_BYTES;
+    const maxPluginBytes = opts.maxPluginBytes ?? MAX_PLUGIN_BYTES;
     const minRows = opts.minRows ?? MIN_ROWS;
     const rotateEvery = opts.rotateEveryNRows ?? ROTATE_EVERY_N_ROWS;
 
@@ -342,6 +344,18 @@ function createRequestLogs(opts = {}) {
         )
     `);
 
+    const stmtRotatePlugin = db.prepare(`
+        DELETE FROM requests WHERE id IN (
+            SELECT id FROM (
+                SELECT id,
+                       SUM(size_bytes) OVER (ORDER BY id DESC) AS running
+                FROM requests
+                WHERE source = 'plugin'
+            )
+            WHERE running > ?
+        )
+    `);
+
     const insertMany = db.transaction((rows) => {
         for (const row of rows) {
             stmtInsertRequest.run(row);
@@ -394,6 +408,7 @@ function createRequestLogs(opts = {}) {
 
     function rotateNow() {
         insertedSinceRotate = 0;
+        stmtRotatePlugin.run(maxPluginBytes);
         stmtRotate.run(maxTotalBytes, minRows);
         reclaimFreePages();
     }
@@ -523,6 +538,7 @@ function createRequestLogs(opts = {}) {
             requestBytes: req.bytes,
             usageCount: usg.n,
             maxTotalBytes,
+            maxPluginBytes,
         };
     }
 
@@ -671,6 +687,7 @@ module.exports = {
     ROUTES,
     MAX_BODY_BYTES,
     MAX_TOTAL_BYTES,
+    MAX_PLUGIN_BYTES,
     MIN_ROWS,
     truncateBody,
     truncateTail,

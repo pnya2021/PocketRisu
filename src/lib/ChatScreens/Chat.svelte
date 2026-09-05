@@ -1,7 +1,9 @@
 <script lang="ts">
+    import { reissueMessageIds } from "src/ts/chatClone";
     import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors, EyeOff } from "@lucide/svelte"
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme"
+    import { MediaQuery } from "svelte/reactivity"
     import { getModelInfo } from "src/ts/model/modellist"
     import { runLuaButtonTrigger } from 'src/ts/process/scriptings'
     import { risuChatParser } from "src/ts/process/scripts"
@@ -25,6 +27,9 @@
     import PopupButton from "../UI/PopupButton.svelte";
     import PartialEditController from './PartialEditController.svelte';
 
+    // Reactive breakpoint: a raw window.innerWidth read here is evaluated once
+    // at mount and never follows a resize (#79).
+    const wide640 = new MediaQuery('(min-width: 640px)')
     let translating = $state(false)
     let editMode = $state(false)
     let statusMessage:string = $state('')
@@ -491,7 +496,7 @@
             <span class="text-xs">{statusMessage}</span>
             <div class="flex items-center ml-2 gap-2 flex-wrap justify-end">
                 {@render translationButton()}
-                {#if window.innerWidth >= 640}
+                {#if wide640.current}
                     {@render majorIconButtonsBody(false)}
                     {#if DBState.db.characters[selIdState.selId] && idx > -1}
                         <PopupButton>
@@ -533,6 +538,7 @@
 {#snippet majorIconButtonsBody(showNames:boolean)}
     {#if !blankMessage}
     <button class="flex items-center hover:text-primary transition-colors button-icon-copy" onclick={async ()=>{
+        await sleep(1)
         const copyText = renderRawStreaming
             ? risuChatParser(rawStreamingText, {chara: name, chatID: idx, rmVar: true, visualize: true, cbsConditions: getCbsCondition()})
             : msgDisplay
@@ -766,7 +772,8 @@
 {/if}
 {#if idx > -1}
     {#if DBState.db.characters[selIdState.selId].ttsMode !== 'none' && (DBState.db.characters[selIdState.selId].ttsMode)}
-        <button class="flex items-center hover:text-primary transition-colors button-icon-tts" onclick={()=>{
+        <button class="flex items-center hover:text-primary transition-colors button-icon-tts" onclick={async () => {
+            await sleep(1)
             return sayTTS(null, isOptimizedStreamingMessage ? rawStreamingText : message)
         }}>
             <Volume2Icon size={20}/>
@@ -775,7 +782,10 @@
             {/if}
         </button>
     {/if}
-    <button class="flex items-center hover:text-red-400 transition-colors button-icon-remove" onclick={rm}>
+    <button class="flex items-center hover:text-red-400 transition-colors button-icon-remove" onclick={async () => {
+        await sleep(1)
+        rm()
+    }}>
         <TrashIcon size={20}/>
 
         {#if showNames}
@@ -788,6 +798,7 @@
 {#snippet translationButton(showNames = false)}
     {#if DBState.db.translator !== '' && !blankMessage && !isOptimizedStreamingMessage}
         <button class={"flex items-center cursor-pointer hover:text-primary transition-colors button-icon-translate " + (translated ? 'text-blue-400':'')} class:translating={translating} onclick={async () => {
+            await sleep(1)
             translated = !translated
         }}>
             <LanguagesIcon />
@@ -797,7 +808,8 @@
         </button>
     {/if}
     {#if idx > -1 && !isOptimizedStreamingMessage}
-        <button class={"flex items-center hover:text-primary transition-colors button-icon-edit "+(editMode?'text-blue-400':'')} onclick={() => {
+        <button class={"flex items-center hover:text-primary transition-colors button-icon-edit "+(editMode?'text-blue-400':'')} onclick={async () => {
+            await sleep(1)
             if(!editMode){
                 editMode = true
             }
@@ -819,18 +831,25 @@
     {#if (rerollIcon || altGreeting) && role !== 'user'}
         {#if altGreeting}
             <!-- First message: ← counter → -->
-            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-unreroll" onclick={unReroll}>
+            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-unreroll" onclick={async () => {
+                await sleep(1)
+                unReroll()
+            }}>
                 <ArrowLeft size={22}/>
             </button>
             {#if !DBState.db.hideMessagePageCount}
                 <span class="flex items-center text-xs text-textcolor2 shrink overflow-hidden whitespace-nowrap min-w-0">{currentPage}/{totalPages}</span>
             {/if}
-            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" onclick={onReroll}>
+            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" onclick={async () => {
+                await sleep(1)
+                onReroll()
+            }}>
                 <ArrowRight size={22}/>
             </button>
         {:else}
             <!-- Normal messages: ← counter → ↻ -->
             <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-unreroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} onclick={async () => {
+                await sleep(1)
                 if (totalPages <= 1) {
                     if (!DBState.db.confirmReroll || await alertConfirm(language.noSwipesRerollConfirm)) onReroll()
                 } else {
@@ -843,6 +862,7 @@
                 <span class="flex items-center text-xs text-textcolor2 shrink overflow-hidden whitespace-nowrap min-w-0" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'}>{currentPage}/{totalPages}</span>
             {/if}
             <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} onclick={async () => {
+                await sleep(1)
                 if (totalPages <= 1) {
                     if (!DBState.db.confirmReroll || await alertConfirm(language.noSwipesRerollConfirm)) onReroll()
                 } else {
@@ -852,6 +872,7 @@
                 <ArrowRight size={22}/>
             </button>
             <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} onclick={async () => {
+                await sleep(1)
                 if (!DBState.db.confirmReroll || await alertConfirm(language.rerollConfirm)) onReroll()
             }}>
                 <RefreshCcwIcon size={20}/>
@@ -908,6 +929,8 @@
         newChat.name = createChatCopyName(newChat.name, 'Branch')
         newChat.id = v4()
         newChat.message = newChat.message.slice(0, idx + 1)
+        // Own message ids for the branch; drops summaries/bookmarks that point past the cut
+        reissueMessageIds(newChat, currentChat.message.map(m => m.chatId))
         newChat.message.push({
             role: 'char',
             data: '{{specialcomment::branchedfrom::' + currentChat.id + '::' + currentChat.name + '::' + currentMessage.chatId + '::}}',

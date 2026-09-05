@@ -2,8 +2,8 @@
     import { DBState, selectedCharID } from "src/ts/stores.svelte";
     import { language } from "src/lang";
     import { getCurrentChat } from "src/ts/storage/database.svelte";
-    import { alertConfirmMulti, alertSelect, notifySuccess } from "src/ts/alert";
-    import { PinIcon, PinOffIcon } from "@lucide/svelte";
+    import { notifySuccess } from "src/ts/alert";
+    import { ContactIcon } from "@lucide/svelte";
     import { openPersonaList, personaSelectCallback } from "src/ts/stores.svelte";
     import { v4 } from "uuid";
     import ShButton from "../UI/GUI/ShButton.svelte";
@@ -34,34 +34,14 @@
         notifySuccess(language.personaUnbindedSuccess)
     }
 
-    async function handlePersonaBindClick() {
-        if (isPersonaBound) {
-            const sel = await alertConfirmMulti(
-                language.personaBindingLabel,
-                [
-                    language.personaBindChange,
-                    { label: language.personaBindUnbind, variant: 'destructive' },
-                ]
-            )
-            if (sel === 0) {
-                personaSelectCallback.set(bindPersona)
-                openPersonaList.set(true)
-            } else if (sel === 1) {
-                unbindPersona()
-            }
-        } else {
-            const sel = parseInt(await alertSelect([
-                language.personaBindCurrent,
-                language.personaSelectOther,
-                language.cancel
-            ]))
-            if (sel === 0) {
-                bindPersona(DBState.db.selectedPersona)
-            } else if (sel === 1) {
-                personaSelectCallback.set(bindPersona)
-                openPersonaList.set(true)
-            }
-        }
+    // One tap opens the picker. Its top row ("default") unbinds; any persona
+    // binds — same flow as the memory preset binding.
+    function handlePersonaBindClick() {
+        personaSelectCallback.set((index) => {
+            if (index < 0) unbindPersona()
+            else bindPersona(index)
+        })
+        openPersonaList.set(true)
     }
 </script>
 
@@ -73,12 +53,8 @@
             : 'text-textcolor2 opacity-75 hover:opacity-100'}`}
         onclick={handlePersonaBindClick}
     >
-        {#if isPersonaBound}
-            <PinIcon size={16} class="shrink-0" />
-        {:else}
-            <PinOffIcon size={16} class="shrink-0" />
-        {/if}
-        <span class="truncate">{displayPersona?.name ?? 'User'}</span>
+        <ContactIcon size={16} class="shrink-0" />
+        <span class="truncate">{isPersonaBound ? (displayPersona?.name ?? 'User') : `${language.memoryPresetInherit} (${displayPersona?.name ?? 'User'})`}</span>
         {#if displayPersona?.note}
             <span class="truncate text-xs opacity-60">({displayPersona.note})</span>
         {/if}

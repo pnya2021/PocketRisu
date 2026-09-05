@@ -1,16 +1,18 @@
 <script lang="ts">
     import { language } from "src/lang";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
-    
+
     import { DBState } from 'src/ts/stores.svelte';
     import Button from "src/lib/UI/GUI/Button.svelte";
+    import ShButton from "src/lib/UI/GUI/ShButton.svelte";
+    import ShDropdownMenuItem from "src/lib/UI/GUI/ShDropdownMenuItem.svelte";
+    import FolderedList, { type FolderedItemPlacement } from "src/lib/UI/FolderedList.svelte";
     import ModuleMenu from "src/lib/Setting/Pages/Module/ModuleMenu.svelte";
-    import { exportModule, importModule, refreshModules, type RisuModule } from "src/ts/process/modules";
-    import { SquarePen, TrashIcon, Globe, Share2Icon, PlusIcon, HardDriveUpload, Waypoints } from "@lucide/svelte";
+    import { exportModule, exportModuleLegacy, hydrateModuleAssets, importModule, refreshModules, type RisuModule } from "src/ts/process/modules";
+    import { SquarePen, Globe, Share2Icon, PlusIcon, HardDriveUpload, Waypoints } from "@lucide/svelte";
     import { v4 } from "uuid";
     import { tooltip } from "src/ts/gui/tooltip";
-    import { alertConfirm, notifySuccess } from "src/ts/alert";
-    import TextInput from "src/lib/UI/GUI/TextInput.svelte";
+    import { alertConfirm, alertError, alertSelect, notifySuccess } from "src/ts/alert";
     import { onDestroy } from "svelte";
     import { importMCPModule } from "src/ts/process/mcp/mcp";
     import { convertModuleToCharacter } from "src/ts/interchangeability";
@@ -22,17 +24,61 @@
     })
     let mode = $state(0)
     let editModuleIndex = $state(-1)
-    let moduleSearch = $state('')
+    let converting = $state(false)
 
-    function sortModules(modules:RisuModule[], search:string){
-        return modules.filter((v) => {
-            if(search === '') return true
-            return v.name.toLowerCase().includes(search.toLowerCase())
-        
-        }).sort((a, b) => {
-            let score = a.name.toLowerCase().localeCompare(b.name.toLowerCase())
-            return score
-        })
+    function isGlobal(rmodule: RisuModule) {
+        return DBState.db.enabledModules.includes(rmodule.id)
+    }
+
+    function isIntegrated(rmodule: RisuModule) {
+        return !!rmodule.namespace
+            && !!DBState.db.moduleIntergration?.split(',').map((s) => s.trim()).includes(rmodule.namespace)
+    }
+
+    function toggleGlobal(rmodule: RisuModule) {
+        if (isGlobal(rmodule)) {
+            DBState.db.enabledModules.splice(DBState.db.enabledModules.indexOf(rmodule.id), 1)
+        } else {
+            DBState.db.enabledModules.push(rmodule.id)
+        }
+        DBState.db.enabledModules = DBState.db.enabledModules
+    }
+
+    function openEditor(index: number) {
+        const rmodule = DBState.db.modules[index]
+        if (!rmodule || rmodule.mcp) return
+        tempModule = rmodule
+        editModuleIndex = index
+        mode = 2
+    }
+
+    async function exportModuleAt(index: number) {
+        const rmodule = DBState.db.modules[index]
+        if (!rmodule || rmodule.mcp) return
+        const sel = parseInt(await alertSelect([`CharX (${language.recommended})`, `RisuM (Legacy)`]))
+        if (sel === 0) exportModule(rmodule)
+        else exportModuleLegacy(rmodule)
+    }
+
+    async function removeModule(index: number) {
+        const rmodule = DBState.db.modules[index]
+        if (!rmodule) return
+        const d = await alertConfirm(`${language.removeConfirm}` + rmodule.name)
+        if (!d) return
+        if (isGlobal(rmodule)) {
+            DBState.db.enabledModules.splice(DBState.db.enabledModules.indexOf(rmodule.id), 1)
+            DBState.db.enabledModules = DBState.db.enabledModules
+        }
+        DBState.db.modules = DBState.db.modules.filter((_, i) => i !== index)
+        notifySuccess(language.moduleDeleted)
+    }
+
+    /** Rebuilds `db.modules` from the folder list's reported order/membership. Ids are untouched. */
+    function applyPlacements(placements: FolderedItemPlacement[]) {
+        const modules = DBState.db.modules
+        const next = placements.map(({ index, folderId }) => ({ ...modules[index], folderId }))
+        if (next.length !== modules.length) return
+        DBState.db.modules = next
     }
 
     onDestroy(() => {
@@ -42,111 +88,50 @@
 {#if mode === 0}
     <SettingPage title={language.modules}>
 
-    <div class="mt-4 flex gap-2 items-center">
-        <TextInput className="grow" placeholder={language.search} bind:value={moduleSearch} />
-        <button class="text-textcolor2 hover:text-primary cursor-pointer" onclick={async () => {
-            tempModule = {
-                name: '',
-                description: '',
-                id: v4(),
-            }
-            mode = 1
-        }}>
-            <PlusIcon />
-        </button>
-        <button class="text-textcolor2 hover:text-primary cursor-pointer" onclick={async () => {
-            importMCPModule()
-        }}>
-            <Waypoints />
-        </button>
-        <button class="text-textcolor2 hover:text-primary cursor-pointer" onclick={async () => {
-            importModule()
-        }}>
-            <HardDriveUpload  />
-        </button>
-    </div>
-
-    <div class="contain w-full max-w-full mt-4 flex flex-col border-selected border-1 rounded-md flex-1 overflow-y-auto">
-        {#if DBState.db.modules.length === 0}
-            <div class="text-textcolor2 p-3">{language.noModules}</div>
-        {:else}
-            {#each sortModules(DBState.db.modules, moduleSearch) as rmodule, i}
-                {#if i !== 0}
-                    <div class="border-t-1 border-selected"></div>
-                {/if}
-
-                <div class="pl-3 pt-3 text-left flex items-center">
-                    {#if rmodule.mcp}
-                        <Waypoints size={18} class="mr-2" />
-                    {/if}
-                    <span class="font-bold">{rmodule.name}</span>
-                    <div class="grow flex justify-end">
-                        <button class={(DBState.db.enabledModules.includes(rmodule.id)) ?
-                                "mr-2 cursor-pointer text-blue-500" :
-                                rmodule.namespace && 
-                                DBState.db.moduleIntergration?.split(',').map((s) => s.trim()).includes(rmodule.namespace) ?
-                                "text-amber-500 hover:text-primary mr-2 cursor-pointer" :
-                                "text-textcolor2 hover:text-primary mr-2 cursor-pointer"
-                            } use:tooltip={language.enableGlobal} onclick={async (e) => {
-                            e.stopPropagation()
-                            if(DBState.db.enabledModules.includes(rmodule.id)){
-                                DBState.db.enabledModules.splice(DBState.db.enabledModules.indexOf(rmodule.id), 1)
-                            }
-                            else{
-                                DBState.db.enabledModules.push(rmodule.id)
-                            }
-                            DBState.db.enabledModules = DBState.db.enabledModules
-                        }}>
-                            <Globe size={18}/>
-                        </button>
-                        {#if !rmodule.mcp}
-                            <button class="text-textcolor2 hover:text-primary mr-2 cursor-pointer" use:tooltip={language.download} onclick={async (e) => {
-                                e.stopPropagation()
-                                exportModule(rmodule)
-                            }}>
-                                <Share2Icon size={18}/>
-                            </button>
-                            <button class="text-textcolor2 hover:text-primary mr-2 cursor-pointer" use:tooltip={language.edit} onclick={async (e) => {
-                                e.stopPropagation()
-                                const index = DBState.db.modules.findIndex((v) => v.id === rmodule.id)
-                                tempModule = rmodule
-                                editModuleIndex = index
-                                mode = 2
-                            }}>
-                                <SquarePen size={18}/>
-                            </button>
-                        {:else}
-                            <button class="text-textcolor2 mr-2 cursor-not-allowed">
-                                <Share2Icon size={18}/>
-                            </button>
-                            <button class="text-textcolor2 mr-2 cursor-not-allowed">
-                                <SquarePen size={18}/>
-                            </button>
-                        {/if}
-                        <button class="text-textcolor2 hover:text-red-400 mr-2 cursor-pointer" use:tooltip={language.remove} onclick={async (e) => {
-                            e.stopPropagation()
-                            const d = await alertConfirm(`${language.removeConfirm}` + rmodule.name)
-                            if(d){
-                                if(DBState.db.enabledModules.includes(rmodule.id)){
-                                    DBState.db.enabledModules.splice(DBState.db.enabledModules.indexOf(rmodule.id), 1)
-                                    DBState.db.enabledModules = DBState.db.enabledModules
-                                }
-                                const index = DBState.db.modules.findIndex((v) => v.id === rmodule.id)
-                                DBState.db.modules.splice(index, 1)
-                                DBState.db.modules = DBState.db.modules
-                                notifySuccess(language.moduleDeleted)
-                            }
-                        }}>
-                            <TrashIcon size={18}/>
-                        </button>
-                    </div>
-                </div>
-                <div class="mt-1 mb-3 pl-3">
-                    <span class="text-sm text-textcolor2">{rmodule.description || 'No description provided'}</span>
-                </div>
-            {/each}
-        {/if}
-    </div>
+    <FolderedList
+        folders={DBState.db.moduleFolders ?? []}
+        itemFolderIds={DBState.db.modules.map(m => m.folderId)}
+        itemSearchTexts={DBState.db.modules.map(m => `${m.name}\n${m.description ?? ''}`)}
+        storageKey="risu-module-folders-collapsed"
+        onSelect={openEditor}
+        onItemsChange={applyPlacements}
+        onFoldersChange={(next) => { DBState.db.moduleFolders = next }}
+        onDelete={removeModule}
+    >
+        {#snippet actions()}
+            <ShButton size="sm" onclick={() => {
+                tempModule = { name: '', description: '', id: v4() }
+                mode = 1
+            }}><PlusIcon />{language.createModule}</ShButton>
+            <ShButton size="sm" variant="outline" onclick={() => importModule()}><HardDriveUpload />{language.importModule}</ShButton>
+            <ShButton size="sm" variant="outline" onclick={() => importMCPModule()} title="MCP"><Waypoints /></ShButton>
+        {/snippet}
+        {#snippet itemContent(index)}
+            {@const rmodule = DBState.db.modules[index]}
+            {#if rmodule.mcp}
+                <Waypoints size={18} class="shrink-0 text-textcolor2" />
+            {/if}
+            <div class="flex flex-col min-w-0 grow">
+                <span class="text-textcolor truncate">{rmodule.name}</span>
+                <span class="text-xs text-textcolor2 truncate">{rmodule.description || 'No description provided'}</span>
+            </div>
+            <button class="no-sort shrink-0 p-1 cursor-pointer {isGlobal(rmodule) ? 'text-blue-500' : isIntegrated(rmodule) ? 'text-amber-500 hover:text-primary' : 'text-textcolor2 hover:text-primary'}"
+                use:tooltip={language.enableGlobal}
+                onclick={(e) => { e.stopPropagation(); toggleGlobal(rmodule) }}>
+                <Globe size={18}/>
+            </button>
+        {/snippet}
+        {#snippet itemMenu(index)}
+            {@const rmodule = DBState.db.modules[index]}
+            {#if !rmodule.mcp}
+                <ShDropdownMenuItem onSelect={() => openEditor(index)}><SquarePen /><span>{language.edit}</span></ShDropdownMenuItem>
+                <ShDropdownMenuItem onSelect={() => exportModuleAt(index)}><Share2Icon /><span>{language.download}</span></ShDropdownMenuItem>
+            {/if}
+        {/snippet}
+    </FolderedList>
+    {#if DBState.db.modules.length === 0}
+        <div class="text-textcolor2 p-3">{language.noModules}</div>
+    {/if}
 
     </SettingPage>
 {:else if mode === 1}
@@ -167,11 +152,24 @@
             notifySuccess(language.moduleUpdated)
             mode = 0
         }}>{language.editModule}</Button>
-        <Button className="mt-2" onclick={() => {
-            const char = convertModuleToCharacter(tempModule)
-            DBState.db.characters.push(char)
-            checkCharOrder()
-            notifySuccess(language.successfullyConverted)
+        <Button className="mt-2" disabled={converting} onclick={async () => {
+            if(converting){
+                return
+            }
+            converting = true
+            try {
+                // Hydrate first: copying the descriptor would make the new
+                // character share the module's manifest, so editing one would
+                // change the other until the next reload.
+                const char = convertModuleToCharacter(await hydrateModuleAssets(tempModule))
+                DBState.db.characters.push(char)
+                checkCharOrder()
+                notifySuccess(language.successfullyConverted)
+            } catch (error) {
+                alertError(`${error}`)
+            } finally {
+                converting = false
+            }
         }}>{language.convertToCharacter}</Button>
     {/if}
     </SettingPage>

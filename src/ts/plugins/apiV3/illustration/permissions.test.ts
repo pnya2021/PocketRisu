@@ -72,7 +72,7 @@ describe('principal permission service', () => {
         expect(queue.current()).toBeNull()
     })
 
-    it('preserves three-day periodic reconfirmation without coalescing an explicit reconfirm', async () => {
+    it('keeps periodic grants permanent while still requiring explicit reconfirmation', async () => {
         let now = 1_000
         service = new PluginPermissionService(persistence, queue, { now: () => now })
         const initial = service.request(context, 'db')
@@ -84,12 +84,10 @@ describe('principal permission service', () => {
         await expect(service.request(context, 'db', { reconfirm: 'periodically' })).resolves.toBe(true)
         expect(queue.current()).toBeNull()
 
-        now += 1
-        const periodic = service.request(context, 'db', { reconfirm: 'periodically' })
+        now += 365 * 24 * 60 * 60 * 1000
+        await expect(service.request(context, 'db', { reconfirm: 'periodically' })).resolves.toBe(true)
+        expect(queue.current()).toBeNull()
         const explicit = service.request(context, 'db', { reconfirm: true })
-        await queue.whenPresented()
-        decideCurrent(queue, true)
-        await periodic
         await queue.whenPresented()
         decideCurrent(queue, true)
         await explicit

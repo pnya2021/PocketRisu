@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { onMount } from 'svelte'
     import ShButton from 'src/lib/UI/GUI/ShButton.svelte'
     import ShInput from 'src/lib/UI/GUI/ShInput.svelte'
     import ShBadge from 'src/lib/UI/GUI/ShBadge.svelte'
@@ -25,14 +26,14 @@
     } from 'src/ts/requestLog'
 
     const PAGE_SIZE = 50
+    const FILTER_STORAGE_KEY = 'risu-request-log-filters'
 
-    // Every category is stored, but the log is overwhelmingly about model
-    // requests, so the default view shows those and the rest is one click away.
     const CATEGORIES: RequestLogCategory[] = ['llm', 'tts', 'image', 'translate', 'embedding', 'other']
     const SOURCES: RequestLogSource[] = [
         'main', 'translate', 'memory', 'emotion', 'sub',
         'preview', 'test', 'tts', 'image', 'plugin', 'other',
     ]
+    type ResultFilter = 'all' | 'success' | 'failed'
 
     const categoryLabel: Record<RequestLogCategory, string> = {
         llm: language.requestLogsCategoryLlm,
@@ -69,14 +70,14 @@
     let loadError = $state<string | null>(null)
     let storage = $state<{ used: number, max: number } | null>(null)
 
-    // Selected filters (inclusive, unlike the system log's subtractive model:
-    // here the useful default is a narrow view — LLM only — rather than
-    // everything minus a few).
-    let selectedCategories = $state<Set<RequestLogCategory>>(new Set(['llm']))
+    // Selected filters are inclusive; the default category set is all request
+    // categories, which is equivalent to no category filter.
+    let selectedCategories = $state<Set<RequestLogCategory>>(new Set(CATEGORIES))
     let selectedSources = $state<Set<RequestLogSource>>(new Set())
-    let resultFilter = $state<'all' | 'success' | 'failed'>('all')
+    let resultFilter = $state<ResultFilter>('all')
     let search = $state('')
     let filtersOpen = $state(false)
+    let filtersReady = $state(false)
 
     // Bodies are fetched per row on expand, keeping the list payload small.
     let expanded = $state<Record<number, boolean>>({})
@@ -96,14 +97,56 @@
     const toggleCategory = (k: RequestLogCategory) => { selectedCategories = toggleSet(selectedCategories, k) }
     const toggleSource = (k: RequestLogSource) => { selectedSources = toggleSet(selectedSources, k) }
     const clearAllFilters = () => {
-        selectedCategories = new Set(['llm'])
+        selectedCategories = new Set(CATEGORIES)
         selectedSources = new Set()
         resultFilter = 'all'
         search = ''
     }
 
+    function knownValues<T extends string>(values: unknown, allowed: readonly T[]): T[] {
+        if (!Array.isArray(values)) return []
+        const allowedSet = new Set(allowed)
+        return values.filter((value): value is T => typeof value === 'string' && allowedSet.has(value as T))
+    }
+
+    function isAllCategoriesSelected(): boolean {
+        return selectedCategories.size === CATEGORIES.length && CATEGORIES.every(cat => selectedCategories.has(cat))
+    }
+
+    function restoreFilters() {
+        try {
+            const raw = localStorage.getItem(FILTER_STORAGE_KEY)
+            if (!raw) return
+            const parsed = JSON.parse(raw) as Record<string, unknown>
+            if (!parsed || typeof parsed !== 'object') return
+
+            const categories = knownValues(parsed.categories, CATEGORIES)
+            selectedCategories = new Set(categories.length > 0 ? categories : CATEGORIES)
+            selectedSources = new Set(knownValues(parsed.sources, SOURCES))
+            resultFilter = parsed.result === 'success' || parsed.result === 'failed' || parsed.result === 'all'
+                ? parsed.result
+                : 'all'
+        } catch {
+            selectedCategories = new Set(CATEGORIES)
+            selectedSources = new Set()
+            resultFilter = 'all'
+        }
+    }
+
+    function persistFilters() {
+        try {
+            localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify({
+                categories: Array.from(selectedCategories),
+                sources: Array.from(selectedSources),
+                result: resultFilter,
+            }))
+        } catch {
+            // localStorage can throw in private/storage-disabled contexts.
+        }
+    }
+
     const activeFilterCount = $derived(
-        (selectedCategories.size === 1 && selectedCategories.has('llm') ? 0 : 1)
+        (isAllCategoriesSelected() ? 0 : 1)
         + (selectedSources.size > 0 ? 1 : 0)
         + (resultFilter !== 'all' ? 1 : 0),
     )
@@ -253,7 +296,18 @@
         return `${(e.inputTokens ?? 0).toLocaleString()} → ${(e.outputTokens ?? 0).toLocaleString()}`
     }
 
+    onMount(() => {
+        restoreFilters()
+        filtersReady = true
+    })
+
     $effect(() => {
+        if (!filtersReady) return
+        persistFilters()
+    })
+
+    $effect(() => {
+        if (!filtersReady) return
         // Re-runs when any filter changes; search is intentionally not a dep.
         void serverFilter
         loadInitial()
@@ -426,6 +480,12 @@
                         <ShBadge variant="outline" className="shrink-0 hidden md:inline-flex">
                             {sourceLabel[entry.source] ?? entry.source}
                         </ShBadge>
+
+                        {#if entry.source === 'plugin' && entry.provider}
+                            <ShBadge variant="secondary" className="shrink-0">
+                                {entry.provider}
+                            </ShBadge>
+                        {/if}
 
                         {#if entry.route === 'job'}
                             <ShBadge variant="secondary" className="shrink-0">

@@ -126,6 +126,95 @@ function dependencies(overrides: Partial<PocketContextAdapterDependencies> = {})
 }
 
 describe('Pocket context resource adapter', () => {
+    it('keeps portrait-only reads available when additional manifest storage is offline', async () => {
+        const card = makeCharacter({ additionalAssets: undefined,
+            additionalAssetManifest: { id: 'card', version: 1, count: 1, sha256: 'card' } })
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [card], modules: [] }),
+            getCurrentCharacter: () => card,
+            loadAssetManifestItems: async () => { throw new Error('offline') },
+        }))
+        const input: ContextAssetCollectionInput = { characterIds: ['char-1'],
+            conversationId: 'conversation-1', moduleScope: 'none', moduleIds: [], include: ['portrait'], mediaTypes: [] }
+        const capture = await adapter.captureAssetSources!(input)
+        expect(capture.assets.map(({ source }) => source.storageKey)).toEqual(['assets/alice.png'])
+        await expect(adapter.revalidateAssetSource!({ input, located: capture.assets[0] }))
+            .resolves.toMatchObject({ storageKey: 'assets/alice.png' })
+        await expect(adapter.revalidateAssetCollection!({ input, selectors: capture.selectors, sources: capture.assets }))
+            .resolves.toBeUndefined()
+    })
+
+    it('loads lazy module counts only after permission and keeps metadata-only enumeration lazy', async () => {
+        const module = makeModule('lazy-module', { assets: undefined,
+            assetManifest: { id: 'module', version: 1, count: 1, sha256: 'module' } })
+        let granted = false
+        let loads = 0
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [], modules: [module] }),
+            getCurrentCharacter: () => undefined,
+            getActiveModulesWithReasons: () => [],
+            loadAssetManifestItems: async () => {
+                if (!granted) throw new Error('permission not granted')
+                loads++
+                return [['reference', 'assets/reference.png', 'png']]
+            },
+        }))
+        const service = new ContextResourceService({ principalId: '11111111-1111-4111-8111-111111111111',
+            instanceId: 'lazy-module-counts', displayName: 'test', signal: new AbortController().signal }, adapter, {
+            requirePermission: async (permission) => { if (permission === 'contextAssets') granted = true },
+        })
+        try {
+            const metadata = await service.listContextModules({ scope: 'installed' })
+            expect(metadata.items[0].assetCount).toBeUndefined()
+            expect(loads).toBe(0)
+            const counted = await service.listContextModules({ scope: 'installed', includeAssetCount: true })
+            expect(counted.items[0].assetCount).toBe(1)
+            expect(loads).toBe(1)
+            expect(module.assets).toBeUndefined()
+        } finally { service.dispose() }
+    })
+
+    it('captures lazy card and module assets without materializing live database lists', async () => {
+        const descriptor = (id: string) => ({ id, version: 1, count: 1, sha256: id })
+        const card: Record<string, any> = makeCharacter({ additionalAssets: undefined, additionalAssetManifest: descriptor('card') })
+        const module = makeModule('module', { assets: undefined, assetManifest: descriptor('module') })
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [card], modules: [module] }),
+            getCurrentCharacter: () => card,
+            getActiveModulesWithReasons: () => [{ module, activatedBy: ['global'] }],
+            loadAssetManifestItems: async (manifest) => [[manifest.id, `assets/${manifest.id}.png`, 'png']],
+        }))
+        const input: ContextAssetCollectionInput = {
+            characterIds: ['char-1'], conversationId: 'conversation-1',
+            moduleScope: 'installed', moduleIds: [], include: ['additional', 'module'], mediaTypes: [],
+        }
+        const capture = await adapter.captureAssetSources!(input)
+        expect(capture.assets.map(({ source }) => source.storageKey)).toEqual([
+            'assets/card.png', 'assets/icon.png', 'assets/voice.mp3', 'assets/module.png',
+        ])
+        expect(card.additionalAssets).toBeUndefined()
+        expect(module.assets).toBeUndefined()
+        expect(card.additionalAssetManifest).toEqual(descriptor('card'))
+        await expect(adapter.revalidateAssetSource!({ input, located: capture.assets[0] }))
+            .resolves.toMatchObject({ storageKey: 'assets/card.png' })
+        card.additionalAssetManifest = descriptor('replacement')
+        await expect(adapter.revalidateAssetSource!({ input, located: capture.assets[0] }))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+    })
+
+    it('rejects failed lazy asset hydration instead of publishing an empty capture', async () => {
+        const card = makeCharacter({ additionalAssets: undefined,
+            additionalAssetManifest: { id: 'card', version: 1, count: 1, sha256: 'card' } })
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [card], modules: [] }),
+            getCurrentCharacter: () => card,
+            loadAssetManifestItems: async () => { throw new Error('offline') },
+        }))
+        await expect(adapter.captureAssetSources!({ characterIds: ['char-1'],
+            conversationId: 'conversation-1', moduleScope: 'none', moduleIds: [], include: ['additional'], mediaTypes: [] }))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+    })
+
     it('projects only descriptive single-card, conversation, asset, lore, and module fields', async () => {
         const adapter = createPocketContextResourceAdapter(dependencies())
         const state = await adapter.getState()

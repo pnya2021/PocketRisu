@@ -24,15 +24,15 @@ export const advancedSettingsItems: SettingItem[] = [
 
     // Prompts
     {
-        id: 'adv.addPrompt', type: 'text', labelKey: 'additionalPrompt', bindKey: 'additionalPrompt',
+        id: 'adv.addPrompt', type: 'textarea', labelKey: 'additionalPrompt', bindKey: 'additionalPrompt',
         helpKey: 'additionalPrompt'
     },
     {
-        id: 'adv.descPrefix', type: 'text', labelKey: 'descriptionPrefix', bindKey: 'descriptionPrefix',
+        id: 'adv.descPrefix', type: 'textarea', labelKey: 'descriptionPrefix', bindKey: 'descriptionPrefix',
         helpKey: 'descriptionPrefix'
     },
     {
-        id: 'adv.emoPrompt', type: 'text', labelKey: 'emotionPrompt', bindKey: 'emotionPrompt2',
+        id: 'adv.emoPrompt', type: 'textarea', labelKey: 'emotionPrompt', bindKey: 'emotionPrompt2',
         helpKey: 'emotionPrompt', options: { placeholder: 'Leave it blank to use default' }
     },
     {
@@ -129,6 +129,10 @@ export const advancedSettingsItems: SettingItem[] = [
         onChange: () => {
             void loadPlugins();
         }
+    },
+    {
+        id: 'adv.allowV21Plugin', type: 'check', labelKey: 'allowV21Plugin', bindKey: 'allowV21Plugin',
+        helpKey: 'allowV21Plugin', helpUnrecommended: true, classes: 'mt-4',
     },
     // Experimental Section (visible when useExperimental is true)
     {

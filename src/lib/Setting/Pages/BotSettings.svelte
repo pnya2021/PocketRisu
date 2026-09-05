@@ -37,6 +37,8 @@
     import SeparateParametersSection from "./SeparateParametersSection.svelte";
     import AuxModelSelectors from './Model/AuxModelSelectors.svelte'
     import CustomModelsSettings from './Model/CustomModelsSettings.svelte'
+    import Accordion from "src/lib/UI/Accordion.svelte";
+    import Button from "src/lib/UI/GUI/Button.svelte";
     
     const openrouterPinnedItems: ModelGridPinnedItem[] = [
         { id: 'risu/free',       displayName: 'Free Auto',       providerName: 'Risu'       },
@@ -384,6 +386,56 @@
     {/if}
 
     <AuxModelSelectors />
+
+    {#snippet CustomFlagButton(name:string,flag:LLMFlags)}
+        <Button className="mt-2" onclick={(e) => {
+            if(DBState.db.customFlags.includes(flag as LLMFlags)){
+                DBState.db.customFlags = DBState.db.customFlags.filter((f) => f !== flag)
+            }
+            else{
+                DBState.db.customFlags.push(flag as LLMFlags)
+            }
+        }} styled={DBState.db.customFlags.includes(flag as LLMFlags) ? 'primary' : 'outlined'}>
+            {name}
+        </Button>
+    {/snippet}
+
+    <ShAlert variant="warning" className="mt-4">
+        {#snippet icon()}<TriangleAlertIcon />{/snippet}
+        {language.botSettingsCustomFlagsScopeDesc}
+    </ShAlert>
+
+    <Accordion styled name={language.customFlags} help="customFlags">
+        <div class="flex items-center">
+            <Check bind:check={DBState.db.enableCustomFlags} name={language.enableCustomFlags}/>
+            <Help key="enableCustomFlags"/>
+        </div>
+
+        {#if DBState.db.enableCustomFlags}
+            {@render CustomFlagButton('hasImageInput', 0)}
+            {@render CustomFlagButton('hasImageOutput', 1)}
+            {@render CustomFlagButton('hasAudioInput', 2)}
+            {@render CustomFlagButton('hasAudioOutput', 3)}
+            {@render CustomFlagButton('hasPrefill', 4)}
+            {@render CustomFlagButton('hasCache', 5)}
+            {@render CustomFlagButton('hasFullSystemPrompt', 6)}
+            {@render CustomFlagButton('hasFirstSystemPrompt', 7)}
+            {@render CustomFlagButton('hasStreaming', 8)}
+            {@render CustomFlagButton('requiresAlternateRole', 9)}
+            {@render CustomFlagButton('mustStartWithUserInput', 10)}
+            {@render CustomFlagButton('hasVideoInput', 12)}
+            {@render CustomFlagButton('OAICompletionTokens', 13)}
+            {@render CustomFlagButton('DeveloperRole', 14)}
+            {@render CustomFlagButton('geminiThinking', 15)}
+            {@render CustomFlagButton('geminiBlockOff', 16)}
+            {@render CustomFlagButton('deepSeekPrefix', 17)}
+            {@render CustomFlagButton('deepSeekThinkingInput', 18)}
+            {@render CustomFlagButton('deepSeekThinkingOutput', 19)}
+            {@render CustomFlagButton('noCivilIntegrity', 20)}
+            {@render CustomFlagButton('claudeThinking', 21)}
+            {@render CustomFlagButton('claudeAdaptiveThinking', 22)}
+        {/if}
+    </Accordion>
 {/if}
 
 {#if $BotSubmenuIndex === 1}

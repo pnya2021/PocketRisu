@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { onMount } from 'svelte'
     import SettingPage from 'src/lib/UI/GUI/SettingPage.svelte'
     import SettingTabs from 'src/lib/UI/GUI/SettingTabs.svelte'
     import ShButton from 'src/lib/UI/GUI/ShButton.svelte'
@@ -33,6 +34,13 @@
 
     type LogLevel = 'error' | 'warning' | 'info'
     type LogOrigin = 'client' | 'server'
+    type SystemLogFilterPrefs = {
+        excludedLevels: LogLevel[]
+        excludedOrigins: LogOrigin[]
+        excludedSources: string[]
+        excludedDevices: string[]
+        explicitOnly: boolean
+    }
 
     interface LogEntry {
         id: number
@@ -49,6 +57,9 @@
     }
 
     const PAGE_SIZE = 200
+    const FILTER_STORAGE_KEY = 'risu-system-log-filters'
+    const LEVELS: LogLevel[] = ['error', 'warning', 'info']
+    const ORIGINS: LogOrigin[] = ['client', 'server']
 
     // submenu lives in a store so other pages can deep-link via
     // openSettings(SettingsRoute.System, SystemTab.X) — see src/ts/routing.
@@ -79,6 +90,7 @@
     let explicitOnly = $state(true)
     let search = $state('')
     let filtersOpen = $state(false)
+    let filtersReady = $state(false)
 
     let expanded = $state<Record<number, boolean>>({})
 
@@ -97,6 +109,69 @@
         excludedSources = new Set(); excludedDevices = new Set()
         explicitOnly = true
         search = ''
+        persistFilters()
+    }
+
+    function knownValues<T extends string>(values: unknown, allowed: readonly T[]): T[] {
+        if (!Array.isArray(values)) return []
+        const allowedSet = new Set(allowed)
+        return values.filter((value): value is T => typeof value === 'string' && allowedSet.has(value as T))
+    }
+
+    function stringValues(values: unknown): string[] {
+        if (!Array.isArray(values)) return []
+        return values.filter((value): value is string => typeof value === 'string')
+    }
+
+    function defaultFilterPrefs(): SystemLogFilterPrefs {
+        return {
+            excludedLevels: [],
+            excludedOrigins: [],
+            excludedSources: [],
+            excludedDevices: [],
+            explicitOnly: true,
+        }
+    }
+
+    function applyFilterPrefs(prefs: SystemLogFilterPrefs) {
+        excludedLevels = new Set(prefs.excludedLevels)
+        excludedOrigins = new Set(prefs.excludedOrigins)
+        excludedSources = new Set(prefs.excludedSources)
+        excludedDevices = new Set(prefs.excludedDevices)
+        explicitOnly = prefs.explicitOnly
+    }
+
+    function restoreFilters() {
+        try {
+            const raw = localStorage.getItem(FILTER_STORAGE_KEY)
+            if (!raw) return
+            const parsed = JSON.parse(raw) as Record<string, unknown>
+            if (!parsed || typeof parsed !== 'object') return
+
+            applyFilterPrefs({
+                excludedLevels: knownValues(parsed.excludedLevels, LEVELS),
+                excludedOrigins: knownValues(parsed.excludedOrigins, ORIGINS),
+                excludedSources: stringValues(parsed.excludedSources),
+                excludedDevices: stringValues(parsed.excludedDevices),
+                explicitOnly: typeof parsed.explicitOnly === 'boolean' ? parsed.explicitOnly : true,
+            })
+        } catch {
+            applyFilterPrefs(defaultFilterPrefs())
+        }
+    }
+
+    function persistFilters() {
+        try {
+            localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify({
+                excludedLevels: Array.from(excludedLevels),
+                excludedOrigins: Array.from(excludedOrigins),
+                excludedSources: Array.from(excludedSources),
+                excludedDevices: Array.from(excludedDevices),
+                explicitOnly,
+            }))
+        } catch {
+            // localStorage can throw in private/storage-disabled contexts.
+        }
     }
 
     // ─── Fetch ──────────────────────────────────────────────────────────────
@@ -357,7 +432,18 @@
     // any change to excludedLevels / excludedOrigins / explicitOnly.
     // Gated on the System Logs tab (index 2) so Dashboard/Backups don't
     // spend a fetch on entry.
+    onMount(() => {
+        restoreFilters()
+        filtersReady = true
+    })
+
     $effect(() => {
+        if (!filtersReady) return
+        persistFilters()
+    })
+
+    $effect(() => {
+        if (!filtersReady) return
         if ($SystemSubmenuIndex !== 2) return
         loadInitial()
     })

@@ -11,6 +11,7 @@
     theme="dark"
     {position}
     richColors
+    swipeDirections={['top', 'left', 'right']}
     duration={3500}
     visibleToasts={8}
     toastOptions={{

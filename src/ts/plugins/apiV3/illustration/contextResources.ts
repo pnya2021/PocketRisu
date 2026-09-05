@@ -173,6 +173,7 @@ export interface BoundedThumbnailResult {
 
 export interface ContextResourceAdapter {
     getState(): Promise<ContextHostState>
+    prepareModuleAssets?(input: ContextModuleCollectionInput): Promise<void>
     resolveCollectionSelectors?(input: {
         characterId?: CharacterId
         conversationId?: ConversationId
@@ -1152,6 +1153,9 @@ export class ContextResourceService {
             return { query, cache, ...(cursor ? { cursor } : {}) }
         }
         const initialCountsAuthorized = requestedCounts && countsAuthorized
+        if (initialCountsAuthorized && this.adapter.prepareModuleAssets) {
+            await this.fenced(this.adapter.prepareModuleAssets(inputFor()), generation)
+        }
         const preparations = await Promise.all(
             initialCountsAuthorized ? [prepare(true), prepare(false)] : [prepare(false)],
         )

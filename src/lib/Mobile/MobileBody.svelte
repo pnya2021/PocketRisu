@@ -14,7 +14,7 @@
     import { DBState } from 'src/ts/stores.svelte';
 </script>
 
-{#if $MobileSideBar > 0 && !$isLite}
+{#if $MobileSideBar > 0 && $selectedCharID !== -1 && !$isLite}
 <div class="w-full px-2 py-1 text-textcolor2 border-b border-b-darkborderc bg-darkbg flex justify-start items-center gap-2">
     <button class="flex-1 border-r border-r-darkborderc" class:text-textcolor={$MobileSideBar === 1} onclick={() => {
         $MobileSideBar = 1
@@ -34,7 +34,10 @@
 </div>
 {/if}
 <div class="w-full flex-1 overflow-y-auto bg-bgcolor relative">
-    {#if $MobileSideBar > 0}
+    <!-- Guard on selectedCharID: deleting the character from inside these panels
+         leaves $MobileSideBar set, which used to keep CharConfig/SideChatList
+         mounted against characters[-1]. Fall through to the home screen instead. -->
+    {#if $MobileSideBar > 0 && $selectedCharID !== -1}
         <div class="w-full flex flex-col p-2 mt-2 h-full">
             {#if $MobileSideBar === 1}
                 <SideChatList bind:chara={DBState.db.characters[$selectedCharID]} />

@@ -108,7 +108,7 @@
          vertically centered right), plus a full-width slider third line. Markup
          is replicated rather than nesting SettingRowLayout because the divider
          (border-t/py-3) must wrap the slider line too. -->
-    <div class="py-3 border-t border-darkborderc">
+    <div class="py-3 border-t border-darkborderc" data-setting-id={item.id}>
         <div class="flex items-center justify-between gap-3">
             <div class="flex flex-col min-w-0">
                 <span class="text-sm text-textcolor {item.classes ?? ''}">{getLabel(item)}</span>

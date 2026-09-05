@@ -1,6 +1,7 @@
 <script lang="ts">
-    import { ArrowDownIcon, ArrowLeftIcon, ArrowUpIcon, BellIcon, CopyIcon, PlusIcon, TrashIcon, TriangleAlertIcon } from "@lucide/svelte";
+    import { ArrowLeftIcon, BellIcon, PlusIcon, TriangleAlertIcon } from "@lucide/svelte";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
+    import FolderedList, { type FolderedItemPlacement } from "src/lib/UI/FolderedList.svelte";
     import ShAccordion from "src/lib/UI/GUI/ShAccordion.svelte";
     import ShAlert from "src/lib/UI/GUI/ShAlert.svelte";
     import SettingTabs from "src/lib/UI/GUI/SettingTabs.svelte";
@@ -138,12 +139,11 @@
         notifySuccess(language.presetDeleted);
     }
 
-    function move(index: number, dir: -1 | 1) {
-        const target = index + dir;
+    /** Rebuilds `db.modelPresets` from the folder list's reported order/membership. Ids are untouched. */
+    function applyPlacements(placements: FolderedItemPlacement[]) {
         const presets = DBState.db.modelPresets;
-        if (target < 0 || target >= presets.length) return;
-        const next = [...presets];
-        [next[index], next[target]] = [next[target], next[index]];
+        const next = placements.map(({ index, folderId }) => ({ ...presets[index], folderId }));
+        if (next.length !== presets.length) return;
         DBState.db.modelPresets = next;
     }
 
@@ -201,6 +201,24 @@
                         </div>
                         <NumberInput bind:value={editingPreset.maxContext as number} placeholder="65000" className="w-32 shrink-0" />
                     </div>
+                    {#if editingPreset.profileSnapshot?.limits?.contextWindowTokens}
+                        {@const contextCap = editingPreset.profileSnapshot.limits.contextWindowTokens}
+                        <div class="flex flex-col gap-1 -mt-2">
+                            <span class="text-xs text-textcolor2">{language.maxContextCapInfo.replace('{}', contextCap.toLocaleString())}</span>
+                            {#if (editingPreset.maxContext ?? 0) > contextCap && !editingPreset.ignoreContextWindowCap}
+                                <span class="text-xs text-draculared">{language.maxContextCapExceeded.replace('{}', contextCap.toLocaleString())}</span>
+                            {/if}
+                        </div>
+                        <div class="flex items-center justify-between gap-3">
+                            <div class="flex flex-col gap-0.5 min-w-0">
+                                <span class="text-sm text-textcolor">{language.maxContextIgnoreCap}</span>
+                                <span class="text-xs text-textcolor2">{language.maxContextIgnoreCapHelp}</span>
+                            </div>
+                            <div class="shrink-0">
+                                <ShSwitch checked={!!editingPreset.ignoreContextWindowCap} onCheckedChange={(v) => { editingPreset.ignoreContextWindowCap = v }} />
+                            </div>
+                        </div>
+                    {/if}
                     <div class="flex items-center justify-between gap-3">
                         <div class="flex flex-col gap-0.5 min-w-0">
                             <span class="text-sm text-textcolor">{language.streamingOverride}</span>
@@ -449,77 +467,38 @@
                 </ShAlert>
             {/if}
 
-            <ShButton variant="default" size="default" className="w-full mb-4" onclick={createNew}>
-                <PlusIcon size={16}/>
-                <span class="ml-1">{language.modelPresetCreate}</span>
-            </ShButton>
-
+            <FolderedList
+                folders={DBState.db.modelPresetFolders ?? []}
+                itemFolderIds={DBState.db.modelPresets.map(p => p.folderId)}
+                itemSearchTexts={DBState.db.modelPresets.map(p => `${p.name}\n${p.profileSnapshot?.profileId ?? ''}`)}
+                storageKey="risu-model-preset-folders-collapsed"
+                onSelect={(index) => { editingId = DBState.db.modelPresets[index].id; submenu = 0; }}
+                onItemsChange={applyPlacements}
+                onFoldersChange={(next) => { DBState.db.modelPresetFolders = next; }}
+                onDuplicate={duplicate}
+                onDelete={remove}
+            >
+                {#snippet actions()}
+                    <ShButton size="sm" onclick={createNew}><PlusIcon />{language.modelPresetCreate}</ShButton>
+                {/snippet}
+                {#snippet itemContent(index)}
+                    {@const preset = DBState.db.modelPresets[index]}
+                    <div class="flex flex-col min-w-0 grow">
+                        <span class="text-textcolor truncate flex items-center gap-1.5">
+                            {#if getPresetUpdateStatus(preset) === 'updatable'}
+                                <span class="w-2 h-2 rounded-full bg-amber-500 shrink-0" title={language.profileUpdateAvailable}></span>
+                            {/if}
+                            <span class="truncate">{preset.name}</span>
+                        </span>
+                        {#if preset.profileSnapshot?.profileId}
+                            <span class="text-xs text-textcolor2 truncate">{preset.profileSnapshot.profileId}</span>
+                        {/if}
+                    </div>
+                {/snippet}
+            </FolderedList>
             {#if DBState.db.modelPresets.length === 0}
                 <div class="text-textcolor2 text-sm text-center py-8">
                     {language.modelPresetEmpty}
-                </div>
-            {:else}
-                <div class="flex flex-col gap-1">
-                    {#each DBState.db.modelPresets as preset, i (preset.id)}
-                        <button
-                            class="flex items-center text-textcolor border border-darkborderc rounded-md p-3 cursor-pointer hover:bg-selected/30 transition-colors text-left"
-                            onclick={() => { editingId = preset.id; submenu = 0; }}
-                        >
-                            <div class="flex flex-col min-w-0 grow">
-                                <span class="text-sm text-textcolor truncate flex items-center gap-1.5">
-                                    {#if getPresetUpdateStatus(preset) === 'updatable'}
-                                        <span class="w-2 h-2 rounded-full bg-amber-500 shrink-0" title={language.profileUpdateAvailable}></span>
-                                    {/if}
-                                    <span class="truncate">{preset.name}</span>
-                                </span>
-                                {#if preset.profileSnapshot?.profileId}
-                                    <span class="text-xs text-textcolor2 truncate">{preset.profileSnapshot.profileId}</span>
-                                {/if}
-                            </div>
-                            <div class="flex gap-2 shrink-0 ml-2">
-                                <div class="text-textcolor2 hover:text-primary cursor-pointer aria-disabled:opacity-30 aria-disabled:pointer-events-none" role="button" tabindex="0" aria-disabled={i === 0} onclick={(e) => {
-                                    e.stopPropagation()
-                                    move(i, -1)
-                                }} onkeydown={(e) => {
-                                    if (e.key === 'Enter' && e.currentTarget instanceof HTMLElement) {
-                                        e.currentTarget.click()
-                                    }
-                                }} aria-label="move up">
-                                    <ArrowUpIcon size={18}/>
-                                </div>
-                                <div class="text-textcolor2 hover:text-primary cursor-pointer aria-disabled:opacity-30 aria-disabled:pointer-events-none" role="button" tabindex="0" aria-disabled={i === DBState.db.modelPresets.length - 1} onclick={(e) => {
-                                    e.stopPropagation()
-                                    move(i, 1)
-                                }} onkeydown={(e) => {
-                                    if (e.key === 'Enter' && e.currentTarget instanceof HTMLElement) {
-                                        e.currentTarget.click()
-                                    }
-                                }} aria-label="move down">
-                                    <ArrowDownIcon size={18}/>
-                                </div>
-                                <div class="text-textcolor2 hover:text-primary cursor-pointer" role="button" tabindex="0" onclick={(e) => {
-                                    e.stopPropagation()
-                                    duplicate(i)
-                                }} onkeydown={(e) => {
-                                    if (e.key === 'Enter' && e.currentTarget instanceof HTMLElement) {
-                                        e.currentTarget.click()
-                                    }
-                                }} aria-label="duplicate">
-                                    <CopyIcon size={18}/>
-                                </div>
-                                <div class="text-textcolor2 hover:text-red-400 cursor-pointer" role="button" tabindex="0" onclick={(e) => {
-                                    e.stopPropagation()
-                                    remove(i)
-                                }} onkeydown={(e) => {
-                                    if (e.key === 'Enter' && e.currentTarget instanceof HTMLElement) {
-                                        e.currentTarget.click()
-                                    }
-                                }} aria-label="delete">
-                                    <TrashIcon size={18}/>
-                                </div>
-                            </div>
-                        </button>
-                    {/each}
                 </div>
             {/if}
         {/if}

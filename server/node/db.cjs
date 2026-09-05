@@ -114,6 +114,7 @@ const stmtKvDel    = db.prepare(`DELETE FROM kv WHERE key = ?`);
 const stmtKvList   = db.prepare(`SELECT key FROM kv`);
 const stmtKvPrefix = db.prepare(`SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtKvPrefixSizes = db.prepare(`SELECT key, LENGTH(value) as size FROM kv WHERE key LIKE ? ESCAPE '\\'`);
+const stmtKvPrefixSizesUpdatedAt = db.prepare(`SELECT key, LENGTH(value) as size, updated_at FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtKvDelPrefix = db.prepare(`DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtKvUpdatedAt = db.prepare(`SELECT updated_at FROM kv WHERE key = ?`);
 
@@ -173,6 +174,11 @@ function kvListWithSizes(prefix) {
     return stmtKvPrefixSizes.all(`${escaped}%`).map(r => ({ key: r.key, size: r.size }));
 }
 
+function kvListWithSizesAndUpdatedAt(prefix) {
+    const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+    return stmtKvPrefixSizesUpdatedAt.all(`${escaped}%`).map(r => ({ key: r.key, size: r.size, updated_at: r.updated_at }));
+}
+
 function checkpointWal(mode = 'TRUNCATE') {
     return db.pragma(`wal_checkpoint(${mode})`);
 }
@@ -215,7 +221,7 @@ function clearEntities() {
 module.exports = {
     db,
     // KV
-    kvGet, kvSet, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue,
+    kvGet, kvSet, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvListWithSizesAndUpdatedAt, kvSize, kvGetUpdatedAt, kvCopyValue,
     clearEntities,
     checkpointWal,
     gcChunks,

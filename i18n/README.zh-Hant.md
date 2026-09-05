@@ -79,6 +79,7 @@ PocketRisu 衍生自 [RisuAI](https://github.com/kwaroran/RisuAI),針對自託�
 
 - 錯誤回報/功能請求:[GitHub Issues](https://github.com/PocketRisu/PocketRisu/issues)
 - 電子郵件:contact@pocketrisu.com
+- 支持專案:[Patreon](https://patreon.com/PocketRisu/membership) — 完全自願;支持者可在應用內展示名字,沒有額外功能或特權
 
 
 ## 授權條款

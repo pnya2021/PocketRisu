@@ -33,6 +33,11 @@ interface ServerBehavior {
     streamHeaders?: Record<string, string>
     /** Body of the never-closing kind for abort tests. */
     streamNeverEnds?: boolean
+    /** Reject this many GET /stream fetches (network-level) before serving.
+     *  Infinity = reject every attach — for retry-exhaustion tests. */
+    streamRejectTimes?: number
+    /** HTTP status of the GET /stream response itself (default 200). */
+    streamHttpStatus?: number
     /** GET /api/model-jobs/:id after the stream ends. */
     job?: { status: string, error?: string }
     /** Successive GET /api/model-jobs/:id responses (last repeats). Overrides job. */
@@ -52,6 +57,10 @@ function setupServer(behavior: ServerBehavior) {
             return new Response(JSON.stringify(c.body ?? {}), { status: c.status })
         }
         if (url === '/api/model-jobs/job-1/stream') {
+            if (behavior.streamRejectTimes && behavior.streamRejectTimes > 0) {
+                behavior.streamRejectTimes -= 1
+                throw new TypeError('Failed to fetch')
+            }
             const headers = behavior.streamHeaders ?? {
                 'content-type': 'text/event-stream',
                 'x-model-job-upstream-status': '200',
@@ -65,7 +74,7 @@ function setupServer(behavior: ServerBehavior) {
             const body = behavior.streamNeverEnds
                 ? new ReadableStream<Uint8Array>({ start() { /* never closes */ } })
                 : streamOf(...chunks)
-            return new Response(body, { status: 200, headers })
+            return new Response(body, { status: behavior.streamHttpStatus ?? 200, headers })
         }
         if (url === '/api/model-jobs/job-1' && method === 'DELETE') {
             return new Response('{"success":true}', { status: 200 })
@@ -92,6 +101,11 @@ function makeOpts(overrides: Partial<JobFetchOptions> = {}): JobFetchOptions {
         realChatId: 'chat-1',
         generationId: 'gen-1',
         adapterKind: 'openai-compatible',
+        model: 'provider/model-id',
+        modelLabel: 'My Preset',
+        inputTokens: 1234,
+        outputTokens: 512,
+        maxContext: 32768,
         streaming: true,
         timeoutMs: 60_000,
         fallbackFetch: vi.fn(async () => new Response('fallback')) as unknown as typeof fetch,
@@ -146,6 +160,11 @@ describe('makeJobFetch', () => {
             chatId: 'chat-1',
             generationId: 'gen-1',
             adapterKind: 'openai-compatible',
+            model: 'provider/model-id',
+            modelLabel: 'My Preset',
+            inputTokens: 1234,
+            outputTokens: 512,
+            maxContext: 32768,
             streaming: true,
             timeoutMs: 60_000,
         })
@@ -171,6 +190,50 @@ describe('makeJobFetch', () => {
         setupServer({ streamHeaders: { 'content-type': 'text/plain' } })
         await expect(makeJobFetch(makeOpts())('https://provider.example/v1/chat', { method: 'POST', body: '{}' }))
             .rejects.toThrow(TypeError)
+    })
+
+    test('initial stream attach retries a rejected fetch and then delivers (send-then-background resume)', async () => {
+        // The tab froze right after job creation; on resume the in-flight
+        // attach rejects while the radio is still down. The retry must attach
+        // once the network is back — the job kept running server-side.
+        const { calls } = setupServer({
+            streamRejectTimes: 2,
+            streamChunks: ['hello world'],
+            job: { status: 'done' },
+        })
+        const res = await makeJobFetch(makeOpts({ reconnectBaseDelayMs: 1 }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        expect(await res.text()).toBe('hello world')
+        expect(callsFor(calls, '/api/model-jobs/job-1/stream')).toHaveLength(3)
+        await vi.waitFor(() => {
+            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(1)
+        })
+    })
+
+    test('initial stream attach exhaustion throws ModelJobConnectionLostError, never the raw TypeError or fallback', async () => {
+        const opts = makeOpts({ reconnectBaseDelayMs: 1 })
+        setupServer({ streamRejectTimes: Infinity })
+        await expect(makeJobFetch(opts)('https://provider.example/v1/chat', { method: 'POST', body: '{}' }))
+            .rejects.toThrow(ModelJobConnectionLostError)
+        expect(opts.fallbackFetch).not.toHaveBeenCalled()
+    })
+
+    test('an HTTP error from the stream endpoint is definitive — no attach retry', async () => {
+        // Only network-level rejections retry; a served response (even an
+        // error) is the server's answer and takes the existing path unchanged.
+        const { calls } = setupServer({ streamHttpStatus: 500 })
+        await expect(makeJobFetch(makeOpts({ reconnectBaseDelayMs: 1 }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' }))
+            .rejects.toThrow(TypeError)
+        expect(callsFor(calls, '/api/model-jobs/job-1/stream')).toHaveLength(1)
+    })
+
+    test('abort during initial attach retry surfaces the abort', async () => {
+        setupServer({ streamRejectTimes: Infinity })
+        const controller = new AbortController()
+        const pending = makeJobFetch(makeOpts({ reconnectBaseDelayMs: 50 }))('https://provider.example/v1/chat', {
+            method: 'POST', body: '{}', signal: controller.signal,
+        })
+        setTimeout(() => controller.abort(), 5)
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     })
 
     test('reattaches after a dropped tail and resumes without duplicating bytes', async () => {

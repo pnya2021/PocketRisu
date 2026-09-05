@@ -5,6 +5,7 @@ import "./ts/storage/database.svelte"
 import App from "./App.svelte";
 import { loadData } from "./ts/bootstrap";
 import { initHotkey } from "./ts/hotkey";
+import { initScrollbarAutoHide } from "./ts/gui/scrollbarAutoHide";
 import { preLoadCheck } from "./preload";
 import { mount } from "svelte";
 
@@ -19,6 +20,7 @@ let app = mount(App, {
 });
 loadData()
 initHotkey()
+initScrollbarAutoHide()
 document.getElementById('preloading').remove()
 
 export default app;

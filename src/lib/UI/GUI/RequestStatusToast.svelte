@@ -10,9 +10,10 @@
     //   row2: model · think N · tok/s   (dim detail; 0/empty hidden)
     //   row3+: cache/search/tool badges (future)
     import { onMount } from 'svelte'
-    import { requestStatuses, isTerminalPhase, type RequestPhase, type RequestKind } from 'src/ts/status/requestStatus'
+    import { toast } from 'svelte-sonner'
+    import { requestStatuses, clearStatus, isTerminalPhase, type RequestPhase, type RequestKind } from 'src/ts/status/requestStatus'
     import { language } from 'src/lang'
-    import { RotateCwIcon } from '@lucide/svelte'
+    import { RotateCwIcon, XIcon } from '@lucide/svelte'
 
     let { id }: { id: string } = $props()
 
@@ -91,6 +92,14 @@
     })
 
     const spinning = $derived(entry ? !isTerminalPhase(entry.phase) && entry.phase !== 'stalled' : false)
+
+    // Manual dismiss: clear the store entry and the sonner toast. Late phase
+    // updates for a cleared entry are no-ops in the store, so the toast is not
+    // re-issued after closing.
+    function dismiss(): void {
+        clearStatus(id)
+        toast.dismiss(`req:${id}`)
+    }
 </script>
 
 {#if entry}
@@ -115,9 +124,10 @@
                 {#if entry.retryAttempt}
                     <span class="rs-retry">#{entry.retryAttempt}</span>
                 {/if}
-                {#if right}
-                    <span class="rs-right">{right.label} <b>{right.value}</b></span>
-                {/if}
+                <span class="rs-actions">
+                    {#if right}<span class="rs-right">{right.label} <b>{right.value}</b></span>{/if}
+                    <button class="rs-close" type="button" aria-label={language.close ?? 'Close'} onclick={dismiss}><XIcon size={14} /></button>
+                </span>
             </div>
 
             {#if entry.error}
@@ -178,8 +188,13 @@
     }
     .rs-elapsed { font-size: 12px; color: var(--risu-theme-textcolor2); font-variant-numeric: tabular-nums; }
     .rs-retry { font-size: 12px; color: var(--risu-theme-textcolor2); }
-    .rs-right { margin-left: auto; font-size: 12px; color: var(--risu-theme-textcolor2); white-space: nowrap; }
+    .rs-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+    .rs-right { font-size: 12px; color: var(--risu-theme-textcolor2); white-space: nowrap; }
     .rs-right b { color: var(--risu-theme-textcolor); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .rs-close { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 5px;
+        color: var(--risu-theme-textcolor2); transition: color .15s ease, background .15s ease; }
+    .rs-close:hover { color: var(--risu-theme-textcolor); background: var(--risu-theme-selected); }
+    .rs-close:focus-visible { outline: 2px solid var(--risu-theme-primary); outline-offset: 1px; }
 
     .rs-detail { font-size: 12px; color: var(--risu-theme-textcolor2); margin-top: 3px; }
     .rs-error { color: var(--risu-theme-draculared); }

@@ -7,6 +7,8 @@
  */
 
 export const helpVi = {
+    "memoryPresetBinding": "Preset trí nhớ dài hạn mà chat này sử dụng.\n\n- **Mặc định**: theo preset mặc định trong Cài đặt → Trí nhớ dài hạn và thay đổi cùng nó.\n- **Tắt**: tin nhắn ngoài cửa sổ ngữ cảnh chỉ bị cắt bỏ.\n- **Chọn preset**: chat này chạy với preset đó bất kể mặc định.\n\nLưu theo từng chat; không ảnh hưởng chat khác của cùng nhân vật.",
+    "memoryPresetDefault": "Preset trí nhớ dài hạn cho các chat để ở “Mặc định”. Khi “Tắt”, trí nhớ chỉ chạy trong chat tự chọn preset.",
         "model": "Tùy chọn mô hình là mô hình chính được sử dụng trong trò chuyện.",
         "submodel": "Mô hình phụ trợ là mô hình được sử dụng để phân tích hình ảnh cảm xúc và đề xuất tự động, v.v. Nên sử dụng gpt3.5.",
         "oaiapikey": "Khóa Api cho OpenAI. bạn có thể lấy nó ở https://platform.openai.com/account/api-keys",

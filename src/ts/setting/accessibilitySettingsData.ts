@@ -262,6 +262,14 @@ export const accessibilitySettingsItems: SettingItem[] = [
         keywords: ['left', 'bar', 'collapse', 'toggle', 'mobile', 'sidebar', 'hide'],
     },
     {
+        id: 'acc.nodeOnlyRestoreLastChat',
+        type: 'check',
+        labelKey: 'nodeOnlyRestoreLastChat',
+        bindKey: 'nodeOnlyRestoreLastChat',
+        helpKey: 'nodeOnlyRestoreLastChat',
+        keywords: ['restore', 'last', 'chat', 'reload', 'start', 'resume', 'character'],
+    },
+    {
         id: 'acc.nodeOnlyScrollButtonType',
         type: 'select',
         labelKey: 'nodeOnlyScrollButtonType',
@@ -363,6 +371,7 @@ export const accessibilitySidebarItems = pick([
 ]);
 
 export const accessibilityOtherItems = pick([
+    'acc.nodeOnlyRestoreLastChat',
     'acc.botSettingAtStart',
     'acc.goCharacterOnImport',
     'acc.createFolderOnBranch',

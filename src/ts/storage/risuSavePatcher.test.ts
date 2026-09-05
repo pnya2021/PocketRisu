@@ -839,6 +839,34 @@ describe('fast-path — expectedHash stays protocol-consistent', () => {
     })
 })
 
+describe('out-of-band asset manifest baseline updates', () => {
+    test('accepted module manifest edit becomes the next patch pre-image without a replace op', async () => {
+        const before = {
+            characters: [],
+            botPresets: [],
+            modules: [{ id: 'm1', assetManifest: { id: 'old', version: 1, count: 1, sha256: 'a' } }],
+        }
+        const descriptor = {
+            id: 'new', version: 1, count: 2, sha256: 'b',
+            ownerKind: 'module', ownerId: 'm1',
+        }
+        const after = {
+            ...before,
+            modules: [{ ...before.modules[0], assetManifest: descriptor }],
+        }
+        const patcher = new RisuSavePatcher()
+        await patcher.init(before)
+        expect(patcher.updateAssetManifestBaseline('module', 'm1', descriptor)).toBe(true)
+
+        const result = await patcher.set(after, emptyToSave())
+        expect(result.patch).toEqual([])
+
+        const fresh = new RisuSavePatcher()
+        await fresh.init(after)
+        expect(result.expectedHash).toBe((await fresh.set(after, emptyToSave())).expectedHash)
+    })
+})
+
 // ──────────────────────────────────────────────────────────────────────────
 // Fast-path granularity — per-ROOT-KEY and per-MODULE pre-checks.
 //
@@ -1120,5 +1148,40 @@ describe('fast-path — per-module granularity', () => {
         await fresh.init(clone(s1))
         const freshHash = (await fresh.set(clone(s1), emptyToSave())).expectedHash
         expect(liveHash).toBe(freshHash)
+    })
+})
+
+// ──────────────────────────────────────────────────────────────────────────
+// pluginCustomStorage is excluded from the patch protocol: plugin values live
+// in the server kv (pluginStorageStore) and the DB field is always {} on the
+// server. The client must neither diff the key nor hash anything but {}.
+// ──────────────────────────────────────────────────────────────────────────
+
+const { calculateHash } = await import('./risuSave')
+
+describe('RisuSavePatcher — pluginCustomStorage excluded', () => {
+    test('non-empty pluginCustomStorage emits no ops and hashes as {}', async () => {
+        const base = { characters: [], botPresets: [], modules: [], foo: 1, pluginCustomStorage: { big: 'x'.repeat(1000) } }
+        const patcher = new RisuSavePatcher()
+        await patcher.init(base)
+
+        const serverDb = { ...base, pluginCustomStorage: {} }
+        expect(patcher.hash()).toBe((calculateHash(serverDb) >>> 0).toString(16))
+
+        const changed = { ...base, pluginCustomStorage: { other: 'y', big: 'z' } }
+        const { patch, expectedHash } = await patcher.set(changed, { ...emptyToSave(), root: true })
+        expect(patch.filter((p: any) => p.path.startsWith('/pluginCustomStorage'))).toEqual([])
+        expect(expectedHash).toBe((calculateHash(serverDb) >>> 0).toString(16))
+        // Baseline still pinned to {} for the next save.
+        expect(patcher.hash()).toBe((calculateHash(serverDb) >>> 0).toString(16))
+    })
+
+    test('deleting the key from the live db emits no remove op', async () => {
+        const base = { characters: [], botPresets: [], modules: [], pluginCustomStorage: {} }
+        const patcher = new RisuSavePatcher()
+        await patcher.init(base)
+        const { characters, botPresets, modules } = base
+        const { patch } = await patcher.set({ characters, botPresets, modules }, { ...emptyToSave(), root: true })
+        expect(patch).toEqual([])
     })
 })

@@ -3,10 +3,24 @@ import { getDatabase, type character } from "../storage/database.svelte"
 import { requestChatData } from "./request/request"
 import { alertError, notifyError } from "../alert"
 import { fetchNative, globalFetch, readImage } from "../globalApi.svelte"
+import { recordRequestLog } from "../requestLog"
 import { CharEmotion } from "../stores.svelte"
 import type { OpenAIChat } from "./index.svelte"
 import { processZip } from "./processzip"
 import random from "lodash/random"
+
+function describeFormData(formData: FormData): string {
+    const parts: string[] = []
+    for (const [name, value] of formData.entries()) {
+        if (typeof value === 'string') {
+            parts.push(`${name}=${value.slice(0, 200)}`)
+        }
+        else {
+            parts.push(`${name}=[binary ${value.size} bytes]`)
+        }
+    }
+    return `FormData(${parts.join(', ')})`
+}
 
 export async function stableDiff(currentChar:character,prompt:string){
     let db = getDatabase()
@@ -213,8 +227,11 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
             }
         }
 
-        // Add vibe reference_image_multiple if exists
-        if(db.NAIImgConfig.reference_mode === 'vibe' && db.NAIImgConfig.vibe_data) {
+        // Add vibe reference_image_multiple if exists.
+        // V5 models do not support Vibe Transfer — never attach encodings
+        // saved from V4/V4.5 use (the stored vibe_data itself is kept).
+        const naiV5Model = db.NAIImgModel === 'nai-diffusion-5-full' || db.NAIImgModel === 'nai-diffusion-5-curated'
+        if(!naiV5Model && db.NAIImgConfig.reference_mode === 'vibe' && db.NAIImgConfig.vibe_data) {
             const vibeData = db.NAIImgConfig.vibe_data;
             // Determine which model to use based on vibe_model_selection or fallback to current model
             const modelKey = db.NAIImgConfig.vibe_model_selection || 
@@ -451,7 +468,9 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
         }
 
         const uri = model === 'core' ? 'core' : model === 'ultra' ? 'ultra' : 'sd3'
-        const da = await fetch("https://api.stability.ai/v2beta/stable-image/generate/" + uri, {
+        const url = "https://api.stability.ai/v2beta/stable-image/generate/" + uri
+        const started = Date.now()
+        const da = await fetch(url, {
             body: formData,
             headers:{
                 "authorization": "Bearer " + db.stabilityKey,
@@ -461,12 +480,30 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
         })
 
         const res = await da.arrayBuffer()
+        try {
+            recordRequestLog({
+                timestamp: started,
+                category: 'image',
+                source: 'image',
+                model,
+                provider: 'stability',
+                url,
+                method: 'POST',
+                status: da.status,
+                success: da.ok,
+                streaming: false,
+                durationMs: Date.now() - started,
+                requestBody: describeFormData(formData),
+                responseBody: '[image response, not recorded]',
+                responseType: da.headers.get('content-type') ?? undefined,
+            })
+        } catch {}
         if(!da.ok){
             notifyError(Buffer.from(res).toString())
             return false
         }
 
-        if((da.headers["content-type"] ?? "").startsWith('application/json')){
+        if((da.headers.get("content-type") ?? "").startsWith('application/json')){
             notifyError(Buffer.from(res).toString())
             return false
         }

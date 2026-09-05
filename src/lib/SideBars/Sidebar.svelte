@@ -34,10 +34,12 @@
     User2Icon,
     ChevronsLeft,
     ArrowRight,
+    HeartIcon,
   } from "@lucide/svelte";
     import {
   addCharacter,
     changeChar,
+    deselectCharacter,
     getCharImage,
   } from "../../ts/characters";
     import CharConfig from "./CharConfig.svelte";
@@ -51,6 +53,7 @@
     import { checkCharOrder, getFileSrc, saveAsset } from "src/ts/globalApi.svelte";
     import { alertInput, alertSelect } from "src/ts/alert";
     import SideChatList from "./SideChatList.svelte";
+  import { supportDialogOpen, supportEnabled, initSupport } from "src/ts/support";
 
   import { sideBarSize } from "src/ts/gui/guisize";
   import DevTool from "./DevTool.svelte";
@@ -81,8 +84,8 @@
   // sort is cheap; the $derived is only read while on the home screen.
   let recentChars = $derived(
     DBState.db.characters
-      .map((c, index) => ({ index, name: c.name, image: c.image, lastInteraction: c.lastInteraction ?? 0 }))
-      .filter((c) => c.lastInteraction > 0)
+      .map((c, index) => ({ index, name: c.name, image: c.image, lastInteraction: c.lastInteraction ?? 0, trashTime: c.trashTime }))
+      .filter((c) => c.lastInteraction > 0 && !c.trashTime)
       .sort((a, b) => b.lastInteraction - a.lastInteraction)
   );
   // Progressive reveal: render `recentVisible` items, "Load more" adds 10.
@@ -97,6 +100,7 @@
   }
 
   let { openGrid = () => {}, hidden = false }: Props = $props();
+  initSupport();
 
   sideBarClosing.set(false)
 
@@ -562,7 +566,7 @@
   )}
   onclick={() => {
     reseter();
-    selectedCharID.set(-1)
+    deselectCharacter()
     PlaygroundStore.set(0)
     OpenRealmStore.set(false)
   }}
@@ -608,7 +612,7 @@
   )}
   onclick={() => {
     reseter();
-    selectedCharID.set(-1)
+    deselectCharacter()
     PlaygroundStore.set(1)
   }}
 >
@@ -661,7 +665,7 @@
       <BarIcon
         onClick={() => {
           reseter();
-          selectedCharID.set(-1)
+          deselectCharacter()
           PlaygroundStore.set(0)
           OpenRealmStore.set(false)
         }}><HomeIcon /></BarIcon>
@@ -673,7 +677,7 @@
             PlaygroundStore.set(0)
             return
           }
-          selectedCharID.set(-1)
+          deselectCharacter()
           PlaygroundStore.set(1)
         }}
       ><ShellIcon /></BarIcon>
@@ -769,34 +773,50 @@
               <SidebarAvatar src="slot" size="56" rounded={IconRounded} bordered name={char.name} color={char.color} backgroundimg={char.img ? getCharImage(char.img, "plain") : ""}
               oncontextmenu={async (e) => {
                 e.preventDefault()
+                // Resolve the folder by id, re-looked-up after every await:
+                // the render index (ind) can go stale while a modal is open
+                // (characterOrder splices from drops/imports/checkCharOrder),
+                // which used to redirect these edits to the wrong folder.
                 const sel = parseInt(await alertSelect([language.renameFolder,language.changeFolderColor,language.changeFolderImage,language.cancel]))
                 if(sel === 0){
                   const v = await alertInput(language.changeFolderName, [], char.name)
                   const db = DBState.db
                   if(v){
-                    const oder = db.characterOrder[ind]
+                    const folderIndex = getFolderIndex(char.id)
+                    if(folderIndex === -1){
+                      return
+                    }
+                    const oder = db.characterOrder[folderIndex]
                     if(typeof(oder) === 'string'){
                       return
                     }
                     oder.name = v
-                    db.characterOrder[ind] = oder
+                    db.characterOrder[folderIndex] = oder
                   }
                 }
                 else if(sel === 1){
                   const colors = ["red","green","blue","yellow","indigo","purple","pink","default"]
                   const sel = parseInt(await alertSelect(colors))
                   const db = DBState.db
-                  const oder = db.characterOrder[ind]
+                  const folderIndex = getFolderIndex(char.id)
+                  if(folderIndex === -1){
+                    return
+                  }
+                  const oder = db.characterOrder[folderIndex]
                   if(typeof(oder) === 'string'){
                     return
                   }
                   oder.color = colors[sel].toLocaleLowerCase()
-                  db.characterOrder[ind] = oder
+                  db.characterOrder[folderIndex] = oder
                 }
                 else if(sel === 2) {
                   const sel = parseInt(await alertSelect(['Reset to Default Image', 'Select Image File']))
                   const db = DBState.db
-                  const oder = db.characterOrder[ind]
+                  const folderIndex = getFolderIndex(char.id)
+                  if(folderIndex === -1){
+                    return
+                  }
+                  const oder = db.characterOrder[folderIndex]
                   if(typeof(oder) === 'string'){
                     return
                   }
@@ -806,7 +826,7 @@
                       oder.imgFile = null
                       oder.img = ''
                       break;
-                  
+
                     case 1:
                       const folderImage = await selectSingleFile([
                         'png',
@@ -822,7 +842,11 @@
 
                       oder.imgFile = folderImageData
                       oder.img = await getFileSrc(folderImageData)
-                      db.characterOrder[ind] = oder
+                      const writeIndex = getFolderIndex(char.id)
+                      if(writeIndex === -1){
+                        return
+                      }
+                      db.characterOrder[writeIndex] = oder
                       break;
                   }
                 }
@@ -1016,7 +1040,7 @@
       <BarIcon
         onClick={() => {
           reseter();
-          selectedCharID.set(-1)
+          deselectCharacter()
           PlaygroundStore.set(0)
           OpenRealmStore.set(false)
         }}><HomeIcon /></BarIcon>
@@ -1028,7 +1052,7 @@
             PlaygroundStore.set(0)
             return
           }
-          selectedCharID.set(-1)
+          deselectCharacter()
           PlaygroundStore.set(1)
         }}
       ><ShellIcon /></BarIcon>
@@ -1121,6 +1145,19 @@
   {/if}
   {#if sideBarMode === 0}
     {#if $selectedCharID < 0 || $settingsOpen}
+      {#if $supportEnabled}
+        <!-- Same card rhythm as the recent-chat rows below (p-2.5, round leading badge). -->
+        <button
+          type="button"
+          class="mt-1 mb-1 flex w-full items-center gap-2 rounded-md border border-borderc/10 bg-darkbg px-2 py-1.5 text-left transition-colors hover:border-borderc/30 hover:bg-selected/50"
+          onclick={() => supportDialogOpen.set(true)}
+        >
+          <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/15 text-primary">
+            <HeartIcon size={13} />
+          </span>
+          <span class="truncate text-sm font-medium text-textcolor">{language.supportBanner}</span>
+        </button>
+      {/if}
       <span class="block text-base font-semibold text-textcolor mt-2">{language.recentChatsTitle}</span>
       <div class="flex items-center justify-between gap-2 mt-2">
         <span class="text-sm text-textcolor2">{language.hideRecentChats}</span>

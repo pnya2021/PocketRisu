@@ -7,6 +7,8 @@
  */
 
 export const helpDe = {
+    "memoryPresetBinding": "Das Langzeitgedächtnis-Preset dieses Chats.\n\n- **Standard**: folgt dem Standard-Preset unter Einstellungen → Langzeitgedächtnis und ändert sich mit ihm.\n- **Aus**: Nachrichten außerhalb des Kontextfensters werden einfach abgeschnitten.\n- **Ein Preset**: dieser Chat läuft unabhängig vom Standard mit diesem Preset.\n\nWird pro Chat gespeichert; andere Chats desselben Charakters sind nicht betroffen.",
+    "memoryPresetDefault": "Das Langzeitgedächtnis-Preset für Chats, die auf „Standard“ stehen. Bei „Aus“ läuft das Gedächtnis nur in Chats, die selbst ein Preset gewählt haben.",
         "model": "Das Hauptmodell, das im Chat verwendet wird",
         "submodel": "Ein Hilfsmodell ist ein Modell, das zur Analyse von Emotionen und automatischen Vorschlägen usw. verwendet wird, um die die Konversation dynamischer zu gestalten. GPT-3.5 wird hier empfohlen.",
         "oaiapikey": "API-Schlüssel für OpenAI. Sie können sich unter platform.openai.com unter -> account -> api-keys einen API-Schlüssel erstellen",

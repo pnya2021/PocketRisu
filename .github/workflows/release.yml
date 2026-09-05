@@ -85,12 +85,31 @@ jobs:
           name: app-build
           path: portable/
 
-      - name: Install production dependencies
+      # dist/ is prebuilt, so the portable only needs the server's runtime
+      # dependency closure (~40MB) — not the full prod node_modules (~1GB).
+      # The dependency list and its lockfile are committed at
+      # scripts/portable/server-deps/; regenerating here verifies the committed
+      # list still matches what the server actually requires, and the frozen
+      # install keeps transitive versions reproducible.
+      - name: Install server production dependencies
         shell: bash
         run: |
-          cd portable
+          mkdir -p portable/scripts
+          cp scripts/updater.cjs portable/scripts/updater.cjs
+          node scripts/portable/gen-server-deps.cjs portable server-deps-check
+          # --strip-trailing-cr: the Windows runner checks the committed file out with CRLF
+          if ! diff -q --strip-trailing-cr server-deps-check/package.json scripts/portable/server-deps/package.json >/dev/null; then
+            echo "scripts/portable/server-deps/ is stale — server dependencies changed."
+            echo "Regenerate it (see the header of scripts/portable/gen-server-deps.cjs)."
+            diff server-deps-check/package.json scripts/portable/server-deps/package.json || true
+            exit 1
+          fi
+          mkdir server-deps
+          cp scripts/portable/server-deps/package.json scripts/portable/server-deps/pnpm-lock.yaml server-deps/
+          cd server-deps
           echo "node-linker=hoisted" > .npmrc
           pnpm install --prod --frozen-lockfile
+          mv node_modules ../portable/node_modules
 
       - name: Extract version
         id: version
@@ -269,12 +288,43 @@ jobs:
           EOF
           chmod +x portable/start.sh portable/update.sh
 
-      - name: Add updater script and portable marker
+      - name: Add portable marker
         shell: bash
         run: |
-          mkdir -p portable/scripts
-          cp scripts/updater.cjs portable/scripts/updater.cjs 2>/dev/null || true
           touch portable/.portable
+
+      # Boot the assembled portable with its bundled Node and trimmed
+      # node_modules; catches any server dependency the generator missed.
+      - name: Smoke test server boot
+        shell: bash
+        run: |
+          cd portable
+          if [ "${{ matrix.platform }}" = "win" ]; then NODE=bin/node.exe; else NODE=bin/node; fi
+          PORT=6099 "./$NODE" server/node/server.cjs > smoke.log 2>&1 &
+          SERVER_PID=$!
+          OK=0
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:6099/ 2>/dev/null; then OK=1; break; fi
+            sleep 1
+          done
+          kill $SERVER_PID 2>/dev/null || true
+          wait $SERVER_PID 2>/dev/null || true
+          if [ "$OK" != "1" ]; then
+            echo "Server failed to respond on port 6099. Boot log:"
+            cat smoke.log
+            exit 1
+          fi
+          echo "Server booted and served / successfully."
+          # Remove boot side effects so they don't ship in the archive.
+          # Retried: on Windows, file locks can outlive the process briefly.
+          for i in 1 2 3; do
+            rm -rf save smoke.log 2>/dev/null && break
+            sleep 2
+          done
+          if [ -e save ] || [ -e smoke.log ]; then
+            echo "Failed to remove smoke test artifacts."
+            exit 1
+          fi
 
       - name: Package portable (Windows)
         if: matrix.platform == 'win'

@@ -1,0 +1,31 @@
+{
+  "name": "pocketrisu-server-deps",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "better-sqlite3": "12.9.0",
+    "compression": "1.8.1",
+    "compression-streams-polyfill": "0.1.7",
+    "express": "4.22.1",
+    "express-rate-limit": "8.3.1",
+    "fast-json-patch": "3.1.1",
+    "fflate": "0.8.2",
+    "msgpackr": "1.11.9",
+    "node-html-parser": "6.1.13",
+    "onnxruntime-node": "1.21.0",
+    "sharp": "0.34.5",
+    "wasm-vips": "0.0.17",
+    "ws": "8.18.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@swc/core",
+      "better-sqlite3",
+      "core-js",
+      "esbuild",
+      "msgpackr-extract",
+      "onnxruntime-node",
+      "protobufjs"
+    ]
+  }
+}

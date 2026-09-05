@@ -1,8 +1,9 @@
 import { alertError, alertStore, alertWait, alertMd, alertConfirm, alertConfirmMulti, alertClear, waitAlert, notifySuccess, notifyInfo, notifyError } from "../alert";
-import { downloadFile, LocalWriter, forageStorage, restorePersistedDatabaseWithPluginRuntime } from "../globalApi.svelte";
+import { downloadFile, LocalWriter, forageStorage, restorePersistedDatabaseWithPluginRuntime, loadAssetManifestItems } from "../globalApi.svelte";
 import { encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase, type Chat } from "../storage/database.svelte";
 import { fetchChatFromServer } from "../storage/chatStorage";
+import * as pluginStorageStore from "../plugins/pluginStorageStore";
 import { language } from "src/lang";
 
 function formatBytes(bytes: number): string {
@@ -258,6 +259,23 @@ export async function SavePartialLocalBackup(){
     // Reassemble full chats from server for placeholders (runtime lazy load)
     alertWait(`Saving partial local backup... (Assembling chat data)`)
     const dbCopy = structuredClone({ ...db, account: undefined })
+    for (const module of dbCopy.modules ?? []) {
+        if (!module?.assetManifest) continue
+        module.assets = await loadAssetManifestItems(module.assetManifest) as [string, string, string][]
+        delete module.assetManifest
+    }
+    for (const char of dbCopy.characters ?? []) {
+        if (char?.additionalAssetManifest) {
+            char.additionalAssets = await loadAssetManifestItems(char.additionalAssetManifest) as [string, string, string][]
+            delete char.additionalAssetManifest
+        }
+    }
+    for (const persona of dbCopy.personas ?? []) {
+        const embedded = persona?.embeddedModule
+        if (!embedded?.assetManifest) continue
+        embedded.assets = await loadAssetManifestItems(embedded.assetManifest) as [string, string, string][]
+        delete embedded.assetManifest
+    }
     for (const char of dbCopy.characters) {
         for (let i = 0; i < char.chats.length; i++) {
             const chat = char.chats[i]
@@ -271,6 +289,11 @@ export async function SavePartialLocalBackup(){
             }
         }
     }
+    // Plugin values live in the server kv, never in the client DB (the field
+    // is always {}). Importing a .bin replaces plugin storage wholesale, so
+    // the backup must carry every key or a restore wipes them.
+    alertWait(`Saving partial local backup... (Assembling plugin data)`)
+    dbCopy.pluginCustomStorage = await pluginStorageStore.snapshotAll()
     const dbData = encodeRisuSaveLegacy(dbCopy, 'compression')
 
     alertWait(`Saving partial local backup... (Saving database)`) 
@@ -419,7 +442,7 @@ export async function SaveServerBackup() {
             const bytesStr = formatBytes(bytes)
             alertWait(`${language.serverBackupSaving} (${pct}% - ${bytesStr})`)
         })
-        notifySuccess(language.serverBackupSaveSuccess(result.filename, formatBytes(result.size)))
+        notifySuccess(language.serverBackupSaveSuccess(result.filename, formatBytes(result.size), result.dir))
     } catch (error) {
         console.error(error)
         alertError(error instanceof Error ? error.message : 'Server backup failed')

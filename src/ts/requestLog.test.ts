@@ -19,7 +19,7 @@ vi.mock('./storage/database.svelte', () => ({
     getDatabase: () => ({ requestLogEnabled: loggingEnabled }),
 }))
 
-const { createRequestLogScope } = await import('./requestLog')
+const { createRequestLogScope, extractLegacyUsage } = await import('./requestLog')
 
 // Captures what the collector POSTs to /api/request-logs.
 let posted: any[][]
@@ -343,5 +343,58 @@ describe('createRequestLogScope', () => {
         await scope.close()
 
         expect(posted).toHaveLength(0)
+    })
+})
+
+describe('extractLegacyUsage', () => {
+    it('reads OpenAI usage without double-counting cache or reasoning tokens', () => {
+        expect(extractLegacyUsage({
+            usage: {
+                prompt_tokens: 100,
+                completion_tokens: 30,
+                prompt_tokens_details: { cached_tokens: 80 },
+                completion_tokens_details: { reasoning_tokens: 12 },
+            },
+        })).toEqual({
+            inputTokens: 100,
+            outputTokens: 30,
+            cachedTokens: 80,
+            reasoningTokens: 12,
+        })
+    })
+
+    it('adds Anthropic cache tokens to input tokens', () => {
+        expect(extractLegacyUsage({
+            usage: {
+                input_tokens: 40,
+                output_tokens: 10,
+                cache_read_input_tokens: 7,
+                cache_creation_input_tokens: 3,
+            },
+        })).toEqual({
+            inputTokens: 50,
+            outputTokens: 10,
+            cachedTokens: 7,
+        })
+    })
+
+    it('reads Gemini usage metadata', () => {
+        expect(extractLegacyUsage({
+            usageMetadata: {
+                promptTokenCount: 25,
+                candidatesTokenCount: 9,
+                cachedContentTokenCount: 5,
+                thoughtsTokenCount: 4,
+            },
+        })).toEqual({
+            inputTokens: 25,
+            outputTokens: 9,
+            cachedTokens: 5,
+            reasoningTokens: 4,
+        })
+    })
+
+    it('ignores non-matching objects', () => {
+        expect(extractLegacyUsage({ ok: true })).toBeUndefined()
     })
 })

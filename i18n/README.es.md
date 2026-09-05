@@ -79,6 +79,7 @@ Para migrar desde una instalación existente de RisuAI, consulta la [guía de mi
 
 - Reportes de errores / solicitudes de funciones: [GitHub Issues](https://github.com/PocketRisu/PocketRisu/issues)
 - Correo electrónico: contact@pocketrisu.com
+- Apoyar el proyecto: [Patreon](https://patreon.com/PocketRisu/membership) — totalmente opcional; quienes apoyan pueden mostrar su nombre en la app, sin funciones ni ventajas adicionales
 
 
 ## Licencia

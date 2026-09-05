@@ -7,6 +7,7 @@ ENV PATH="$PNPM_HOME:$PATH"
 # Copy dependency-related file
 COPY package.json .
 COPY pnpm-lock.yaml .
+COPY .npmrc .
 
 RUN corepack enable
 RUN corepack install --global pnpm@10.34.1
@@ -16,8 +17,20 @@ RUN corepack install --global pnpm@10.34.1
 FROM base AS deps
 # better-sqlite3 requires native build tools on Node 24
 RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
-# Install only prod deps
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --prod --frozen-lockfile
+# dist/ is prebuilt in the builder stage, so the runtime image only needs the
+# server's runtime dependency closure (~40MB) — not the full prod
+# node_modules (~1GB). The dependency list and its lockfile are committed at
+# scripts/portable/server-deps/; regenerating verifies the committed list
+# still matches what the server actually requires, and the frozen install
+# keeps transitive versions reproducible.
+COPY server ./server
+COPY scripts/portable ./scripts/portable
+COPY scripts/updater.cjs ./scripts/updater.cjs
+RUN node scripts/portable/gen-server-deps.cjs . /tmp/server-deps-check \
+    && cmp /tmp/server-deps-check/package.json scripts/portable/server-deps/package.json \
+    && mkdir server-deps \
+    && cp scripts/portable/server-deps/package.json scripts/portable/server-deps/pnpm-lock.yaml server-deps/
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store cd server-deps && pnpm install --prod --frozen-lockfile
 
 # ------------------------------------------------------------------------------------------
 
@@ -45,7 +58,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json .
-COPY --from=deps /app/node_modules /app/node_modules
+COPY --from=deps /app/server-deps/node_modules /app/node_modules
 COPY --from=builder /app/server ./server
 COPY --from=builder /app/dist ./dist
 
