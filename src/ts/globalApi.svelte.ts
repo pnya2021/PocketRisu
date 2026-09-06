@@ -68,18 +68,56 @@ import { addLog } from './log'
 
 export const forageStorage = new AutoStorage()
 
+async function persistFullDatabaseSnapshotUnderLease(database: Database) {
+    // Restores can contain server stubs, while a live rebase/archive snapshot
+    // contains empty runtime placeholders. Only _stub asks the server to merge
+    // its stored chat body: persisting a placeholder as a full empty chat would
+    // overwrite that body. Keep loaded chats inline so their latest edits land
+    // in this acknowledged write, and never mutate the caller's snapshot.
+    const persistedDatabase: Database = {
+        ...database,
+        characters: Array.isArray(database.characters) ? database.characters.map((character) => {
+            if (!character || !Array.isArray(character.chats)) return character
+            return {
+                ...character,
+                chats: character.chats.map((chat) => {
+                    if (chat?._placeholder !== true) return chat
+                    if (typeof chat.id !== 'string' || !chat.id.trim()) {
+                        throw new Error('Cannot persist an unresolved chat without a stable id')
+                    }
+                    return chatToStub(chat)
+                }),
+            }
+        }) : database.characters,
+    } as Database
+    await persistRestoredDatabaseAndInvalidateEncoder(
+        async () => { await writeEtagBoundDatabase(forageStorage, encodeRisuSaveLegacy(persistedDatabase, 'compression')) },
+        requiresFullEncoderReload,
+    )
+    setPatchSyncBaseline(persistedDatabase)
+}
+
+/** Caller owns the exclusive database lease; the live plugin runtime stays running. */
+export async function persistLiveDatabaseUnderLease(database: Database) {
+    if (!forageStorage.getDbEtag()) {
+        throw new Error('An acknowledged database revision is required before archiving')
+    }
+    // Live storage is already split into KV. Do not remigrate a stale inline
+    // overlay over it, or clear the preloaded cache used by running V2 plugins.
+    if (database.pluginCustomStorage && Object.keys(database.pluginCustomStorage).length > 0) {
+        throw new Error('Live plugin storage must be migrated before archiving')
+    }
+    await persistFullDatabaseSnapshotUnderLease(database)
+}
+
 export async function persistRestoredDatabaseUnderLease(database: Database) {
     await pluginStorageStore.drainPendingWrites()
     pluginStorageStore.invalidateCache()
     try {
-        await persistRestoredDatabaseAndInvalidateEncoder(
-            async () => { await writeEtagBoundDatabase(forageStorage, encodeRisuSaveLegacy(database, 'compression')) },
-            requiresFullEncoderReload,
-        )
+        await persistFullDatabaseSnapshotUnderLease(database)
     } finally {
         pluginStorageStore.invalidateCache()
     }
-    setPatchSyncBaseline(database)
 }
 
 export function persistRestoredDatabase(database: Database) {

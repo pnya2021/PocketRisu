@@ -17,10 +17,11 @@ import { get } from "svelte/store"
 import { language } from "src/lang"
 import { alertConfirm, alertError, notifySuccess } from "./alert"
 import { changeChar, deselectCharacter } from "./characters"
-import { checkCharOrder, forageStorage, requestImmediateSave, requiresFullEncoderReload } from "./globalApi.svelte"
+import { checkCharOrder, forageStorage, persistLiveDatabaseUnderLease, requestImmediateSave, requiresFullEncoderReload } from "./globalApi.svelte"
+import { generationStates } from "./process/generationState"
 import { DBState, loadingOverlayStore, selectedCharID } from "./stores.svelte"
 import { convertStubsToPlaceholders } from "./storage/chatStorage"
-import type { ArchivedCharacterStub, character } from "./storage/database.svelte"
+import { getDatabase, type ArchivedCharacterStub, type character, type Database } from "./storage/database.svelte"
 import { databasePersistenceCoordinator } from "./storage/databasePersistenceCoordinator"
 import { CharacterArchiveError, type NodeStorage } from "./storage/nodeStorage"
 
@@ -66,21 +67,49 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
     if (!arg.skipConfirm && !await alertConfirm(language.deactivateCharacterConfirm(name))) return false
 
     const run = async () => {
-        // The server builds the payload from its own view; push any edits
-        // still sitting in the client's debounce first so nothing is lost.
-        await requestImmediateSave()
         const archived = await databasePersistenceCoordinator.runExclusiveMutation(async () => {
-            // A save/rebase may have replaced the database while the pre-save
-            // was pending. Resolve by stable id only after owning its mutation lease.
-            const db = DBState.db
-            let idx = db.characters.findIndex((c) => c?.chaId === chaId)
-            if (idx === -1) return false
+            // Resolve only after obtaining ownership: a preceding save/rebase
+            // may have replaced the database while the confirmation was open.
+            assertArchiveGenerationIdle()
+            const databaseSnapshot = getDatabase({ snapshot: true })
+            const snapshotMatches = (databaseSnapshot.characters ?? [])
+                .filter((candidate) => candidate?.chaId === chaId)
+            if (snapshotMatches.length === 0) return false
+            if (snapshotMatches.length !== 1) {
+                throw new CharacterArchiveError(
+                    'ARCHIVE_CHARACTER_CHANGED',
+                    'The character identity is ambiguous. Reload before retrying deactivation.',
+                )
+            }
+            const targetSignature = archiveTargetSignature(snapshotMatches[0])
 
-            // Keep the server snapshot and its corresponding live list move in
-            // the same lease as owned message/Inlay writes.
+            // Archive must not turn an initial, unbound write into a blind
+            // overwrite of a foreign database revision.
+            if (!forageStorage.getDbEtag()) {
+                throw new CharacterArchiveError(
+                    'ARCHIVE_SAVE_UNAVAILABLE',
+                    'The saved database revision is unavailable. Reload before deactivating a character.',
+                )
+            }
+
+            // The debounce save can coalesce or absorb failures. Use an
+            // acknowledged, ETag-bound full write of the exact snapshot instead.
+            await persistLiveDatabaseUnderLease(databaseSnapshot)
+            assertArchiveTargetUnchanged(chaId, targetSignature)
+
+            // Generations are checked separately because their incremental
+            // writes can occur outside the coordinator.
             const stub = await storage().archiveCharacter(chaId)
-            idx = db.characters.findIndex((c) => c?.chaId === chaId)
-            if (idx === -1) return false
+            assertArchiveTargetUnchanged(chaId, targetSignature)
+
+            const db = DBState.db
+            const idx = db.characters.findIndex((candidate) => candidate?.chaId === chaId)
+            if (idx === -1) {
+                throw new CharacterArchiveError(
+                    'ARCHIVE_CHARACTER_CHANGED',
+                    'The character changed while preparing deactivation. Retry the operation.',
+                )
+            }
             if (!Array.isArray(db.nodeOnlyArchivedCharacters)) db.nodeOnlyArchivedCharacters = []
             if (arg.trash) stub.trashedAt = arg.trashedAt ?? Date.now()
             db.nodeOnlyArchivedCharacters.push(stub)
@@ -168,6 +197,34 @@ export async function activateCharacter(chaId: string): Promise<number> {
     // requestImmediateSave takes a normal-write lease itself.
     if (shouldSave) void requestImmediateSave()
     return result
+}
+
+function assertArchiveGenerationIdle(): void {
+    if (get(generationStates).size === 0) return
+    throw new CharacterArchiveError(
+        'ARCHIVE_GENERATION_ACTIVE',
+        'Wait for all message generations to finish before deactivating a character.',
+    )
+}
+
+function archiveTargetSignature(target: Database['characters'][number]): string {
+    const signature = JSON.stringify(target)
+    if (typeof signature === 'string') return signature
+    throw new CharacterArchiveError(
+        'ARCHIVE_CHARACTER_CHANGED',
+        'The character changed while preparing deactivation. Retry the operation.',
+    )
+}
+
+function assertArchiveTargetUnchanged(chaId: string, expectedSignature: string): void {
+    assertArchiveGenerationIdle()
+    const matches = (getDatabase({ snapshot: true }).characters ?? [])
+        .filter((candidate) => candidate?.chaId === chaId)
+    if (matches.length === 1 && archiveTargetSignature(matches[0]) === expectedSignature) return
+    throw new CharacterArchiveError(
+        'ARCHIVE_CHARACTER_CHANGED',
+        'The character changed while preparing deactivation. Retry the operation.',
+    )
 }
 
 /** Move an already-deactivated character to the trash (marker only; nothing moves on the server). */

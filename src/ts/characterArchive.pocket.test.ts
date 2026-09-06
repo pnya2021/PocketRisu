@@ -20,6 +20,8 @@ const host = vi.hoisted(() => {
         deleteArchivedCharacter: vi.fn(),
         fetchArchivedCharactersInline: vi.fn(),
         requestImmediateSave: vi.fn(),
+        persistLiveDatabaseUnderLease: vi.fn(),
+        getDbEtag: vi.fn(),
         checkCharOrder: vi.fn(),
         requiresFullEncoderReload: { state: false },
     }
@@ -60,7 +62,9 @@ vi.mock('./globalApi.svelte', () => ({
             deleteArchivedCharacter: host.deleteArchivedCharacter,
             fetchArchivedCharactersInline: host.fetchArchivedCharactersInline,
         },
+        getDbEtag: host.getDbEtag,
     },
+    persistLiveDatabaseUnderLease: host.persistLiveDatabaseUnderLease,
     requestImmediateSave: host.requestImmediateSave,
     requiresFullEncoderReload: host.requiresFullEncoderReload,
 }))
@@ -75,6 +79,12 @@ vi.mock('./storage/chatStorage', () => ({
     convertStubsToPlaceholders: (chats: unknown[]) => chats,
 }))
 
+vi.mock('./storage/database.svelte', () => ({
+    getDatabase: ({ snapshot }: { snapshot?: boolean } = {}) => snapshot
+        ? JSON.parse(JSON.stringify(host.dbState.db))
+        : host.dbState.db,
+}))
+
 vi.mock('./storage/nodeStorage', () => {
     class CharacterArchiveError extends Error {
         constructor(public readonly code: string, message: string) {
@@ -86,6 +96,7 @@ vi.mock('./storage/nodeStorage', () => {
 })
 
 import { activateCharacter, archiveCharacter } from './characterArchive'
+import { generationStates, type GenState } from './process/generationState'
 import { databasePersistenceCoordinator } from './storage/databasePersistenceCoordinator'
 
 function deferred<T = void>() {
@@ -98,6 +109,13 @@ function deferred<T = void>() {
     return { promise, resolve, reject }
 }
 
+function archivedStub(name = 'Archived') {
+    return {
+        chaId: 'character-a', name, archivedAt: 100,
+        bytes: 1, chatCount: 0, chatIds: [], image: '', tags: [], lastInteraction: 0,
+    }
+}
+
 describe('character archive database mutation ownership', () => {
     beforeEach(() => {
         host.dbState.db = { characters: [], nodeOnlyArchivedCharacters: [] }
@@ -105,83 +123,188 @@ describe('character archive database mutation ownership', () => {
         host.requiresFullEncoderReload.state = false
         vi.clearAllMocks()
         host.requestImmediateSave.mockResolvedValue(undefined)
+        host.persistLiveDatabaseUnderLease.mockResolvedValue(undefined)
+        host.getDbEtag.mockReturnValue('etag:current')
+        generationStates.set(new Map())
     })
 
-    it('waits for an acknowledged owned write before taking the server archive snapshot', async () => {
+    it('waits for an owned write and full-writes its acknowledged target before archiving', async () => {
         host.dbState.db = {
             characters: [{ chaId: 'character-a', name: 'Before write', chats: [] }],
             nodeOnlyArchivedCharacters: [],
         }
         const writerStarted = deferred()
         const releaseWriter = deferred()
-        let writer: Promise<void> | undefined
-        let persistedName = 'Before write'
+        let persistedName: string | undefined
         let archivedName: string | undefined
-
-        // Model requestImmediateSave's real ordering: its normal save completes,
-        // then another owned message mutation obtains the shared coordinator
-        // before archiveCharacter's await continuation resumes.
-        host.requestImmediateSave.mockImplementationOnce(async () => {
-            await databasePersistenceCoordinator.runNormalWrite(
-                databasePersistenceCoordinator.captureGeneration(),
-                () => undefined,
-            )
-            writer = databasePersistenceCoordinator.runExclusiveMutation(async () => {
-                writerStarted.resolve()
-                await releaseWriter.promise
-                persistedName = 'Acknowledged write'
-            })
+        const writer = databasePersistenceCoordinator.runExclusiveMutation(async () => {
+            writerStarted.resolve()
+            await releaseWriter.promise
+            host.dbState.db.characters[0].name = 'Acknowledged write'
+        })
+        await writerStarted.promise
+        host.persistLiveDatabaseUnderLease.mockImplementation(async (snapshot: any) => {
+            persistedName = snapshot.characters[0].name
         })
         host.archiveCharacter.mockImplementation(async () => {
             archivedName = persistedName
-            return {
-                chaId: 'character-a',
-                name: archivedName,
-                archivedAt: 100,
-                bytes: 1,
-                chatCount: 0,
-                chatIds: [],
-                image: '',
-                tags: [],
-                lastInteraction: 0,
-            }
+            return archivedStub(archivedName)
         })
 
         const archiving = archiveCharacter(0, { skipConfirm: true, silent: true })
-        await writerStarted.promise
         await Promise.resolve()
-        const archiveStartedBeforeAcknowledgement = host.archiveCharacter.mock.calls.length > 0
+        const persistenceStartedBeforeAcknowledgement = host.persistLiveDatabaseUnderLease.mock.calls.length > 0
         releaseWriter.resolve()
         await writer
         await expect(archiving).resolves.toBe(true)
 
-        expect(archiveStartedBeforeAcknowledgement).toBe(false)
+        expect(persistenceStartedBeforeAcknowledgement).toBe(false)
         expect(archivedName).toBe('Acknowledged write')
         expect(host.dbState.db.characters).toEqual([])
         expect(host.dbState.db.nodeOnlyArchivedCharacters).toHaveLength(1)
     })
 
-    it('re-resolves the archive target after the pre-save lease instead of mutating a stale database', async () => {
+    it('re-resolves the archive target after acquiring the lease instead of mutating a stale database', async () => {
         const staleDatabase = {
             characters: [{ chaId: 'character-a', name: 'Deleted concurrently', chats: [] }],
             nodeOnlyArchivedCharacters: [] as any[],
         }
         host.dbState.db = staleDatabase
-        host.requestImmediateSave.mockImplementationOnce(async () => {
-            await databasePersistenceCoordinator.runExclusiveMutation(() => {
-                host.dbState.db = { characters: [], nodeOnlyArchivedCharacters: [] }
-            })
+        const priorStarted = deferred()
+        const releasePrior = deferred()
+        const prior = databasePersistenceCoordinator.runExclusiveMutation(async () => {
+            priorStarted.resolve()
+            await releasePrior.promise
+            host.dbState.db = { characters: [], nodeOnlyArchivedCharacters: [] }
         })
-        host.archiveCharacter.mockResolvedValue({
-            chaId: 'character-a', name: 'Deleted concurrently', archivedAt: 100,
-            bytes: 1, chatCount: 0, chatIds: [], image: '', tags: [], lastInteraction: 0,
-        })
+        await priorStarted.promise
+        host.archiveCharacter.mockResolvedValue(archivedStub('Deleted concurrently'))
 
-        await expect(archiveCharacter(0, { skipConfirm: true, silent: true })).resolves.toBe(false)
+        const archiving = archiveCharacter(0, { skipConfirm: true, silent: true })
+        releasePrior.resolve()
+        await prior
+        await expect(archiving).resolves.toBe(false)
 
+        expect(host.persistLiveDatabaseUnderLease).not.toHaveBeenCalled()
         expect(host.archiveCharacter).not.toHaveBeenCalled()
         expect(host.dbState.db.characters).toEqual([])
         expect(staleDatabase.nodeOnlyArchivedCharacters).toEqual([])
+    })
+
+    it.each(['live', 'background'] as const)('rejects while a %s generation is active', async (kind) => {
+        host.dbState.db = {
+            characters: [{ chaId: 'character-a', name: 'Generating', chats: [] }],
+            nodeOnlyArchivedCharacters: [],
+        }
+        generationStates.set(new Map<string, GenState>([[
+            'chat-a', { generationId: 'generation-a', kind },
+        ]]))
+
+        await expect(archiveCharacter(0, { skipConfirm: true, silent: true }))
+            .rejects.toMatchObject({ code: 'ARCHIVE_GENERATION_ACTIVE' })
+
+        expect(host.dbState.db.characters).toHaveLength(1)
+        expect(host.persistLiveDatabaseUnderLease).not.toHaveBeenCalled()
+        expect(host.archiveCharacter).not.toHaveBeenCalled()
+    })
+
+    it('rejects when a generation starts during the acknowledged full write', async () => {
+        host.dbState.db = {
+            characters: [{ chaId: 'character-a', name: 'Stable', chats: [] }],
+            nodeOnlyArchivedCharacters: [],
+        }
+        host.persistLiveDatabaseUnderLease.mockImplementation(async () => {
+            generationStates.set(new Map<string, GenState>([[
+                'chat-a', { generationId: 'generation-a', kind: 'live' },
+            ]]))
+        })
+
+        await expect(archiveCharacter(0, { skipConfirm: true, silent: true }))
+            .rejects.toMatchObject({ code: 'ARCHIVE_GENERATION_ACTIVE' })
+
+        expect(host.dbState.db.characters).toHaveLength(1)
+        expect(host.archiveCharacter).not.toHaveBeenCalled()
+    })
+
+    it('leaves the live body when a generation starts during archive HTTP', async () => {
+        host.dbState.db = {
+            characters: [{ chaId: 'character-a', name: 'Stable', chats: [] }],
+            nodeOnlyArchivedCharacters: [],
+        }
+        host.archiveCharacter.mockImplementation(async () => {
+            generationStates.set(new Map<string, GenState>([[
+                'chat-a', { generationId: 'generation-a', kind: 'background' },
+            ]]))
+            return archivedStub('Stable')
+        })
+
+        await expect(archiveCharacter(0, { skipConfirm: true, silent: true }))
+            .rejects.toMatchObject({ code: 'ARCHIVE_GENERATION_ACTIVE' })
+
+        expect(host.dbState.db.characters.map((char) => char.chaId)).toEqual(['character-a'])
+        expect(host.dbState.db.nodeOnlyArchivedCharacters).toEqual([])
+    })
+
+    it('rejects a target edit made during the acknowledged full write before archive HTTP', async () => {
+        host.dbState.db = {
+            characters: [{ chaId: 'character-a', name: 'Before edit', chats: [] }],
+            nodeOnlyArchivedCharacters: [],
+        }
+        host.persistLiveDatabaseUnderLease.mockImplementation(async () => {
+            host.dbState.db.characters[0].name = 'Edited during write'
+        })
+
+        await expect(archiveCharacter(0, { skipConfirm: true, silent: true }))
+            .rejects.toMatchObject({ code: 'ARCHIVE_CHARACTER_CHANGED' })
+
+        expect(host.dbState.db.characters[0].name).toBe('Edited during write')
+        expect(host.archiveCharacter).not.toHaveBeenCalled()
+    })
+
+    it('leaves the edited live body when the target changes during archive HTTP', async () => {
+        host.dbState.db = {
+            characters: [{ chaId: 'character-a', name: 'Before edit', chats: [] }],
+            nodeOnlyArchivedCharacters: [],
+        }
+        host.archiveCharacter.mockImplementation(async () => {
+            host.dbState.db.characters[0].name = 'Edited during archive'
+            return archivedStub('Before edit')
+        })
+
+        await expect(archiveCharacter(0, { skipConfirm: true, silent: true }))
+            .rejects.toMatchObject({ code: 'ARCHIVE_CHARACTER_CHANGED' })
+
+        expect(host.dbState.db.characters[0].name).toBe('Edited during archive')
+        expect(host.dbState.db.nodeOnlyArchivedCharacters).toEqual([])
+    })
+
+    it('does not call archive HTTP when the acknowledged full write rejects', async () => {
+        host.dbState.db = {
+            characters: [{ chaId: 'character-a', name: 'Unsaved', chats: [] }],
+            nodeOnlyArchivedCharacters: [],
+        }
+        host.persistLiveDatabaseUnderLease.mockRejectedValue(new Error('write failed'))
+
+        await expect(archiveCharacter(0, { skipConfirm: true, silent: true }))
+            .rejects.toThrow('write failed')
+
+        expect(host.dbState.db.characters).toHaveLength(1)
+        expect(host.archiveCharacter).not.toHaveBeenCalled()
+    })
+
+    it('refuses an unbound full write when no database ETag is available', async () => {
+        host.dbState.db = {
+            characters: [{ chaId: 'character-a', name: 'Unbound', chats: [] }],
+            nodeOnlyArchivedCharacters: [],
+        }
+        host.getDbEtag.mockReturnValue(null)
+
+        await expect(archiveCharacter(0, { skipConfirm: true, silent: true }))
+            .rejects.toMatchObject({ code: 'ARCHIVE_SAVE_UNAVAILABLE' })
+
+        expect(host.persistLiveDatabaseUnderLease).not.toHaveBeenCalled()
+        expect(host.archiveCharacter).not.toHaveBeenCalled()
+        expect(host.dbState.db.characters).toHaveLength(1)
     })
 
     it('holds activation ownership through the server read and the live list move', async () => {
