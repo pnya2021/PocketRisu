@@ -13,7 +13,7 @@ import type {
 type UnknownRecord = Record<PropertyKey, any>
 
 export interface PocketStudioCardAdapterDependencies {
-    getDatabase(): { characters?: unknown[] }
+    getDatabase(): { characters?: unknown[]; nodeOnlyArchivedCharacters?: unknown[] }
     getSelectedCharacterIndex(): number
     readImage(storageKey: string): Promise<Uint8Array | ArrayBuffer | ArrayBufferView | null | undefined>
     getAssetStorageRevision?(storageKey: string): string
@@ -632,6 +632,14 @@ export function createPocketStudioCardResourceAdapter(
             : []
         const memberRecords = rootMembers.map((memberId) => catalogue.byId.get(memberId))
         if (memberRecords.some((member) => !member || member.native.kind !== 'character')) {
+            const archivedField = ownData(dependencies.getDatabase(), 'nodeOnlyArchivedCharacters')
+            const archived = archivedField.valid ? arrayValues(archivedField.value) ?? [] : []
+            const missingIds = new Set(rootMembers.filter((_id, index) => !memberRecords[index]))
+            if (archived.some((stub) => isRecord(stub) && missingIds.has(ownData(stub, 'chaId').value))) {
+                throw new PluginApiError('NOT_FOUND',
+                    '그룹 구성원 중 비활성화되거나 휴지통에 있는 카드가 있습니다. 본체에서 복원·활성화한 뒤 다시 시도하세요.',
+                    { details: { reason: 'GROUP_MEMBER_ARCHIVED' } })
+            }
             throw malformed('Studio group membership is missing, nested, or malformed')
         }
         const project = (record: typeof rootRecord) => projectAssets

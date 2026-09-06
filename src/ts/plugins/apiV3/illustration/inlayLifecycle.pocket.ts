@@ -15,6 +15,7 @@ export interface PocketInlayLifecycleDependencies {
     getDatabase(): { characters?: UnknownRecord[] }
     getCurrentCharacter(): UnknownRecord | undefined
     fetchChatContent(chaId: string, chatIndex: number, chatId: string): Promise<unknown | null>
+    fetchInlayReferences(): Promise<unknown>
     getInlayAssetRecord(id: string): Promise<InlayAssetRecord | null>
     writeInlayImageFromBytes(data: Uint8Array, options: {
         id: string
@@ -50,6 +51,26 @@ const messagesContain = (messages: unknown, tokens: readonly string[], strict: b
         if (containsToken(message.data, tokens)) return true
     }
     return false
+}
+
+const referenceCountFromScan = (scan: unknown, id: string) => {
+    if (!scan || typeof scan !== 'object') throw new Error('Inlay reference scan is malformed')
+    const { scannedAt, totalMessages, refCounts } = scan as UnknownRecord
+    if (!Number.isSafeInteger(scannedAt) || scannedAt <= 0
+        || !Number.isSafeInteger(totalMessages) || totalMessages < 0
+        || !refCounts || typeof refCounts !== 'object' || Array.isArray(refCounts)) {
+        throw new Error('Inlay reference scan is malformed')
+    }
+    const prototype = Object.getPrototypeOf(refCounts)
+    if (prototype !== null && prototype !== Object.prototype) {
+        throw new Error('Inlay reference counts are malformed')
+    }
+    for (const count of Object.values(refCounts)) {
+        if (typeof count !== 'number' || !Number.isSafeInteger(count) || count <= 0) {
+            throw new Error('Inlay reference counts are malformed')
+        }
+    }
+    return Object.prototype.hasOwnProperty.call(refCounts, id) ? refCounts[id] as number : 0
 }
 
 const storageFailure = (message: string) => new PluginApiError('INTERNAL', message, { retryable: true })
@@ -171,10 +192,11 @@ export function createPocketInlayLifecycleAdapter(
                         if (messagesContain((loaded as UnknownRecord).message, tokens, true)) return true
                     }
                 }
-                return false
+                const scan = await dependencies.fetchInlayReferences()
+                return referenceCountFromScan(scan, id) > 0
             } catch (error) {
                 if (error instanceof PluginApiError) throw error
-                throw storageFailure('Unable to verify lazy-chat Inlay references')
+                throw storageFailure('Unable to verify Inlay references')
             }
         },
         async removeInlay(id) {

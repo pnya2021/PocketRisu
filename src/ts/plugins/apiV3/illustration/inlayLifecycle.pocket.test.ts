@@ -24,6 +24,11 @@ function harness(overrides: Record<string, unknown> = {}) {
         getDatabase: vi.fn(() => database),
         getCurrentCharacter: vi.fn(() => ({ chaId: 'character-1' })),
         fetchChatContent: vi.fn(async () => null as unknown),
+        fetchInlayReferences: vi.fn(async () => ({
+            scannedAt: 1,
+            totalMessages: 1,
+            refCounts: Object.create(null) as Record<string, number>,
+        })),
         getInlayAssetRecord: vi.fn(async (id: string) => stored.get(id) ?? null),
         writeInlayImageFromBytes: vi.fn(async (_data: Uint8Array, request: any) => {
             await request.beforeStore()
@@ -83,6 +88,56 @@ describe('Pocket owned Inlay adapter', () => {
             getDatabase: vi.fn(() => ({ characters: [{ chaId: 'c', chats: [{ message: [{ data: `{{inlayed::${id}extra}} {{inlay::prefix${id}}}` }] }] }] })),
         })
         await expect(adapter.hasReference(id)).resolves.toBe(false)
+    })
+
+    it('finds a reference that exists only in the authoritative server archive scan', async () => {
+        const id = 'inlay_' + 'a'.repeat(64)
+        const fetchInlayReferences = vi.fn(async () => ({
+            scannedAt: 10,
+            totalMessages: 3,
+            refCounts: Object.assign(Object.create(null), { [id]: 1 }) as Record<string, number>,
+        }))
+        const { adapter } = harness({ fetchInlayReferences })
+
+        await expect(adapter.hasReference(id)).resolves.toBe(true)
+        expect(fetchInlayReferences).toHaveBeenCalledOnce()
+    })
+
+    it('allows an Inlay absent from both active chats and the authoritative server scan', async () => {
+        const id = 'inlay_' + 'a'.repeat(64)
+        const { adapter } = harness()
+
+        await expect(adapter.hasReference(id)).resolves.toBe(false)
+    })
+
+    it.each([
+        ['server unavailable', vi.fn(async () => { throw new Error('private server path') })],
+        ['missing refCounts', vi.fn(async () => ({ scannedAt: 10, totalMessages: 3 }))],
+        ['array refCounts', vi.fn(async () => ({ scannedAt: 10, totalMessages: 3, refCounts: [] }))],
+        ['invalid reference count', vi.fn(async () => ({ scannedAt: 10, totalMessages: 3, refCounts: { other: -1 } }))],
+    ])('fails closed without exposing raw details when the authoritative scan is %s', async (_label, fetchInlayReferences) => {
+        const { adapter } = harness({ fetchInlayReferences })
+
+        await expect(adapter.hasReference('inlay_' + 'a'.repeat(64))).rejects.toMatchObject({
+            name: 'PluginApiError',
+            code: 'INTERNAL',
+            message: 'Unable to verify Inlay references',
+            retryable: true,
+        })
+    })
+
+    it('retains an unsaved live reference without depending on server availability', async () => {
+        const id = 'inlay_' + 'a'.repeat(64)
+        const fetchInlayReferences = vi.fn(async () => { throw new Error('offline') })
+        const { adapter } = harness({
+            getDatabase: vi.fn(() => ({
+                characters: [{ chaId: 'c', chats: [{ message: [{ data: `{{inlay::${id}}}` }] }] }],
+            })),
+            fetchInlayReferences,
+        })
+
+        await expect(adapter.hasReference(id)).resolves.toBe(true)
+        expect(fetchInlayReferences).not.toHaveBeenCalled()
     })
 
     it('reads placeholder chat content lazily without hydrating or mutating database state', async () => {

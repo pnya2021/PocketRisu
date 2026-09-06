@@ -40,7 +40,7 @@ import {
     correctRerollMessageIdentity,
     pocketMessageRevisionKey,
 } from "../plugins/apiV3/illustration/messageEvents.pocket";
-import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
+import { abortGeneration, chatGenKey, chatProcessStage, endGeneration, isChatGenerating, onDatabaseRebased, registerAbort, setGenerationStage, startGeneration } from "./generationState";
 import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
 
 export interface OpenAIChat{
@@ -256,7 +256,11 @@ export async function generateResolvedSpeaker(
 ):Promise<boolean> {
 
     chatProcessStage.set(0)
-    const abortSignal = arg.signal ?? (new AbortController()).signal
+    // Callers without a signal (multisend, commands, dev tools) get an
+    // internal controller that is registered with the generation entry below,
+    // so abortGeneration() reaches every send, not only UI-initiated ones.
+    const internalAbort = arg.signal ? null : new AbortController()
+    const abortSignal = arg.signal ?? internalAbort.signal
     const responseStartedAt = arg.responseStartedAt ?? performance.now()
     
     // NOTE: `throwError()` can be called before these are populated (e.g. HypaV3 early validation errors).
@@ -393,6 +397,7 @@ export async function generateResolvedSpeaker(
         return false
     }
     const generationId = v4()
+    if (internalAbort) registerAbort(genKey, internalAbort)
     startGeneration(genKey, generationId)
     // Resumable-send tombstone (pendingSends.ts): registered BEFORE the
     // pipeline so a tab death anywhere in it (translate → memory → request)
@@ -401,6 +406,11 @@ export async function generateResolvedSpeaker(
     // No-op unless the server-side requests toggle is on.
     if (realChatId && !arg.preview && !arg.previewPrompt) {
         registerPendingSend(realChatId, generationId)
+    }
+    // Module-scoped result of the last preview: cleared up front so a failed
+    // preview cannot hand the previous prompt to the caller as if it were new.
+    if (arg.previewPrompt) {
+        previewBody = ''
     }
 
     if(chatProcessIndex === -1 && DBState.db.presetChain){
@@ -423,6 +433,31 @@ export async function generateResolvedSpeaker(
     DBState.db.statics.messages += 1
     nowChatroom.lastInteraction = Date.now()
     selectedChat = nowChatroom.chatPage
+    // The indices above address DBState.db for the rest of this send. A save
+    // conflict rebase may replace the database (and reorder characters) while
+    // streaming, so re-resolve them by id when that happens; the listener is
+    // dropped with the generation entry.
+    {
+        const sendChaId = nowChatroom.chaId
+        const sendChatId = nowChatroom.chats?.[selectedChat]?.id
+        onDatabaseRebased(genKey, () => {
+            const chars = DBState.db.characters ?? []
+            const charIdx = chars.findIndex((c) => c?.chaId === sendChaId)
+            if (charIdx === -1) {
+                // Deactivated on another device mid-generation. The rebase
+                // aborts such generations and waits for them to end BEFORE
+                // swapping the database (globalApi), so this branch is only
+                // reached if that wait timed out; abort again as a last
+                // resort and leave the indices (the old target object is
+                // gone either way).
+                abortGeneration(genKey)
+                return
+            }
+            selectedChar = charIdx
+            const chatIdx = sendChatId ? (chars[charIdx].chats ?? []).findIndex((c) => c?.id === sendChatId) : -1
+            if (chatIdx !== -1) selectedChat = chatIdx
+        })
+    }
     // Block send if chat is still a placeholder (hydration not complete)
     if (nowChatroom.chats[nowChatroom.chatPage]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
@@ -1914,16 +1949,22 @@ export async function generateResolvedSpeaker(
                 if(streamingFlushError !== null){
                     throw streamingFlushError
                 }
-                if(deferStreamingPostProcessing && receivedStreamingResult){
+                // A user Stop still post-processes the partial reply as before;
+                // only skip when the target message no longer exists (the
+                // character was deactivated elsewhere during a rebase).
+                if(deferStreamingPostProcessing && receivedStreamingResult && DBState.db.characters[selectedChar]?.chats?.[selectedChat]?.message?.[msgIndex]){
                     let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
                     emoChanged = result2.emoChanged
                 }
             }
             finally {
-                DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = false
-                DBState.db.characters[selectedChar].chats[selectedChat].activeStreamingDisplayOptimizationMode = undefined
-                DBState.db.characters[selectedChar].reloadKeys += 1
+                const target = DBState.db.characters[selectedChar]
+                if(target?.chats?.[selectedChat]){
+                    target.chats[selectedChat].isStreaming = false
+                    target.chats[selectedChat].activeStreamingDisplayOptimizationMode = undefined
+                    target.reloadKeys += 1
+                }
                 void reader.cancel().catch(() => {})
             }
         }

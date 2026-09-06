@@ -754,6 +754,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             getDatabase,
             getCurrentCharacter,
             fetchChatContent: (chaId, chatIndex, chatId) => inlayNodeStorage.fetchChatContent(chaId, chatIndex, chatId),
+            fetchInlayReferences: () => inlayNodeStorage.fetchInlayReferences(),
             getInlayAssetRecord,
             writeInlayImageFromBytes,
             removeInlayAsset,
