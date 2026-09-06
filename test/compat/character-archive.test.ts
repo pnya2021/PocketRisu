@@ -379,4 +379,83 @@ describe('character archive', () => {
     expect(s.prefixes['archive-meta/'].count).toBe(0)
     expect(s.archiveOrphan).toMatchObject({ available: true, count: 0 })
   })
+
+  test('archive preserves a newly loaded edit and the full body behind a lazy-chat stub', async () => {
+    const isolated = await spawnServer({ env: { POCKETRISU_CHUNK_THRESHOLD: '4096' } })
+    try {
+      const isolatedClient = await createClient(isolated.port, isolated.password)
+      expect((await isolatedClient.importBackup(buildBackup())).ok).toBe(true)
+
+      const readIsolatedDb = async () => {
+        const res = await isolatedClient.fetch('/api/read', { headers: { 'file-path': DB_KEY_HEX } })
+        expect(res.status).toBe(200)
+        const db = utils.normalizeJSON(await utils.decodeRisuSave(Buffer.from(await res.arrayBuffer()))) as any
+        return { db, etag: res.headers.get('x-db-etag'), hash: utils.calculateHash(db).toString(16) }
+      }
+      const readChat = async (index: number, id: string) => {
+        const res = await isolatedClient.fetch(`/api/chat-content/${ARCH}/${index}`, { headers: { 'x-chat-id': id } })
+        expect(res.status).toBe(200)
+        return utils.normalizeJSON(await utils.decodeRisuSave(Buffer.from(await res.arrayBuffer()))) as any
+      }
+
+      const before = await readIsolatedDb()
+      const prepared = structuredClone(before.db)
+      const target = prepared.characters.find((character: any) => character.chaId === ARCH)
+      const loadedChat = await readChat(0, 'a-chat-0')
+      loadedChat.message[0].data = 'newly loaded edit acknowledged before archive'
+      const originalLazyChat = await readChat(1, 'a-chat-1')
+      const lazyView = target.chats[1]
+      const preparedLazyStub = {
+        id: lazyView.id,
+        name: lazyView.name,
+        _stub: true,
+        ...('lastDate' in lazyView ? { lastDate: lazyView.lastDate } : {}),
+        ...('folderId' in lazyView ? { folderId: lazyView.folderId } : {}),
+        ...('modules' in lazyView ? { modules: lazyView.modules } : {}),
+      }
+      expect(preparedLazyStub).toEqual(lazyView)
+      target.chats = [loadedChat, preparedLazyStub]
+
+      const write = await isolatedClient.fetch('/api/write', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'file-path': DB_KEY_HEX,
+          'x-if-match': before.etag!,
+        },
+        body: new Uint8Array(encodeDb(prepared)),
+      })
+      expect(write.status).toBe(200)
+      expect(await write.json() as any).toMatchObject({ success: true, etag: expect.any(String) })
+
+      const persisted = await readIsolatedDb()
+      const archived = await isolatedClient.fetch(`/api/characters/${ARCH}/archive`, { method: 'POST' })
+      expect(archived.status).toBe(200)
+      const archivedStub = (await archived.json() as any).stub
+      const targetIndex = persisted.db.characters.findIndex((character: any) => character.chaId === ARCH)
+      const moved = await isolatedClient.fetch('/api/patch', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'file-path': DB_KEY_HEX },
+        body: JSON.stringify({
+          expectedHash: persisted.hash,
+          patch: [
+            { op: 'remove', path: `/characters/${targetIndex}` },
+            { op: 'add', path: '/nodeOnlyArchivedCharacters', value: [archivedStub] },
+          ],
+        }),
+      })
+      expect(moved.status).toBe(200)
+
+      const inline = await isolatedClient.fetch('/api/characters/archived/inline')
+      expect(inline.status).toBe(200)
+      const payload = utils.normalizeJSON(
+        await utils.decodeRisuSave(Buffer.from(await inline.arrayBuffer())),
+      ) as any
+      const restored = payload.characters.find((character: any) => character.chaId === ARCH)
+      expect(restored.chats[0]).toEqual(loadedChat)
+      expect(restored.chats[1]).toEqual(originalLazyChat)
+    } finally {
+      await isolated.cleanup()
+    }
+  })
 })
