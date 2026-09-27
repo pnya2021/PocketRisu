@@ -1,6 +1,7 @@
 //This is a web worker that runs Python code using Pyodide.
 
 import { loadPyodide, version as pyodideVersion, type PyodideInterface } from "pyodide";
+import { v4 } from "uuid";
 
 type InitMessage = {
     type: "init";
@@ -46,7 +47,7 @@ self.onmessage = async (event:MessageEvent<PyWorkerMessage>) => {
                 md[func] = (...args: any[]) => {
 
                     return new Promise((resolve, reject) => {
-                        const callid = crypto.randomUUID();
+                        const callid = v4();
                         self.postMessage({
                             type: "call",
                             function: func,

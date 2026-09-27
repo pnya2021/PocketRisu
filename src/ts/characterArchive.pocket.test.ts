@@ -197,7 +197,7 @@ describe('character archive database mutation ownership', () => {
             nodeOnlyArchivedCharacters: [],
         }
         generationStates.set(new Map<string, GenState>([[
-            'chat-a', { generationId: 'generation-a', kind },
+            'chat-a', { generationId: 'generation-a', kind, startedAt: 0 },
         ]]))
 
         await expect(archiveCharacter(0, { skipConfirm: true, silent: true }))
@@ -215,7 +215,7 @@ describe('character archive database mutation ownership', () => {
         }
         host.persistLiveDatabaseUnderLease.mockImplementation(async () => {
             generationStates.set(new Map<string, GenState>([[
-                'chat-a', { generationId: 'generation-a', kind: 'live' },
+                'chat-a', { generationId: 'generation-a', kind: 'live', startedAt: 0 },
             ]]))
         })
 
@@ -233,7 +233,7 @@ describe('character archive database mutation ownership', () => {
         }
         host.archiveCharacter.mockImplementation(async () => {
             generationStates.set(new Map<string, GenState>([[
-                'chat-a', { generationId: 'generation-a', kind: 'background' },
+                'chat-a', { generationId: 'generation-a', kind: 'background', startedAt: 0 },
             ]]))
             return archivedStub('Stable')
         })

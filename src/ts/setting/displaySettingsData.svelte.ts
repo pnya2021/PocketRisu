@@ -80,6 +80,8 @@ export const displayThemeSettingsItems: SettingItem[] = [
         componentProps: { messageKey: 'customCSSWarning' },
         keywords: ['custom', 'css', 'warning'],
     },
+    // moved from Advanced (only matters with custom CSS)
+    { id: 'adv.cssErr', type: 'check', labelKey: 'returnCSSError', bindKey: 'returnCSSError', helpKey: 'returnCSSError', classes: 'mt-4' },
     {
         id: 'display.waifuWidth',
         type: 'slider',
@@ -298,6 +300,21 @@ export const displaySizeSettingsItems: SettingItem[] = [
         bindKey: 'settingsCloseButtonSize',
         options: { min: 16, max: 48, step: 1 },
         keywords: ['settings', 'close', 'button', 'size'],
+    },
+    // moved from Advanced (mobile viewport height unit)
+    {
+        id: 'adv.heightMode', type: 'select', labelKey: 'heightMode', bindKey: 'heightMode',
+        helpKey: 'heightMode',
+        options: {
+            selectOptions: [
+                { value: 'normal', label: 'Normal' },
+                { value: 'percent', label: 'Percent' },
+                { value: 'vh', label: 'VH' },
+                { value: 'dvh', label: 'DVH' },
+                { value: 'svh', label: 'SVH' },
+                { value: 'lvh', label: 'LVH' }
+            ]
+        }
     },
 ];
 

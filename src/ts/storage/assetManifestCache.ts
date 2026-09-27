@@ -1,4 +1,4 @@
-import type { AssetManifestTuple } from './nodeStorage'
+import type { AssetManifestDescriptor, AssetManifestTuple } from './nodeStorage'
 
 // Sized so a heavy setup (character + dozens of asset modules) fits without
 // thrashing: entries are name→path tuples (~1MB per 5,000 assets), and the
@@ -42,4 +42,38 @@ export function getCachedFullAssetManifest(id?: string): AssetManifestTuple[] | 
     fullManifestCache.delete(id)
     fullManifestCache.set(id, entry)
     return entry.items
+}
+
+// Manifest ids are content-addressed, so a cached full manifest is never
+// stale: serve it instead of re-downloading every page (dynamic-asset scripts
+// and the CBS list functions used to fetch the whole manifest per message on
+// a cold cache). Concurrent loads of the same id share one download. Callers
+// get their own copy — editors mutate the returned list, which must not leak
+// into the shared cache.
+export function createManifestItemsLoader(fetchItems: (manifest: AssetManifestDescriptor) => Promise<AssetManifestTuple[]>) {
+    const inFlight = new Map<string, Promise<AssetManifestTuple[]>>()
+    const copy = (items: AssetManifestTuple[]) => items.map((item) => [...item] as AssetManifestTuple)
+    return async function loadAssetManifestItems(manifest?: AssetManifestDescriptor): Promise<AssetManifestTuple[]> {
+        if (!manifest) return []
+        const cached = getCachedFullAssetManifest(manifest.id)
+        if (cached) return copy(cached)
+        const id = manifest.id
+        let load = id ? inFlight.get(id) : undefined
+        if (!load) {
+            load = (async () => {
+                const items = await fetchItems(manifest)
+                // The descriptor id can be refreshed in place by a 404 retry,
+                // so cache under the id the items actually belong to.
+                cacheFullAssetManifest(manifest.id, items)
+                return items
+            })()
+            if (id) {
+                const started = load
+                inFlight.set(id, started)
+                const clear = () => { if (inFlight.get(id) === started) inFlight.delete(id) }
+                started.then(clear, clear)
+            }
+        }
+        return copy(await load)
+    }
 }

@@ -20,6 +20,9 @@ export const languageKorean = {
     unknownModel: "에러: 알수없는 모델 선택됨",
     httpError: "요청 에러:",
     noData: "올바른 파일이 아니거나 데이터가 손상됐습니다.",
+    chatBodyMissing: "서버에서 이 채팅 내용을 찾지 못했습니다. 남아 있을 수 있는 메시지를 빈 채팅으로 덮어쓰지 않도록 그대로 두었습니다. 다른 기기나 백업을 확인하세요.",
+    chatLoadFailed: "채팅을 불러오지 못했습니다. 연결을 확인한 뒤 다시 시도하세요.",
+    chatLoadRetry: "다시 불러오기",
     onlyOneChat: "채팅이 하나 이상 필요합니다",
     onlyOnePreset: "프리셋이 하나 이상 필요합니다",
     noUserIcon: "유저 아이콘이 없습니다.",
@@ -61,6 +64,10 @@ export const languageKorean = {
       "이 채팅은 아직 생성 중이에요. 완료되거나 중지한 뒤 다시 보내주세요.",
     otherChatGenerating:
       "다른 채팅에서 생성이 진행 중이에요. 그 채팅이 완료되거나 중지된 뒤 다시 보내주세요.",
+    otherChatGenerationStopConfirm:
+      "다른 채팅에서 3분 넘게 생성 중이라 멈췄을 수 있어요. 그 생성을 중지하고 여기서 보낼 수 있게 할까요?",
+    generationForceReleased:
+      "응답이 스스로 멈추지 않아 생성 상태를 강제로 정리했어요. 다시 보낼 수 있어요.",
     assetManifestConflictTitle: "다른 세션에서 에셋 목록이 변경되었습니다",
     assetManifestConflictDesc:
       "최신 에셋 페이지를 다시 불러왔습니다. 내용을 확인한 뒤 편집을 다시 시도해주세요.",
@@ -614,13 +621,27 @@ export const languageKorean = {
   deactivateCharacterConfirm: (name: string) =>
     `"${name}" 캐릭터와 채팅을 비활성화합니다.\n\n사용하지 않는 캐릭터를 비활성화하면 로딩과 저장이 가벼워져 성능 개선에 도움이 됩니다. 목록에는 남지만 열 수 없고, 플러그인이나 스크립트, 검색, 데이터셋 내보내기에서는 삭제된 것처럼 보입니다. 데이터는 서버에 보관되며 언제든 다시 활성화할 수 있습니다.\n\n비활성화할까요?`,
   deactivateCharacterDone: "캐릭터를 비활성화했습니다.",
-  deactivateCharacterUnsaved: "아직 서버에 저장되지 않은 채팅이 있어 비활성화할 수 없습니다. 잠시 후 다시 시도하세요.",
+  deactivateCharacterLostChats: (name: string, count: number, list: string) =>
+      `"${name}"의 채팅 ${count}개는 서버에도 이 브라우저에도 내용이 없어 열면 빈 채팅으로 보입니다.\n\n${list}\n\n이 채팅들은 빈 채팅으로 보관됩니다. 비활성화할까요?`,
   deactivateCharacterFailed: "비활성화에 실패했습니다: ",
+  archiveSavePending: "비활성화했지만 아직 서버에 저장하지 못했습니다. 자동으로 다시 저장을 시도합니다.",
+  bulkArchiveBusy: "이미 여러 캐릭터를 처리하는 중입니다. 끝난 뒤 다시 시도하세요.",
+  bulkArchiveProgress: (done: number, total: number, trash: boolean) =>
+    `${trash ? "휴지통으로 옮기는 중" : "비활성화하는 중"}… ${done}/${total}`,
+  bulkArchiveDone: (count: number, trash: boolean) =>
+    trash ? `캐릭터 ${count}개를 휴지통으로 옮겼습니다.` : `캐릭터 ${count}개를 비활성화했습니다.`,
+  bulkArchiveFailed: (done: number, failed: number, list: string) =>
+    `${done}개는 처리했고 ${failed}개는 실패했습니다. 실패한 캐릭터는 그대로 남아 있습니다.\n\n${list}`,
+  bulkArchiveStopped: "변경사항을 서버에 저장하지 못해 나머지 캐릭터는 처리하지 않았습니다. 이미 처리한 캐릭터는 자동으로 다시 저장을 시도합니다.",
+  bulkDeactivateLostChats: (count: number, list: string) =>
+    `캐릭터 ${count}개에 서버에도 이 브라우저에도 내용이 없는 채팅이 있습니다. 열면 빈 채팅으로 보이는 채팅입니다.\n\n${list}\n\n이 채팅들은 빈 채팅으로 보관됩니다. 이 캐릭터들도 비활성화할까요?`,
+  archiveSaveFailed: "최근 변경사항을 서버에 저장하지 못해, 변경사항을 지키기 위해 중단했습니다. 잠시 후 다시 시도하세요.",
   rebaseSkippedArchived: (names: string) =>
     `"${names}" 캐릭터가 다른 기기에서 비활성화되어 이 기기의 저장되지 않은 변경을 반영하지 못했습니다.`,
   activateCharacterConfirm: (name: string) => `"${name}" 캐릭터가 비활성화되어 있습니다. 활성화할까요?`,
   activateCharacterMissing: "보관된 캐릭터 데이터를 찾을 수 없어 활성화할 수 없습니다. 서버 로그와 스토리지 대시보드를 확인하세요.",
   activateCharacterFailed: "활성화에 실패했습니다: ",
+  activateCharacterAlreadyActive: "서버에서 이 캐릭터가 이미 활성 상태입니다. 페이지를 새로고침하세요.",
   activateCharacterRemoveStub: "이 캐릭터를 목록에서 제거할까요? (다른 데이터는 삭제되지 않습니다)",
   deactivatedBadge: "비활성화",
   exportCharacter: "캐릭터 엑스포트",
@@ -1163,6 +1184,13 @@ export const languageKorean = {
     "현재 탭이 비활성화되었습니다. OK를 누르면 탭이 다시 활성화됩니다.",
   sessionHandoffReload:
     "다른 기기에서 사용되어 최신 상태로 새로고침했어요.",
+  sessionUnsavedTitle: "다른 곳에서 저장 권한을 가져갔어요",
+  sessionUnsavedDetail:
+    "이 탭의 저장은 멈췄고, 아직 서버에 저장되지 않은 편집이 있어요. 새로고침하면 그 편집은 사라지고 최신 상태를 불러옵니다. 먼저 미저장 편집을 JSON 파일로 내려받아 두면 필요한 내용을 직접 옮겨 적을 수 있어요.",
+  sessionUnsavedDownload: "미저장 편집 내려받기",
+  sessionUnsavedReload: "편집을 버리고 새로고침",
+  sessionUnsavedPaused: "이 탭의 저장은 멈춘 상태예요. 편집 내용을 옮긴 뒤 새로고침하세요.",
+  backupBrowserDownloadStarted: "브라우저 다운로드로 백업을 받기 시작했어요. 진행 상황과 완료는 브라우저의 다운로드 목록에서 확인하세요.",
   addCharacter: "캐릭터 추가",
   importFromRealm: "RisuRealm에서 고르기",
   importFromRealmDesc:
@@ -1889,7 +1917,6 @@ export const languageKorean = {
   serverBackupDownload: "다운로드",
   serverBackupDelete: "삭제",
   serverBackupRestoring: "서버 백업에서 복원 중...",
-  serverBackupDownloading: "백업 다운로드 중...",
   serverBackupDeleteConfirm: (filename: string) =>
     `"${filename}" 백업을 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.`,
   serverBackupDeleteSuccess: "백업이 삭제되었습니다.",
@@ -2362,6 +2389,20 @@ export const languageKorean = {
   storageOrphanAutoCleanDesc:
     "앱을 열 때마다 고아 미디어를 자동으로 지웁니다. 기본은 꺼짐 — 아직 알려지지 않은 참조까지 지울 수 있어 수동 정리를 권장합니다.",
 
+  storageSaveMetrics: "저장 성능",
+  storageSaveMetricsHeader: (n: number) => `이 탭의 최근 ${n}회`,
+  storageSaveMetricsDesc:
+    "이 탭에서 최근 저장에 걸린 시간입니다. 저장이 느리거나 자주 실패하면 '진단 복사' 내용을 제보에 함께 붙여 주세요. 경로·이름·내용은 들어가지 않습니다.",
+  storageSaveMetricsEmpty: "아직 저장 기록이 없습니다. 편집하면 여기에 쌓입니다.",
+  storageSaveMetricsCounts: "저장 방식",
+  storageSaveMetricsCountsValue: (patch: number, full: number, retry: number, error: number) =>
+    `부분 ${patch} · 전체 ${full} · 재시도 ${retry} · 실패 ${error}`,
+  storageSaveMetricsTime: "저장 시간 (중앙값 / 상위 10%)",
+  storageSaveMetricsServer: "서버 처리 (중앙값)",
+  storageSaveMetricsQueue: "서버 대기열 대기 (중앙값)",
+  storageSaveMetricsPersist: "마지막 디스크 기록",
+  storageSaveMetricsCopy: "진단 복사",
+
   storageWalCleanup: "WAL 수동 정리",
   storageWalCleanupHeader: (walSize: number) =>
     `현재 WAL ${(walSize / 1024 / 1024).toFixed(1)} MB`,
@@ -2653,4 +2694,23 @@ export const languageKorean = {
     tokensPerSec: "tok/s",
     cacheHit: "캐시 적중 · {n} 토큰",
   },
+  settingActionAdd: "추가",
+  settingActionRename: "이름 변경",
+  settingActionView: "보기",
+  settingActionExport: "내보내기",
+  settingActionImport: "가져오기",
+  settingActionClear: "지우기",
+  showStatistics: "사용 통계",
+  showStatisticsDesc: "지금까지 누적된 사용 통계를 표로 보여줍니다.",
+  exportSettingsReport: "버그 제보용 설정 내보내기",
+  exportSettingsReportDesc: "API 키·캐릭터 등 개인 정보를 뺀 설정을 파일로 받고 클립보드에 복사합니다.",
+  banCharactersetDesc: "선택한 문자 집합이 섞인 응답을 받으면 자동으로 다시 생성합니다.",
+  inlayCompressAllDesc: "저장된 모든 인레이 이미지를 다시 압축해 저장 용량을 줄입니다.",
+  advTabPrompt: "프롬프트·생성",
+  advTabRequest: "요청·모델",
+  advTabAssets: "화면·에셋",
+  advTabDev: "개발·실험",
+  advSectionResponse: "응답 보정",
+  advSectionDevTools: "개발 도구",
+  advSectionExperimental: "실험적 기능",
 } satisfies DeepPartial<typeof import("./en").languageEnglish>;

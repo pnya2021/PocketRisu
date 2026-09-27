@@ -102,7 +102,7 @@ function setupServer(behavior: ServerBehavior) {
         throw new Error(`unexpected fetch: ${method} ${url}`)
     })
     vi.stubGlobal('fetch', fetchMock)
-    return { calls }
+    return { calls, fetchMock }
 }
 
 function makeOpts(overrides: Partial<JobFetchOptions> = {}): JobFetchOptions {
@@ -315,6 +315,57 @@ describe('makeJobFetch', () => {
         await vi.waitFor(() => {
             expect(callsFor(calls, '/api/model-jobs/job-1', 'DELETE')).toHaveLength(1)
         })
+    })
+
+    test('an abort that lands while the create response is read still DELETEs the job', async () => {
+        const { calls, fetchMock } = setupServer({ streamNeverEnds: true })
+        const controller = new AbortController()
+        // Abort right as the create response comes back: the abort event
+        // fires before jobFetch has registered its listener.
+        vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+            const res = await fetchMock(input, init)
+            if (String(input) === '/api/model-jobs' && (init?.method ?? 'GET') === 'POST') controller.abort()
+            return res
+        })
+        await makeJobFetch(makeOpts())('https://provider.example/v1/chat', {
+            method: 'POST', body: '{}', signal: controller.signal,
+        }).catch(() => {})
+        await vi.waitFor(() => {
+            expect(callsFor(calls, '/api/model-jobs/job-1', 'DELETE')).toHaveLength(1)
+        })
+    })
+
+    test('an abort while the create body is still arriving finds the job by generation and DELETEs it', async () => {
+        const { calls, fetchMock } = setupServer({ streamNeverEnds: true })
+        const controller = new AbortController()
+        vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input)
+            const method = init?.method ?? 'GET'
+            if (url === '/api/model-jobs' && method === 'POST') {
+                calls.push({ url, init })
+                // Headers arrived; the body errors when the request is aborted.
+                const body = new ReadableStream<Uint8Array>({
+                    start(c) { init?.signal?.addEventListener('abort', () => c.error(new DOMException('The operation was aborted.', 'AbortError'))) },
+                })
+                setTimeout(() => controller.abort(), 5)
+                return new Response(body, { status: 200 })
+            }
+            if (url === '/api/model-jobs?active=1') {
+                calls.push({ url, init })
+                return new Response(JSON.stringify({ jobs: [
+                    { id: 'job-other', chatId: 'chat-1', generationId: 'gen-other' },
+                    { id: 'job-1', chatId: 'chat-1', generationId: 'gen-1' },
+                ] }), { status: 200 })
+            }
+            return fetchMock(input, init)
+        })
+        await expect(makeJobFetch(makeOpts())('https://provider.example/v1/chat', {
+            method: 'POST', body: '{}', signal: controller.signal,
+        })).rejects.toMatchObject({ name: 'AbortError' })
+        await vi.waitFor(() => {
+            expect(callsFor(calls, '/api/model-jobs/job-1', 'DELETE')).toHaveLength(1)
+        })
+        expect(callsFor(calls, '/api/model-jobs/job-other', 'DELETE')).toHaveLength(0)
     })
 
     test('creation 409 for another generation throws ModelJobBusyError and never falls back', async () => {

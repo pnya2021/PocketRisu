@@ -17,12 +17,18 @@
     let manifestTotal = $state(0)
     const manifestPageSize = 100
 
+    // A slower page from the previous character must not land on this one.
+    let manifestRequestSeq = 0
+
     async function loadManifestPage(offset = 0) {
         if (!currentCharacter.additionalAssetManifest) return
+        const seq = ++manifestRequestSeq
+        const chaId = currentCharacter.chaId
         const page = await forageStorage.getAssetManifestPage(currentCharacter.additionalAssetManifest, {
             offset,
             limit: manifestPageSize,
         })
+        if (seq !== manifestRequestSeq || currentCharacter.chaId !== chaId) return
         manifestItems = page.items as [string, string, string][]
         manifestOffset = page.offset
         manifestTotal = page.total
@@ -30,9 +36,20 @@
         assetFilePath = []
     }
 
+    let shownChaId: string | undefined
     $effect(() => {
         const manifestId = currentCharacter.additionalAssetManifest?.id
-        if (manifestId) void loadManifestPage(0)
+        // Drop the previous character's page at once, not when the new one lands.
+        if (shownChaId !== currentCharacter.chaId) {
+            shownChaId = currentCharacter.chaId
+            manifestItems = []
+        }
+        if (manifestId) {
+            void loadManifestPage(0)
+        } else {
+            manifestRequestSeq++
+            manifestItems = []
+        }
     })
 
     $effect.pre(() => {

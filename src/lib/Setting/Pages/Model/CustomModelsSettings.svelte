@@ -1,13 +1,17 @@
 <script lang="ts">
+    import SettingFieldLabel from "src/lib/Setting/Wrappers/SettingFieldLabel.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { language } from "src/lang";
     import { LLMFlags, LLMFormat, LLMTokenizer } from "src/ts/model/types";
-    import Button from "src/lib/UI/GUI/Button.svelte";
+    import ShButton from "src/lib/UI/GUI/ShButton.svelte";
+    import ShToggle from "src/lib/UI/GUI/ShToggle.svelte";
+    import ShAccordion from "src/lib/UI/GUI/ShAccordion.svelte";
+    import SettingRowLayout from "src/lib/Setting/Wrappers/SettingRowLayout.svelte";
+    import type { SettingItem } from "src/ts/setting/types";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
     import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
-    import Accordion from "src/lib/UI/Accordion.svelte";
     import { requestImmediateSave } from "src/ts/globalApi.svelte";
     import { PlusIcon, TrashIcon, ArrowUp, ArrowDown } from "@lucide/svelte";
     import { v4 } from "uuid";
@@ -17,27 +21,33 @@
     let { noAccordion }:{
         noAccordion?: boolean,
     } = $props()
+
+    // Row-layout field descriptor for SettingRowLayout (label only here).
+    function f(id: string, label: string, helpKey?: string): SettingItem {
+        return { id: `customModels.${id}`, type: 'custom', fallbackLabel: label, helpKey }
+    }
 </script>
 
+
 {#snippet CustomFlagButton(index:number,name:string,flag:LLMFlags)}
-    <Button className="mt-2" onclick={(e) => {
+    <ShToggle size="sm" pressed={DBState.db.customModels[index].flags.includes(flag)} onPressedChange={() => {
         if(DBState.db.customModels[index].flags.includes(flag)){
             DBState.db.customModels[index].flags = DBState.db.customModels[index].flags.filter((f) => f !== flag)
         }
         else{
             DBState.db.customModels[index].flags.push(flag)
         }
-    }} styled={DBState.db.customModels[index].flags.includes(flag) ? 'primary' : 'outlined'}>
+    }}>
         {name}
-    </Button>
+    </ShToggle>
 {/snippet}
 
 {#snippet mainBody()}
     {#each DBState.db.customModels as model, index (model.id)}
-        <div class="flex flex-col mt-2">
-            <button class="hover:bg-selected px-6 py-2 text-lg rounded-t-md border-selected border flex justify-between items-center"
-                class:bg-selected={openedModels.has(model.id)}
-                class:rounded-b-md={!openedModels.has(model.id)}
+        <div class="flex flex-col mt-2 rounded-md border border-darkborderc overflow-hidden">
+            <div class="flex items-center justify-between gap-2 pr-2" class:bg-selected={openedModels.has(model.id)}>
+            <button class="grow min-w-0 text-left px-3 h-11 text-base font-medium hover:bg-selected/30 truncate"
+                aria-expanded={openedModels.has(model.id)}
                 onclick={() => {
                     if (openedModels.has(model.id)) {
                         openedModels.delete(model.id)
@@ -47,9 +57,10 @@
                     openedModels = new Set(openedModels)
                 }}
             >
-                <span class="text-left">{model.name ?? "Unnamed"}</span>
-                <div class="flex items-center gap-1">
-                    <Button size="sm" styled="outlined" onclick={(e) => {
+                {model.name ?? "Unnamed"}
+            </button>
+                <div class="flex items-center gap-1 shrink-0">
+                    <ShButton variant="ghost" size="icon-sm" aria-label="Move up" onclick={(e) => {
                         e.stopPropagation()
                         if(index === 0) return
                         let models = DBState.db.customModels
@@ -60,8 +71,8 @@
                         void requestImmediateSave()
                     }}>
                         <ArrowUp />
-                    </Button>
-                    <Button size="sm" styled="outlined" onclick={(e) => {
+                    </ShButton>
+                    <ShButton variant="ghost" size="icon-sm" aria-label="Move down" onclick={(e) => {
                         e.stopPropagation()
                         if(index === DBState.db.customModels.length - 1) return
                         let models = DBState.db.customModels
@@ -72,8 +83,8 @@
                         void requestImmediateSave()
                     }}>
                         <ArrowDown />
-                    </Button>
-                    <Button size="sm" styled="outlined" onclick={(e) => {
+                    </ShButton>
+                    <ShButton variant="ghost" size="icon-sm" className="hover:text-red-400" aria-label="Delete" onclick={(e) => {
                         e.stopPropagation()
                         let models = DBState.db.customModels
                         models.splice(index, 1)
@@ -83,19 +94,23 @@
                         void requestImmediateSave()
                     }}>
                         <TrashIcon />
-                    </Button>
+                    </ShButton>
                 </div>
-            </button>
+            </div>
             {#if openedModels.has(model.id)}
-            <div class="flex flex-col border border-selected p-2 rounded-b-md overflow-x-auto">
-            <span class="text-textcolor mt-4">{language.name}</span>
-            <TextInput className="mt-2" bind:value={DBState.db.customModels[index].name}/>
-            <span class="text-textcolor mt-4">{language.proxyRequestModel}</span>
-            <TextInput className="mt-2" bind:value={DBState.db.customModels[index].internalId}/>
-            <span class="text-textcolor mt-4">URL</span>
-            <TextInput className="mt-2" bind:value={DBState.db.customModels[index].url}/>
-            <span class="text-textcolor mt-4">{language.tokenizer}</span>
-            <SelectInput className="mt-2 mb-4" value={DBState.db.customModels[index].tokenizer.toString()} onchange={(e) => {
+            <div class="flex flex-col border-t border-darkborderc px-3 pb-3 overflow-x-auto [&>*:first-child]:border-t-0">
+            <SettingRowLayout item={f('cm1', `${language.name}`)} wideControl>
+    {#snippet control()}<TextInput className="sm:w-64 h-8" size="sm" padding fullwidth bind:value={DBState.db.customModels[index].name}/>{/snippet}
+</SettingRowLayout>
+            <SettingRowLayout item={f('cm2', `${language.proxyRequestModel}`)} wideControl>
+    {#snippet control()}<TextInput className="sm:w-64 h-8" size="sm" padding fullwidth bind:value={DBState.db.customModels[index].internalId}/>{/snippet}
+</SettingRowLayout>
+            <SettingRowLayout item={f('cm3', `URL`)} wideControl>
+    {#snippet control()}<TextInput className="sm:w-64 h-8" size="sm" padding fullwidth bind:value={DBState.db.customModels[index].url}/>{/snippet}
+</SettingRowLayout>
+            <SettingRowLayout item={f('cm5', `${language.tokenizer}`)}>
+    {#snippet control()}
+    <SelectInput className="w-48" size="sm" value={DBState.db.customModels[index].tokenizer.toString()} onchange={(e) => {
                 DBState.db.customModels[index].tokenizer = parseInt(e.currentTarget.value) as LLMTokenizer
             }}>
                 <OptionInput value="0">Unknown</OptionInput>
@@ -112,8 +127,11 @@
                 <OptionInput value="11">Cohere</OptionInput>
                 <OptionInput value="13">DeepSeek</OptionInput>
             </SelectInput>
-            <span class="text-textcolor">{language.format}</span>
-            <SelectInput className="mt-2 mb-4" value={DBState.db.customModels[index].format.toString()} onchange={(e) => {
+    {/snippet}
+</SettingRowLayout>
+            <SettingRowLayout item={f('cm6', `${language.format}`)}>
+    {#snippet control()}
+    <SelectInput className="w-48" size="sm" value={DBState.db.customModels[index].format.toString()} onchange={(e) => {
                 DBState.db.customModels[index].format = parseInt(e.currentTarget.value) as LLMFormat
             }}>
                 <OptionInput value="0">OpenAICompatible</OptionInput>
@@ -132,16 +150,23 @@
                 <OptionInput value="17">AWSBedrockClaude</OptionInput>
                 <OptionInput value="18">OpenAIResponseAPI</OptionInput>
             </SelectInput>
-            <span class="text-textcolor">{language.proxyAPIKey}</span>
-            <TextInput className="mt-2" bind:value={DBState.db.customModels[index].key}/>
-            <span class="text-textcolor mt-4">{language.additionalParams}</span>
-            <TextAreaInput className="mt-2 mb-4" bind:value={DBState.db.customModels[index].params} placeholder={`temperature=0.7
+    {/snippet}
+</SettingRowLayout>
+            <SettingRowLayout item={f('cm4', `${language.proxyAPIKey}`)} wideControl>
+    {#snippet control()}<TextInput className="sm:w-64 h-8" size="sm" padding fullwidth bind:value={DBState.db.customModels[index].key}/>{/snippet}
+</SettingRowLayout>
+            <div class="py-3 border-t border-darkborderc flex flex-col">
+    <SettingFieldLabel label={`${language.additionalParams}`} />
+    <TextAreaInput className="mt-2" bind:value={DBState.db.customModels[index].params} placeholder={`temperature=0.7
     max_tokens=2000
     reasoning_effort="high"
     header::anthropic-dangerous-direct-browser-access=true
     stop=json::["</s>", "\\n\\n"]
     frequency_penalty={{none}}`}/>
-            <Accordion styled name={language.flags}>
+</div>
+            <div class="pt-3 border-t border-darkborderc">
+            <ShAccordion name={language.flags} variant="card">
+                <div class="flex flex-wrap gap-1.5 py-1">
                 {@render CustomFlagButton(index,'hasImageInput', 0)}
                 {@render CustomFlagButton(index,'hasImageOutput', 1)}
                 {@render CustomFlagButton(index,'hasAudioInput', 2)}
@@ -161,13 +186,15 @@
                 {@render CustomFlagButton(index,'deepSeekPrefix', 17)}
                 {@render CustomFlagButton(index,'deepSeekThinkingInput', 18)}
                 {@render CustomFlagButton(index,'deepSeekThinkingOutput', 19)}
-            </Accordion>
+                </div>
+            </ShAccordion>
+            </div>
                 </div>
             {/if}
         </div>
     {/each}
     <div class="flex flex-col mt-2">
-        <button class="hover:bg-selected px-6 py-2 text-lg rounded-md border-selected border flex justify-center items-center cursor-pointer" onclick={() => {
+        <ShButton variant="outline" className="w-full" aria-label="Add custom model" onclick={() => {
             DBState.db.customModels.push({
                 internalId: "",
                 url: "",
@@ -182,7 +209,7 @@
             void requestImmediateSave()
         }}>
             <PlusIcon />
-        </button>
+        </ShButton>
     </div>
     
 {/snippet}
@@ -191,8 +218,8 @@
 {#if noAccordion}
     {@render mainBody()}
 {:else}
-    <Accordion styled name={language.customModels} className="overflow-x-auto">
+    <ShAccordion name={language.customModels} variant="card">
         {@render mainBody()}
-    </Accordion>
+    </ShAccordion>
 
 {/if}

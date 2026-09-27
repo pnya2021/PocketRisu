@@ -22,7 +22,9 @@
 
     const isSafeSchema = (url:string) => {
         try {
-            const parsedUrl = new URL(url);
+            // Resolve against the page so a relative icon path is allowed;
+            // the protocol check below still applies to the resolved URL.
+            const parsedUrl = new URL(url, location.href);
             const allowedProtocols = ['http:', 'https:', 'data:', 'blob:'];
             if (allowedProtocols.includes(parsedUrl.protocol)) {
                 return url;

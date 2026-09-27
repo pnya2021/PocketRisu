@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
     clearPrincipalTombstonesForTests,
     invalidatePluginPrincipal,
@@ -29,6 +29,39 @@ describe('plugin principals', () => {
         })
         expect(installed.principalId).toBe(ids[0])
         expect(isCanonicalPluginPrincipalId(installed.principalId)).toBe(true)
+    })
+
+    it('mints a fresh principal without secure-context randomUUID', () => {
+        const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+        vi.stubGlobal('crypto', { getRandomValues })
+        try {
+            const fresh = preparePluginRecord(record('fresh'), undefined, { kind: 'fresh-install' })
+            expect(isCanonicalPluginPrincipalId(fresh.principalId)).toBe(true)
+        } finally {
+            vi.unstubAllGlobals()
+        }
+    })
+
+    it('repairs a principal without secure-context randomUUID', () => {
+        const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+        vi.stubGlobal('crypto', { getRandomValues })
+        try {
+            const repaired = normalizePluginPrincipals([{ ...record('repaired'), principalId: 'invalid' }])
+            expect(isCanonicalPluginPrincipalId(repaired.records[0].principalId)).toBe(true)
+        } finally {
+            vi.unstubAllGlobals()
+        }
+    })
+
+    it('registers a programmatic plugin without secure-context randomUUID', () => {
+        const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+        vi.stubGlobal('crypto', { getRandomValues })
+        try {
+            const reconciled = reconcileProgrammaticPluginRecords([], [record('programmatic')])
+            expect(isCanonicalPluginPrincipalId(reconciled.records[0].principalId)).toBe(true)
+        } finally {
+            vi.unstubAllGlobals()
+        }
     })
 
     it('retains identity for a trusted in-place update and hot reload', () => {

@@ -1750,6 +1750,8 @@ export interface ArchivedCharacterStub{
     archivedAt: number
     /** Set when the character sits in the trash (trash = deactivated + this marker). Exported as `trashTime`. */
     trashedAt?: number
+    /** Folder the character sat in when it went to the trash; restoring puts it back there if the folder still exists. */
+    trashedFromFolder?: string
     /** Encoded payload size on the server. */
     bytes: number
     chatCount: number

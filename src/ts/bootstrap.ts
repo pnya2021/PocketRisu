@@ -89,7 +89,6 @@ export async function loadData() {
                 }
                 try {
                     const decoded = await decodeRisuSave(gotStorage)
-                    console.log(decoded)
                     hydrateColdDatabase(decoded, {
                         setDatabase,
                         getSnapshot: () => getDatabase({ snapshot: true }),

@@ -108,6 +108,11 @@ export interface SettingOptions {
 
     // button
     onClick?: () => void | Promise<void>;
+    /** Row layout only: i18n key for the button text; the item label then
+     * becomes the row label on the left. Without it the label is the button text. */
+    buttonLabelKey?: string;
+    /** Row layout only: ShButton variant (default 'outline'). */
+    buttonVariant?: 'outline' | 'destructive';
     
     // header
     level?: 'h2' | 'span' | 'warning';

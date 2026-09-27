@@ -1,3 +1,5 @@
+import { v4 } from 'uuid'
+
 export interface PrincipalPluginRecord {
     name: string
     script: string
@@ -41,7 +43,7 @@ const persistTombstones = () => {
 }
 
 const newPrincipalId = (
-    randomUUID: () => string = () => crypto.randomUUID(),
+    randomUUID: () => string = v4,
     excluded: ReadonlySet<string> = new Set(),
 ) => {
     let id = randomUUID()
@@ -129,7 +131,7 @@ export function reconcileProgrammaticPluginRecords<T extends PrincipalPluginReco
     const currentByName = new Map(current.map((record) => [record.name, record]))
     const retained = new Set<string>()
     const assigned = new Set<string>()
-    const randomUUID = options.randomUUID ?? (() => crypto.randomUUID())
+    const randomUUID = options.randomUUID ?? v4
     const allocateUnassignedUuid = () => {
         let principalId = randomUUID()
         while (assigned.has(principalId)) principalId = randomUUID()

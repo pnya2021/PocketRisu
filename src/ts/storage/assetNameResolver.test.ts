@@ -1,5 +1,5 @@
 import { describe, test, expect, vi } from 'vitest'
-import { createAssetNameResolver } from './assetNameResolver'
+import { createAssetNameResolver, createBatchedResolve, RESOLVE_BATCH_MAX_NAMES } from './assetNameResolver'
 
 const char = { id: 'c-1', ownerKind: 'character', ownerId: 'chara' } as any
 const mod = { id: 'm-1', ownerKind: 'module', ownerId: 'risuco' } as any
@@ -52,5 +52,68 @@ describe('createAssetNameResolver', () => {
         expect(await resolveNames(undefined, [], ['x'], true, 4)).toEqual({})
         expect(await resolveNames(char, [], [], true, 4)).toEqual({})
         expect(resolve).not.toHaveBeenCalled()
+    })
+})
+
+describe('in-flight sharing and batching', () => {
+    test('overlapping concurrent lookups ask for each name once', async () => {
+        let release!: () => void
+        const gate = new Promise<void>((r) => { release = r })
+        const resolve = vi.fn(async (_owners: any, names: string[], _d: number): Promise<Res> => {
+            await gate
+            return { resolved: Object.fromEntries(names.map((n) => [n, `assets/${n}`])), fuzzy: [] }
+        })
+        const resolveNames = createAssetNameResolver(resolve)
+        const a = resolveNames(char, [], ['bg', 'hero'], true, 4)
+        const b = resolveNames(char, [], ['hero', 'villain'], true, 4)
+        release()
+        expect(await a).toEqual({ bg: { path: 'assets/bg', fuzzy: false }, hero: { path: 'assets/hero', fuzzy: false } })
+        expect(await b).toEqual({ hero: { path: 'assets/hero', fuzzy: false }, villain: { path: 'assets/villain', fuzzy: false } })
+        expect(resolve).toHaveBeenCalledTimes(2)
+        expect(resolve.mock.calls[0][1]).toEqual(['bg', 'hero'])
+        expect(resolve.mock.calls[1][1]).toEqual(['villain'])
+    })
+
+    test('a failed lookup rejects every waiter and is retried later', async () => {
+        let fail = true
+        const resolve = vi.fn(async (_owners: any, names: string[], _d: number): Promise<Res> => {
+            if (fail) throw new Error('offline')
+            return { resolved: Object.fromEntries(names.map((n) => [n, `assets/${n}`])), fuzzy: [] }
+        })
+        const resolveNames = createAssetNameResolver(resolve)
+        const a = resolveNames(char, [], ['bg'], true, 4)
+        const b = resolveNames(char, [], ['bg'], true, 4)
+        await expect(a).rejects.toThrow('offline')
+        await expect(b).rejects.toThrow('offline')
+        fail = false
+        expect(await resolveNames(char, [], ['bg'], true, 4)).toEqual({ bg: { path: 'assets/bg', fuzzy: false } })
+    })
+
+    test('calls in the same task share one request; later ones start a new batch', async () => {
+        const send = vi.fn(async (_owners: any, names: string[], _d: number): Promise<Res> => ({
+            resolved: Object.fromEntries(names.map((n) => [n, `assets/${n}`])), fuzzy: [],
+        }))
+        const batched = createBatchedResolve(send)
+        const owners = [{ manifestId: 'c-1', fuzzy: true }]
+        const p1 = batched(owners, ['a', 'b'], 4)
+        const p2 = batched(owners, ['b', 'c'], 4)
+        const other = batched([{ manifestId: 'c-2', fuzzy: true }], ['a'], 4)
+        const [r1, r2] = await Promise.all([p1, p2, other])
+        expect(send).toHaveBeenCalledTimes(2)
+        expect(send.mock.calls[0][1]).toEqual(['a', 'b', 'c'])
+        expect(r1).toBe(r2)
+        await batched(owners, ['d'], 4)
+        expect(send).toHaveBeenCalledTimes(3)
+        expect(send.mock.calls[2][1]).toEqual(['d'])
+    })
+
+    test('a batch closes before the server name limit', async () => {
+        const send = vi.fn(async (_owners: any, _names: string[], _d: number): Promise<Res> => ({ resolved: {}, fuzzy: [] }))
+        const batched = createBatchedResolve(send)
+        const owners = [{ manifestId: 'c-1', fuzzy: true }]
+        const first = Array.from({ length: RESOLVE_BATCH_MAX_NAMES - 10 }, (_, i) => `n${i}`)
+        await Promise.all([batched(owners, first, 4), batched(owners, Array.from({ length: 20 }, (_, i) => `m${i}`), 4)])
+        expect(send).toHaveBeenCalledTimes(2)
+        expect(send.mock.calls.every((call) => call[1].length <= RESOLVE_BATCH_MAX_NAMES)).toBe(true)
     })
 })

@@ -9,6 +9,7 @@ import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
 import { normalizeChat } from "./database.svelte"
+import type { PatchServerTimings } from "./saveMetrics"
 
 const PLUGIN_MODEL_PROFILE_ID = 'pixai-tagger-v0.9-onnx'
 const PLUGIN_MODEL_PRINCIPAL = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -132,6 +133,8 @@ export interface PatchItemResult {
     /** `code` / `error` of a 409 body, for logging which guard rejected the patch. */
     conflictCode?: string
     conflictError?: string
+    /** Server stage timings on success (older servers omit them). */
+    serverTimings?: PatchServerTimings
 }
 
 /** Hash fields a 409 or a full-write response may carry; null when absent. */
@@ -735,7 +738,23 @@ export class NodeStorage{
         }
     }
 
+    // Boot fires several storage calls at once. Without sharing one check,
+    // each sent its own test_auth and, on an unset or wrong password, each
+    // opened its own password prompt.
+    private authPending: Promise<void> | null = null
+
     private async checkAuth(){
+        if(!this.authChecked){
+            this.authPending ??= this.runAuthCheck().finally(() => {
+                this.authPending = null
+            })
+            await this.authPending
+            return
+        }
+        await this.initSession()
+    }
+
+    private async runAuthCheck(){
 
         if(!this.authChecked){
             const data = await (await fetch('/api/test_auth',{
@@ -850,7 +869,10 @@ export class NodeStorage{
             this._lastDbEtag = nextEtag
         }
         const persistWarning = data.persistWarning as PersistWarning | undefined
-        return { success: true, etag: nextEtag, persistWarning }
+        const serverTimings = data.timings && typeof data.timings === 'object'
+            ? data.timings as PatchServerTimings
+            : undefined
+        return { success: true, etag: nextEtag, persistWarning, serverTimings }
     }
 
     // ── Bulk asset operations (3-2-B) ──────────────────────────────────────────
@@ -1018,16 +1040,35 @@ export class NodeStorage{
         return await da.json()
     }
 
-    async exportBackup(opts?: ExportBackupOptions): Promise<Response> {
+    /** Hands the backup export to the browser's own download manager. */
+    async downloadBackupExport(opts?: ExportBackupOptions): Promise<void> {
         const params = new URLSearchParams()
         if (opts?.target === 'upstream') params.set('target', 'upstream')
         if (opts?.mode === 'settings') params.set('mode', 'settings')
         if (opts?.moduleAssets === false) params.set('moduleAssets', '0')
         const query = params.toString()
-        const url = query ? `/api/backup/export?${query}` : '/api/backup/export'
-        const da = await this.authFetch(url)
-        if (da.status < 200 || da.status >= 300) throw `backup export error: ${da.status}`
-        return da
+        await this.startCookieDownload(query ? `/api/backup/export?${query}` : '/api/backup/export')
+    }
+
+    // A backup is streamed by the browser's download manager straight to disk
+    // instead of relayed through this tab (whose memory Safari fills with the
+    // whole file, and which non-secure origins route through a third-party
+    // page). The GET authenticates with the session cookie, so refresh it
+    // first. No x-session-id: registering a boot here would disturb the
+    // writer lock.
+    private async startCookieDownload(url: string): Promise<void> {
+        const res = await fetch('/api/session', {
+            method: 'POST',
+            headers: { 'risu-auth': await this.createAuth() },
+        })
+        if (!res.ok) throw new Error(`session refresh failed: ${res.status}`)
+        const anchor = document.createElement('a')
+        anchor.href = url
+        anchor.download = ''
+        anchor.style.display = 'none'
+        document.body.appendChild(anchor)
+        anchor.click()
+        anchor.remove()
     }
 
     // Key names + sizes only; values stay on the server until read per key.
@@ -1268,11 +1309,8 @@ export class NodeStorage{
         if (da.status < 200 || da.status >= 300) throw new Error(`server backup delete error: ${da.status}`)
     }
 
-    async downloadServerBackup(filename: string): Promise<Response> {
-        const da = await this.authFetch(`/api/backup/server/download/${encodeURIComponent(filename)}`)
-        if (da.status === 404) throw new Error('Backup file not found')
-        if (da.status < 200 || da.status >= 300) throw new Error(`server backup download error: ${da.status}`)
-        return da
+    async downloadServerBackup(filename: string): Promise<void> {
+        await this.startCookieDownload(`/api/backup/server/download/${encodeURIComponent(filename)}`)
     }
 
     // ── Chat content (runtime lazy load) ────────────────────────────────────
@@ -1285,6 +1323,57 @@ export class NodeStorage{
         if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
         const buffer = new Uint8Array(await da.arrayBuffer())
         return normalizeChat(await decodeRisuSave(buffer))
+    }
+
+    /**
+     * Chat delta sync (see server `sendChatContent`): with a base, the server
+     * answers with only the messages after it when the prefix verifies —
+     * `deltaBase` is then set and `chat.message` holds just the rest.
+     */
+    async fetchChatContentDelta(chaId: string, chatIndex: number, chatId: string, base: { count: number, fp: string } | null): Promise<{ chat: any, deltaBase: number | null } | null> {
+        const headers: Record<string, string> = { 'x-chat-id': chatId }
+        if (base) {
+            headers['x-chat-base-count'] = String(base.count)
+            headers['x-chat-base-fp'] = base.fp
+        }
+        const da = await this.authFetchGetWithFirstByteTimeout(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, { headers })
+        if (da.status === 404) return null
+        if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
+        const deltaHeader = da.headers.get('x-chat-delta-base')
+        const deltaBase = deltaHeader !== null && base && Number(deltaHeader) === base.count ? base.count : null
+        const buffer = new Uint8Array(await da.arrayBuffer())
+        return { chat: normalizeChat(await decodeRisuSave(buffer)), deltaBase }
+    }
+
+    /**
+     * Save a chat, optionally as a delta: `base` names the prefix the server
+     * already holds and `chat.message` carries only the messages after it.
+     * The body is gzipped when the browser can. Returns 'base-mismatch' when
+     * the server could not verify the prefix (the caller then saves in full).
+     */
+    async saveChatContentDelta(chaId: string, chatIndex: number, chatId: string, chat: any, base: { count: number, fp: string } | null): Promise<'ok' | 'base-mismatch'> {
+        const encoded = encodeRisuSaveLegacy(chat)
+        const headers: Record<string, string> = {
+            'content-type': 'application/octet-stream',
+            'x-chat-id': chatId,
+        }
+        if (base) {
+            headers['x-chat-base-count'] = String(base.count)
+            headers['x-chat-base-fp'] = base.fp
+        }
+        const gzipped = await gzipForUpload(encoded)
+        if (gzipped) headers['content-encoding'] = 'gzip'
+        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
+            method: 'POST',
+            headers,
+            body: (gzipped ?? encoded) as BodyInit,
+        })
+        if (base && da.status === 409) {
+            const body = await da.json().catch(() => ({})) as { code?: string }
+            if (body?.code === 'CHAT_DELTA_BASE_MISMATCH') return 'base-mismatch'
+        }
+        if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
+        return 'ok'
     }
 
     async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void> {
@@ -1303,13 +1392,34 @@ export class NodeStorage{
     // ── Character archive (deactivate / activate) — see src/ts/characterArchive.ts ──
 
     /** Server writes + verifies the payload; returns the stub to keep in the database. */
-    async archiveCharacter(chaId: string): Promise<any> {
-        const da = await this.authFetch(`/api/characters/${encodeURIComponent(chaId)}/archive`, { method: 'POST' })
-        const body = await da.json().catch(() => ({})) as { ok?: boolean; stub?: any; error?: string; code?: string }
+    async archiveCharacter(chaId: string, arg: { acceptLostChats?: boolean } = {}): Promise<any> {
+        const da = await this.authFetch(`/api/characters/${encodeURIComponent(chaId)}/archive`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ acceptLostChats: arg.acceptLostChats === true }),
+        })
+        const body = await da.json().catch(() => ({})) as { ok?: boolean; stub?: any; error?: string; code?: string; chats?: string[] }
         if (da.status < 200 || da.status >= 300 || !body?.stub) {
-            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archive error: ${da.status}`)
+            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archive error: ${da.status}`, body?.chats)
         }
         return body.stub
+    }
+
+    /**
+     * Archive rows for many characters in one request. Throws only when the
+     * request as a whole fails; each character's outcome is in its result.
+     */
+    async archiveCharacters(chaIds: string[], arg: { acceptLostChats?: boolean } = {}): Promise<ArchiveBatchResult[]> {
+        const da = await this.authFetch('/api/characters/archive-batch', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ chaIds, acceptLostChats: arg.acceptLostChats === true }),
+        })
+        const body = await da.json().catch(() => ({})) as { ok?: boolean; results?: ArchiveBatchResult[]; error?: string; code?: string }
+        if (da.status < 200 || da.status >= 300 || !Array.isArray(body?.results)) {
+            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archive error: ${da.status}`)
+        }
+        return body.results
     }
 
     /** Server registers the chats and returns the client-view character (stub chats, manifest descriptor). */
@@ -1465,11 +1575,35 @@ async function digestPassword(message:string) {
 }
 
 /** Failure reported by the character archive endpoints; `code` is the server's error code. */
+/** One character's outcome in /api/characters/archive-batch. */
+export type ArchiveBatchResult =
+    | { chaId: string; ok: true; stub: any }
+    | { chaId: string; ok: false; code: string; error: string; chats?: string[] }
+
 export class CharacterArchiveError extends Error {
     code: string
-    constructor(code: string, message: string) {
+    /** Names of the chats the failure is about (ARCHIVE_CHATS_UNAVAILABLE). */
+    chats: string[]
+    constructor(code: string, message: string, chats: string[] = []) {
         super(message)
         this.name = 'CharacterArchiveError'
         this.code = code
+        this.chats = Array.isArray(chats) ? chats : []
+    }
+}
+
+// Chat bodies are text-heavy (Korean prose is ~3 bytes a character), so the
+// upload shrinks several-fold; small bodies are not worth the round trip
+// through the stream. The server's express.raw() inflates Content-Encoding
+// gzip transparently, and old servers never see this header from old code.
+const GZIP_MIN_BYTES = 8 * 1024
+
+async function gzipForUpload(bytes: Uint8Array): Promise<Uint8Array | null> {
+    if (bytes.byteLength < GZIP_MIN_BYTES || typeof CompressionStream === 'undefined') return null
+    try {
+        const stream = new Blob([bytes as BlobPart]).stream().pipeThrough(new CompressionStream('gzip'))
+        return new Uint8Array(await new Response(stream).arrayBuffer())
+    } catch {
+        return null
     }
 }

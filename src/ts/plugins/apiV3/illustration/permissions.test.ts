@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { SecurityConfirmationQueue } from '../../securityConfirmationQueue'
 import {
     ALL_PLUGIN_PERMISSIONS,
@@ -251,6 +251,19 @@ describe('principal permission service', () => {
         first.abortController.abort()
         expect(first.context.signal.aborted).toBe(true)
         expect(second.context.signal.aborted).toBe(false)
+    })
+
+    it('creates execution contexts without secure-context randomUUID', () => {
+        const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+        vi.stubGlobal('crypto', { getRandomValues })
+        try {
+            const first = createPluginExecutionContext({ principalId: context.principalId, name: 'demo' })
+            const second = createPluginExecutionContext({ principalId: context.principalId, name: 'demo' })
+            expect(first.context.instanceId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+            expect(second.context.instanceId).not.toBe(first.context.instanceId)
+        } finally {
+            vi.unstubAllGlobals()
+        }
     })
 
     it('exposes a read-only generation token that changes synchronously for principal and global resets', async () => {

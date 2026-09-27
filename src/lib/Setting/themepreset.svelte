@@ -9,6 +9,7 @@
     import { updateAnimationSpeed } from "src/ts/gui/animation";
     import { updateGuisize } from "src/ts/gui/guisize";
     import ShSortableList from "../UI/GUI/ShSortableList.svelte";
+    import ShButton from "../UI/GUI/ShButton.svelte";
 
     let editMode = $state(false)
 
@@ -42,13 +43,11 @@
 
 <div class="absolute w-full h-full z-40 bg-black/50 flex justify-center items-center">
     <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl w-124 max-h-full overflow-y-auto">
-        <div class="flex items-center text-textcolor mb-4">
-            <h2 class="mt-0 mb-0">{language.themePresets}</h2>
-            <div class="grow flex justify-end">
-                <button class="text-textcolor2 hover:text-primary mr-2 cursor-pointer items-center" onclick={close}>
-                    <XIcon size={24}/>
-                </button>
-            </div>
+        <div class="flex items-center justify-between text-textcolor mb-3">
+            <h2 class="mt-0 mb-0 text-lg font-semibold">{language.themePresets}</h2>
+            <ShButton variant="ghost" size="icon-sm" aria-label="Close" onclick={close}>
+                <XIcon />
+            </ShButton>
         </div>
         <ShSortableList className="flex flex-col" disabled={editMode} onReorder={reorderPresets}>
         {#each DBState.db.themePresets as preset, i (i)}
@@ -59,7 +58,7 @@
                     close()
                 }
             }}
-            class="flex items-center text-textcolor border-t-1 border-solid border-0 border-darkborderc p-2 cursor-pointer"
+            class="flex items-center text-textcolor border-t-1 border-solid border-0 border-darkborderc px-3 h-11 rounded-md cursor-pointer hover:bg-selected/30"
             class:bg-selected={i === DBState.db.themePresetsId}
             data-sortable-key={i}>
                 {#if editMode}
@@ -116,26 +115,26 @@
         {/each}
         </ShSortableList>
 
-        <div class="flex mt-2 items-center">
-            <button class="text-textcolor2 hover:text-primary cursor-pointer mr-1" onclick={() => {
+        <div class="flex flex-wrap gap-2 mt-3 pt-3 border-t border-darkborderc">
+            <ShButton variant="outline" size="sm" onclick={() => {
                 let themePresets = DBState.db.themePresets
                 let newPreset = safeStructuredClone(themePresetTemplate)
                 newPreset.name = `New Theme`
                 themePresets.push(newPreset)
                 DBState.db.themePresets = themePresets
             }}>
-                <PlusIcon/>
-            </button>
-            <button class="text-textcolor2 hover:text-primary mr-2 cursor-pointer" onclick={() => {
+                <PlusIcon />{language.settingActionAdd}
+            </ShButton>
+            <ShButton variant="outline" size="sm" onclick={() => {
                 importThemePreset()
             }}>
-                <HardDriveUploadIcon size={18}/>
-            </button>
-            <button class="text-textcolor2 hover:text-primary cursor-pointer" onclick={() => {
+                <HardDriveUploadIcon />{language.settingActionImport}
+            </ShButton>
+            <ShButton variant={editMode ? 'default' : 'ghost'} size="sm" className="ml-auto" onclick={() => {
                 editMode = !editMode
             }}>
-                <PencilIcon size={18}/>
-            </button>
+                <PencilIcon />{language.settingActionRename}
+            </ShButton>
         </div>
     </div>
 </div>

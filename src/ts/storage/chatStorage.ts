@@ -1,6 +1,8 @@
 import { forageStorage } from "../globalApi.svelte"
 import { type Chat, type ChatStub, type ChatOrStub, isChatStub } from "./database.svelte"
 import { tick } from "svelte"
+import { writable } from "svelte/store"
+import { createChatDeltaSync, indexedDbChatCopies } from "./chatDeltaSync"
 
 // ── Stub ↔ Placeholder conversion ───────────────────────────────────────────
 
@@ -110,9 +112,16 @@ export async function fetchChatFromServer(chaId: string, chatIndex: number, chat
     return storage.fetchChatContent(chaId, chatIndex, chatId)
 }
 
+// Opening and saving go through delta sync (chatDeltaSync.ts): only what
+// changed crosses the wire for long chats. Exports and backups keep using
+// fetchChatFromServer above, which always transfers the whole chat.
+const chatDeltaSync = createChatDeltaSync({
+    fetchChatContentDelta: (chaId, chatIndex, chatId, base) => forageStorage.realStorage.fetchChatContentDelta(chaId, chatIndex, chatId, base),
+    saveChatContentDelta: (chaId, chatIndex, chatId, chat, base) => forageStorage.realStorage.saveChatContentDelta(chaId, chatIndex, chatId, chat, base),
+}, indexedDbChatCopies)
+
 export async function saveChatToServer(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
-    const storage = forageStorage.realStorage
-    await storage.saveChatContent(chaId, chatIndex, chatId, chat)
+    await chatDeltaSync.saveChat(chaId, chatIndex, chatId, chat)
 }
 
 // ── Hydration ───────────────────────────────────────────────────────────────
@@ -123,6 +132,26 @@ export async function saveChatToServer(chaId: string, chatIndex: number, chatId:
 export function isHydrating(chaId: string, chatId: string): boolean {
     const key = chatKey(chaId, chatId)
     return hydrationInFlight.has(key) || hydrationJustApplied.has(key)
+}
+
+/**
+ * Chats whose last hydration failed, keyed `chaId/chatId`: 'missing' when the
+ * server holds no body (404), 'error' for any other failure. The chat screen
+ * shows this instead of "loading" forever. A missing body is left as a
+ * placeholder, never replaced by an empty chat: an empty save could overwrite
+ * messages another device or a backup still holds.
+ */
+export type ChatLoadFailure = 'missing' | 'error'
+export const chatLoadFailures = writable<ReadonlyMap<string, ChatLoadFailure>>(new Map())
+
+function setChatLoadFailure(key: string, failure: ChatLoadFailure | null): void {
+    chatLoadFailures.update(failures => {
+        if ((failures.get(key) ?? null) === failure) return failures
+        const next = new Map(failures)
+        if (failure) next.set(key, failure)
+        else next.delete(key)
+        return next
+    })
 }
 
 /**
@@ -149,10 +178,18 @@ export async function ensureChatHydrated(
 
     const promise = (async () => {
         hydrationInFlight.add(key)
+        setChatLoadFailure(key, null)
         try {
-            const full = await fetchChatFromServer(chaId, index, chatId)
+            let full: Chat | null
+            try {
+                full = await chatDeltaSync.fetchChat(chaId, index, chatId)
+            } catch (error) {
+                setChatLoadFailure(key, 'error')
+                throw error
+            }
             if (!full) {
                 console.error(`[chatStorage] hydrate failed: chat not found on server (${key})`)
+                setChatLoadFailure(key, 'missing')
                 return null
             }
 

@@ -1,5 +1,6 @@
 <script lang="ts">
     import { getActiveHypaV3Preset } from "src/ts/process/memory/memoryPresets";
+    import { untrack } from "svelte";
     import { language } from "../../lang";
     import { tokenizeAccurate } from "../../ts/tokenizer";
     import { saveImage as saveAsset, type character, type groupChat, getCurrentCharacter } from "../../ts/storage/database.svelte";
@@ -110,24 +111,60 @@ import ShButton from "../UI/GUI/ShButton.svelte";
         return DBState.db.characters[$selectedCharID] as character
     }
 
+    // This panel stays mounted across character switches, so the loaded page
+    // is tagged with the character it belongs to. Row actions index into the
+    // current character's manifest; running them against another character's
+    // page would rename or delete the wrong asset.
+    let manifestOwner: string | null = $state(null)
+    let manifestRequestSeq = 0
+
+    function clearManifestPage() {
+        manifestRequestSeq++
+        manifestItems = []
+        manifestOffset = 0
+        manifestTotal = 0
+        manifestOwner = null
+        manifestLoading = false
+        assetFileExtensions = []
+        assetFilePath = []
+    }
+
+    function manifestPageIsCurrent(char: character) {
+        return !!char?.additionalAssetManifest && manifestOwner === char.chaId
+    }
+
     async function loadCharacterManifestPage(offset = 0) {
-        const manifest = currentChar().additionalAssetManifest
+        const char = currentChar()
+        const manifest = char?.additionalAssetManifest
         if (!manifest) return
+        const seq = ++manifestRequestSeq
         manifestLoading = true
         try {
             const page = await forageStorage.getAssetManifestPage(manifest, {
                 offset,
                 limit: manifestPageSize,
             })
+            // A newer load (or a character switch) superseded this one.
+            if (seq !== manifestRequestSeq || currentChar()?.chaId !== char.chaId) return
             manifestItems = page.items as [string, string, string][]
             manifestOffset = page.offset
             manifestTotal = page.total
+            manifestOwner = char.chaId
             assetFileExtensions = []
             assetFilePath = []
         } finally {
-            manifestLoading = false
+            if (seq === manifestRequestSeq) manifestLoading = false
         }
     }
+
+    $effect(() => {
+        const chaId = currentCharacter?.chaId
+        untrack(() => {
+            if (manifestOwner === chaId) return
+            if (manifestOwner !== null) clearManifestPage()
+            if (viewSubMenu === 2 && currentChar()?.additionalAssetManifest) void loadCharacterManifestPage(0)
+        })
+    })
 
     async function openCharacterAssetsTab() {
         viewSubMenu = 2
@@ -157,6 +194,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     async function renameCharacterManifestAsset(index: number, name: string) {
         const char = currentChar()
         if (!char.additionalAssetManifest) return
+        if (!manifestPageIsCurrent(char)) return
         try {
             char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
                 { type: 'rename', index: manifestOffset + index, name },
@@ -169,6 +207,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
 
     async function removeCharacterManifestAsset(index: number) {
         const char = currentChar()
+        if (char.additionalAssetManifest && !manifestPageIsCurrent(char)) return
         char.chats[char.chatPage].fmIndex = -1
         if (!char.additionalAssetManifest) {
             char.additionalAssets?.splice(index, 1)
@@ -713,14 +752,11 @@ import ShButton from "../UI/GUI/ShButton.svelte";
             {#if DBState.db.newImageHandlingBeta}
             <CheckInput bind:check={DBState.db.characters[$selectedCharID].prebuiltAssetCommand} name={language.insertAssetPrompt}/>
 
-            {#if DBState.db.characters[$selectedCharID].prebuiltAssetCommand}
-
             <span class="text-textcolor mt-2">{language.assetStyle}</span>
             <SelectInput className="mb-2" bind:value={DBState.db.characters[$selectedCharID].prebuiltAssetStyle}>
                 <OptionInput value="">{language.static}</OptionInput>
                 <OptionInput value="dynamic">{language.dynamic}</OptionInput>
             </SelectInput>
-            {/if}
             {/if}
             <div class="w-full max-w-full border border-selected rounded-md p-2 mt-2">
                 <table class="contain w-full max-w-full tabler mt-2">

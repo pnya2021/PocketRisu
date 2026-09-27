@@ -18,6 +18,17 @@
 
     let realmOpen = $state(!DBState.db.hideRealm);
 
+    // The home screen is often only passed through: on a phone the user opens
+    // the app and goes straight into a chat. Ask the hub for its cards only
+    // once home has stayed up for a moment, so its full-size card images (up
+    // to a few MB) do not compete with the chat body on a slow remote link.
+    const HUB_LOAD_DELAY_MS = 1500;
+    let hubReady = $state(false);
+    $effect(() => {
+      const timer = setTimeout(() => { hubReady = true; }, HUB_LOAD_DELAY_MS);
+      return () => clearTimeout(timer);
+    });
+
     const fmtMB = (n: number) => `${Math.round(n / 1024 / 1024)} MB`;
 
     const relatedLinkIconClass =
@@ -126,7 +137,7 @@
         aria-hidden={!realmOpen}
         inert={!realmOpen}
       >
-        {#if realmOpen}
+        {#if realmOpen && hubReady}
           {#await getRisuHub({
                 search: '',
                 page: 0,

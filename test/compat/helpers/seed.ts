@@ -43,6 +43,10 @@ export interface SeedOptions {
   characterOrder?: unknown[]
   /** Exact asset backup entries referenced by custom character/group records. */
   databaseAssets?: Array<{ name: string, data: Uint8Array }>
+  /** Raw pluginCustomStorage to put in the database (e.g. upstream `_coldplugin` maps). */
+  pluginCustomStorage?: Record<string, unknown>
+  /** Extra cold storage entries keyed by cold id, stored as upstream plain JSON. */
+  coldStorageEntries?: Record<string, unknown>
 }
 
 export function createSeedBackup(opts: SeedOptions = {}): Buffer {
@@ -55,6 +59,8 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
     databaseCharacters,
     characterOrder,
     databaseAssets = [],
+    pluginCustomStorage,
+    coldStorageEntries = {},
   } = opts
 
   const generatedCharacters: Array<Record<string, unknown>> = Array.from({ length: characterCount }, (_, ci) => {
@@ -105,6 +111,9 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
     selectedCharacter: 0,
     ...(characterOrder ? { characterOrder: structuredClone(characterOrder) } : {}),
   }
+  if (pluginCustomStorage) {
+    database.pluginCustomStorage = pluginCustomStorage
+  }
 
   // Add cold storage character stubs to the database
   for (const cs of coldStorageCharacters) {
@@ -134,6 +143,13 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
         data: Buffer.from(JSON.stringify(cs.fullData), 'utf-8'),
       })
     }
+  }
+
+  for (const [coldId, value] of Object.entries(coldStorageEntries)) {
+    entries.push({
+      name: `coldstorage/${coldId}.json`,
+      data: Buffer.from(JSON.stringify(value), 'utf-8'),
+    })
   }
 
   if (includeAssets) {

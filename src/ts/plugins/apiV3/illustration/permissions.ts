@@ -1,6 +1,7 @@
 import { pluginDataLifecycle } from '../../pluginDataLifecycle'
 import { SecurityConfirmationQueue, securityConfirmationQueue } from '../../securityConfirmationQueue'
 import { PluginApiError } from './errors'
+import { v4 } from 'uuid'
 
 export const ALL_PLUGIN_PERMISSIONS = [
     'fetchLogs', 'db', 'mainDom', 'replacer', 'provider', 'sendChat',
@@ -31,7 +32,7 @@ export function createPluginExecutionContext(plugin: { principalId: string; name
         abortController,
         context: {
             principalId: plugin.principalId,
-            instanceId: crypto.randomUUID(),
+            instanceId: v4(),
             displayName: plugin.displayName ?? plugin.name,
             internalName: plugin.name,
             signal: abortController.signal,

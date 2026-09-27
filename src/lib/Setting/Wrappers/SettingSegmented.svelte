@@ -5,6 +5,7 @@
     import SegmentedControl from 'src/lib/UI/GUI/SegmentedControl.svelte';
     import Help from 'src/lib/Others/Help.svelte';
     import { language } from 'src/lang';
+    import SettingFieldLabel from './SettingFieldLabel.svelte';
 
     interface Props {
         item: SettingItem;
@@ -48,6 +49,19 @@
     });
 </script>
 
+{#if ctx.layout === 'row' || ctx.layout === 'block'}
+    <!-- Segments can be long ("Budget (Manual Tokens)"), so the control takes
+         the full width under the row-style label + inline help. -->
+    <div class="py-3 border-t border-darkborderc flex flex-col" data-setting-id={item.id}>
+        <SettingFieldLabel
+            label={getLabel(item)}
+            helpKey={item.helpKey}
+            helpUnrecommended={item.helpUnrecommended}
+            showExperimental={item.showExperimental}
+        />
+        <SegmentedControl className="mt-2" size="sm" bind:value={localValue} options={processedOptions} />
+    </div>
+{:else}
 <span class="text-textcolor {item.classes ?? ''}" data-setting-id={item.id}>
     {getLabel(item)}
     {#if item.showExperimental}<Help key="experimental"/>{/if}
@@ -57,3 +71,4 @@
     bind:value={localValue}
     options={processedOptions}
 />
+{/if}

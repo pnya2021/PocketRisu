@@ -64,6 +64,7 @@
   const isTouchDevice = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
   const touchDragEnabled = $derived(isTouchDevice && !DBState.db.disableMobileDragDrop);
     import { RISU_SIDEBAR_DRAG_TYPE } from "src/ts/dragTypes";
+    import { scrollWithinContainer } from "../ChatScreens/scrollWithin";
 
   let sideBarMode = $state(0);
   let editMode = $state(false);
@@ -99,6 +100,11 @@
   let IconRounded = $state(false)
   let openFolders:string[] = $state([])
   let currentDrag: DragData | null = $state(null)
+  // characterOrder index of each rendered entry (top level, and per folder).
+  // The sidebar skips hidden, trashed and (optionally) deactivated entries, so
+  // a rendered position is not a characterOrder index; drag handlers translate.
+  let renderedOrder: number[] = []
+  let renderedFolderOrder: Record<string, number[]> = {}
   interface Props {
     hidden?: boolean;
   }
@@ -110,6 +116,8 @@
 
   $effect(() => {
     let newCharImages: sortType[] = [];
+    const newRenderedOrder: number[] = []
+    const newRenderedFolderOrder: Record<string, number[]> = {}
     const idObject = getCharacterIndexObject()
     // Deactivated characters keep their slot in characterOrder; resolve those
     // ids against the stub list (unless the user chose to hide them).
@@ -125,7 +133,7 @@
       const stub = archivedById.get(id)
       return stub ? { type: 'archived', img: stub.image ?? '', chaId: stub.chaId, name: stub.name ?? '' } : null
     }
-    for (const id of DBState.db.characterOrder) {
+    for (const [orderIndex, id] of DBState.db.characterOrder.entries()) {
       if(typeof(id) === 'string'){
         if (hiddenSet.has(id)) continue
         const index = idObject[id] ?? -1
@@ -137,15 +145,20 @@
             type: "normal",
             name: cha.name
           });
+          newRenderedOrder.push(orderIndex)
         } else {
           const archived = archivedEntry(id)
-          if (archived) newCharImages.push(archived)
+          if (archived) {
+            newCharImages.push(archived)
+            newRenderedOrder.push(orderIndex)
+          }
         }
       }
       else{
         const folder = id
         let folderCharImages: sortTypeEntry[] = []
-        for(const id of folder.data){
+        const folderOrder: number[] = []
+        for(const [dataIndex, id] of folder.data.entries()){
           if (hiddenSet.has(id)) continue
           const index = idObject[id] ?? -1
           if(index !== -1){
@@ -156,11 +169,17 @@
               type: "normal",
               name: cha.name
             });
+            folderOrder.push(dataIndex)
           } else {
             const archived = archivedEntry(id)
-            if (archived) folderCharImages.push(archived)
+            if (archived) {
+              folderCharImages.push(archived)
+              folderOrder.push(dataIndex)
+            }
           }
         }
+        newRenderedFolderOrder[folder.id] = folderOrder
+        newRenderedOrder.push(orderIndex)
         newCharImages.push({
           folder: folderCharImages,
           type: "folder",
@@ -173,6 +192,8 @@
         });
       }
     }
+    renderedOrder = newRenderedOrder
+    renderedFolderOrder = newRenderedFolderOrder
     if (!isEqual(charImages, newCharImages)) {
       charImages = newCharImages;
     }
@@ -182,7 +203,28 @@
   })
 
 
-  const inserter = (mainIndex:DragData, targetIndex:DragData) => {
+  const renderedPositions = (d:DragData) => d.folder ? renderedFolderOrder[d.folder] : renderedOrder
+
+  // The characterOrder entry a rendered item shows.
+  const itemOrderIndex = (d:DragData): DragData | null => {
+    const index = renderedPositions(d)?.[d.index]
+    return index === undefined ? null : { ...d, index }
+  }
+
+  // A drop slot: before the rendered item at d.index, or after the last one.
+  const slotOrderIndex = (d:DragData): DragData | null => {
+    const positions = renderedPositions(d)
+    if (!positions) return null
+    if (d.index < positions.length) return { ...d, index: positions[d.index] }
+    return { ...d, index: positions.length ? positions[positions.length - 1] + 1 : 0 }
+  }
+
+  const inserter = (renderedMain:DragData, renderedTarget:DragData) => {
+    const mainIndex = itemOrderIndex(renderedMain)
+    const targetIndex = slotOrderIndex(renderedTarget)
+    if(!mainIndex || !targetIndex){
+      return
+    }
     if(mainIndex.index === targetIndex.index && mainIndex.folder === targetIndex.folder){
       return
     }
@@ -300,12 +342,11 @@
     }
     
     setTimeout(() => {
-      const activeElement = document.querySelector(`[data-char-id="${characterId}"]`)
-      if (activeElement) {
-        activeElement.scrollIntoView({ 
-          behavior: 'smooth', 
-          block: 'start' 
-        })
+      const activeElement = document.querySelector(`[data-char-id="${characterId}"]`) as HTMLElement | null
+      const list = activeElement?.closest('.character-list') as HTMLElement | null
+      // Scroll the list only — scrollIntoView also scrolls an inflated root.
+      if (activeElement && list) {
+        scrollWithinContainer(activeElement, list, { block: 'start', behavior: 'smooth' })
       }
     }, 100)
   }
@@ -325,7 +366,12 @@
   })
 
 
-  const createFolder = (mainIndex:DragData, targetIndex:DragData) => {
+  const createFolder = (renderedMain:DragData, renderedTarget:DragData) => {
+    const mainIndex = itemOrderIndex(renderedMain)
+    const targetIndex = itemOrderIndex(renderedTarget)
+    if(!mainIndex || !targetIndex){
+      return
+    }
     if(mainIndex.index === targetIndex.index && mainIndex.folder === targetIndex.folder){
       return
     }

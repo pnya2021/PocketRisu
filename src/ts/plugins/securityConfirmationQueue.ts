@@ -1,4 +1,5 @@
 import { writable, type Readable } from 'svelte/store'
+import { v4 } from 'uuid'
 
 export type SecurityConfirmationKind =
     | 'permission' | 'secret-placement' | 'secret-replacement'
@@ -56,7 +57,7 @@ export class SecurityConfirmationQueue {
         const copy = request.description
             ?? `${request.displayName} (${request.internalName}) requests ${request.action}.`
         const view: SecurityConfirmationView = {
-            digest, presentationId: crypto.randomUUID(), request: { ...request }, title: request.title ?? 'Plugin permission', copy,
+            digest, presentationId: v4(), request: { ...request }, title: request.title ?? 'Plugin permission', copy,
             allowLabel: request.allowLabel ?? 'Allow', denyLabel: request.denyLabel ?? 'Deny',
         }
         return new Promise<boolean>((resolve) => {

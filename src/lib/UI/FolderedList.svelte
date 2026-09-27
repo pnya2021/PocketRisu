@@ -193,7 +193,8 @@
 </script>
 
 <div class="flex flex-col gap-2" bind:this={rootEl}>
-    <div class="flex items-center gap-2">
+    <!-- flex-wrap: with 3+ actions the toolbar overflowed 360px phones -->
+    <div class="flex flex-wrap items-center gap-2">
         {@render actions?.()}
         <div class="grow"></div>
         <ShButton size="sm" variant="outline" onclick={createFolder}><FolderPlusIcon />{language.folderNew}</ShButton>

@@ -575,6 +575,8 @@ function convertOffSpecCards(charaData:OldTavernChar|CharacterCardV2Risu, imgp:s
             note: '',
             name: 'Chat 1',
             localLore: [],
+            // An id from the start: the save path uploads only chats that have one.
+            id: v4(),
             ...newChatModelDefaults()
         }],
         chatPage: 0,
@@ -877,6 +879,8 @@ async function importCharacterCardSpec<T extends boolean = false>(card:Character
             note: '',
             name: 'Chat 1',
             localLore: [],
+            // An id from the start: the save path uploads only chats that have one.
+            id: v4(),
             ...newChatModelDefaults()
         }],
         chatPage: 0,

@@ -201,9 +201,9 @@
 />
 
 {#if $PromptPresetSubmenuIndex === 0}
-    <SettingRenderer items={promptPresetBasicInfoItems} />
+    <SettingRenderer items={promptPresetBasicInfoItems} layout="row" />
 {:else if $PromptPresetSubmenuIndex === 1}
-    <SettingRenderer items={promptPresetPromptItems} />
+    <SettingRenderer items={promptPresetPromptItems} layout="row" />
 {:else if $PromptPresetSubmenuIndex === 2}
     <ShAlert className="mt-4 mb-2">
         {#snippet icon()}<InfoIcon />{/snippet}
@@ -211,6 +211,6 @@
     </ShAlert>
     <SettingRenderer items={promptPresetParameterItems} layout="block" />
 {:else if $PromptPresetSubmenuIndex === 3}
-    <SettingRenderer items={promptPresetAdvancedItems} />
+    <SettingRenderer items={promptPresetAdvancedItems} layout="row" />
 {/if}
 {/if}

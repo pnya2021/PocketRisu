@@ -32,6 +32,10 @@ function enabled(): boolean {
 // register POST on the network, resurrecting a tombstone for a send that
 // already ended (→ one spurious auto re-send at the next boot).
 const opChains = new Map<string, Promise<unknown>>()
+// A stopped pipeline can finish after a replacement send has registered.
+// Track ownership synchronously so its late cleanup cannot queue a DELETE
+// behind the replacement's POST. The operation chain preserves that order.
+const pendingOwners = new Map<string, string>()
 function chained<T>(chatId: string, op: () => Promise<T>, fallback: T): Promise<T> {
     const prev = opChains.get(chatId) ?? Promise.resolve()
     const next = prev.then(op, op).catch(() => fallback)
@@ -44,6 +48,7 @@ function chained<T>(chatId: string, op: () => Promise<T>, fallback: T): Promise<
 }
 
 export function registerPendingSend(chatId: string, generationId: string): void {
+    pendingOwners.set(chatId, generationId)
     if (!enabled()) return
     void chained(chatId, async () => {
         await fetch('/api/pending-sends', {
@@ -57,7 +62,9 @@ export function registerPendingSend(chatId: string, generationId: string): void 
 /** Clear the tombstone (send concluded) and drop any local resume flag.
  *  NOT gated on the toggle: a record made before the toggle was switched off
  *  must still be clearable. */
-export function clearPendingSend(chatId: string): void {
+export function clearPendingSend(chatId: string, generationId?: string): void {
+    if (generationId !== undefined && pendingOwners.get(chatId) !== generationId) return
+    pendingOwners.delete(chatId)
     resumableSends.update((m) => {
         if (!m.has(chatId)) return m
         const next = new Map(m)

@@ -90,52 +90,53 @@
     }
 </script>
 
-<div class="flex flex-col gap-4">
-    <div class="flex flex-col gap-1">
-        <span class="text-textcolor">{language.name}</span>
-        <TextInput bind:value={DBState.db.botPresets[activeIndex].name} fullwidth />
+<!-- Row-layout grammar: name / icon rows, then the preset actions. -->
+<div class="flex flex-col">
+    <div class="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+        <span class="text-sm text-textcolor">{language.name}</span>
+        <TextInput className="sm:w-64 h-8" size="sm" padding bind:value={DBState.db.botPresets[activeIndex].name} fullwidth />
     </div>
 
-    <div class="flex flex-col gap-2">
-        <span class="text-textcolor">{language.icon}</span>
-        <div class="flex items-center gap-3 p-2 rounded-md border border-darkborderc">
+    <div class="flex items-center justify-between gap-3 py-3 border-t border-darkborderc">
+        <div class="flex items-center gap-3 min-w-0">
             {#if DBState.db.botPresets[activeIndex]?.image}
                 <img src={DBState.db.botPresets[activeIndex].image} alt="icon"
-                     class="w-12 h-12 rounded-md shrink-0" decoding="async" />
+                     class="w-10 h-10 rounded-md shrink-0" decoding="async" />
             {:else}
-                <div class="w-12 h-12 rounded-md bg-darkbutton flex items-center justify-center text-textcolor2 shrink-0">
-                    <ImageOffIcon size={20} />
+                <div class="w-10 h-10 rounded-md bg-darkbutton flex items-center justify-center text-textcolor2 shrink-0">
+                    <ImageOffIcon size={18} />
                 </div>
             {/if}
-            <div class="flex flex-wrap gap-2 grow justify-end">
-                <ShButton variant="default" size="sm" onclick={uploadIcon}>
-                    <UploadIcon size={16} />
-                    <span class="ml-1">{language.presetImport}</span>
+            <span class="text-sm text-textcolor">{language.icon}</span>
+        </div>
+        <div class="flex flex-wrap gap-2 justify-end">
+            <ShButton variant="outline" size="sm" onclick={uploadIcon}>
+                <UploadIcon size={16} />
+                <span class="ml-1">{language.presetImport}</span>
+            </ShButton>
+            {#if DBState.db.botPresets[activeIndex]?.image}
+                <ShButton variant="destructive" size="sm" onclick={removeIcon}>
+                    <TrashIcon size={16} />
+                    <span class="ml-1">{language.iconRemove}</span>
                 </ShButton>
-                {#if DBState.db.botPresets[activeIndex]?.image}
-                    <ShButton variant="destructive" size="sm" onclick={removeIcon}>
-                        <TrashIcon size={16} />
-                        <span class="ml-1">{language.iconRemove}</span>
-                    </ShButton>
-                {/if}
-            </div>
+            {/if}
         </div>
     </div>
 
-    <div class="flex flex-col gap-2">
-        <ShButton variant="default" size="default" className="w-full" onclick={handleDuplicate}>
+    <div class="flex flex-wrap gap-2 py-3 border-t border-darkborderc">
+        <ShButton variant="outline" size="sm" onclick={handleDuplicate}>
             <CopyIcon size={16} />
             <span class="ml-1">{language.presetDuplicate}</span>
         </ShButton>
-        <ShButton variant="default" size="default" className="w-full" onclick={handleExport}>
+        <ShButton variant="outline" size="sm" onclick={handleExport}>
             <Share2Icon size={16} />
             <span class="ml-1">{language.presetExport}</span>
         </ShButton>
-        <ShButton variant="default" size="default" className="w-full" onclick={handleImport}>
+        <ShButton variant="outline" size="sm" onclick={handleImport}>
             <HardDriveUploadIcon size={16} />
             <span class="ml-1">{language.presetImport}</span>
         </ShButton>
-        <ShButton variant="destructive" size="default" className="w-full" onclick={handleDelete}>
+        <ShButton variant="destructive" size="sm" className="sm:ml-auto" onclick={handleDelete}>
             <Trash2Icon size={16} />
             <span class="ml-1">{language.presetDelete}</span>
         </ShButton>

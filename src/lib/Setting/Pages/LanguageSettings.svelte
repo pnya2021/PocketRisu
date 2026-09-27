@@ -11,5 +11,5 @@
 </script>
 
 <SettingPage title={language.language}>
-<SettingRenderer items={languageSettingsItems} />
+<SettingRenderer items={languageSettingsItems} layout="row" />
 </SettingPage>

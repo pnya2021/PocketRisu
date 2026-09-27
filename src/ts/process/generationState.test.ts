@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 import {
     abortGeneration,
@@ -10,11 +10,14 @@ import {
     generationStates,
     isAnyGenerating,
     isChatGenerating,
+    prepareGenerationRestart,
     registerAbort,
     setGenerationStage,
     startGeneration,
+    stopGeneration,
     syncDoingChat,
 } from './generationState'
+
 
 beforeEach(() => {
     // endAllGenerations preserves background entries by design; drop them too.
@@ -209,5 +212,144 @@ describe('syncDoingChat', () => {
         doingChat.set(false)
         syncDoingChat()
         expect(get(doingChat)).toBe(true)
+    })
+})
+
+describe('owner-scoped endGeneration', () => {
+    it('ignores an end from a generation that no longer owns the key', () => {
+        startGeneration('c1', 'new')
+        expect(endGeneration('c1', { generationId: 'old' })).toBe(false)
+        expect(isChatGenerating('c1')).toBe(true)
+        expect(endGeneration('c1', { generationId: 'new' })).toBe(true)
+        expect(isChatGenerating('c1')).toBe(false)
+    })
+
+    it('ignores an end from a caller whose controller is not the registered one', () => {
+        const oldCtl = new AbortController()
+        const newCtl = new AbortController()
+        registerAbort('c1', newCtl)
+        startGeneration('c1', 'g-new')
+        expect(endGeneration('c1', { controller: oldCtl })).toBe(false)
+        expect(isChatGenerating('c1')).toBe(true)
+        expect(endGeneration('c1', { controller: newCtl })).toBe(true)
+        expect(isChatGenerating('c1')).toBe(false)
+    })
+
+    it('does not drop a newer pending controller registered before its generation starts', () => {
+        const oldCtl = new AbortController()
+        const newCtl = new AbortController()
+        registerAbort('c1', newCtl)
+        expect(endGeneration('c1', { controller: oldCtl })).toBe(false)
+        startGeneration('c1', 'g-new')
+        expect(get(generationStates).get('c1')?.abortController).toBe(newCtl)
+    })
+
+    it('an owner end after the entry is gone still reports success', () => {
+        const ctl = new AbortController()
+        expect(endGeneration('c1', { controller: ctl })).toBe(true)
+    })
+})
+
+describe('stopGeneration (#85)', () => {
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+
+    it('aborts and leaves release to the pipeline when it winds down in time', () => {
+        const ctl = new AbortController()
+        registerAbort('c1', ctl)
+        startGeneration('c1', 'g1')
+        const released = vi.fn()
+        stopGeneration('c1', { graceMs: 1000, onForceReleased: released })
+        expect(ctl.signal.aborted).toBe(true)
+        endGeneration('c1', { generationId: 'g1' })
+        vi.advanceTimersByTime(1000)
+        expect(released).not.toHaveBeenCalled()
+    })
+
+    it('force-releases a live generation that ignores the abort', () => {
+        const ctl = new AbortController()
+        registerAbort('c1', ctl)
+        startGeneration('c1', 'g1')
+        const released = vi.fn()
+        stopGeneration('c1', { graceMs: 1000, onForceReleased: released })
+        vi.advanceTimersByTime(999)
+        expect(get(doingChat)).toBe(true)
+        vi.advanceTimersByTime(1)
+        expect(isChatGenerating('c1')).toBe(false)
+        expect(get(doingChat)).toBe(false)
+        expect(released).toHaveBeenCalledWith('c1')
+    })
+
+    it('does not release a newer generation that took the key during the grace period', () => {
+        startGeneration('c1', 'g1')
+        const released = vi.fn()
+        stopGeneration('c1', { graceMs: 1000, onForceReleased: released })
+        endGeneration('c1', { generationId: 'g1' })
+        startGeneration('c1', 'g2')
+        vi.advanceTimersByTime(1000)
+        expect(get(generationStates).get('c1')?.generationId).toBe('g2')
+        expect(released).not.toHaveBeenCalled()
+    })
+
+    it('leaves background (server job) entries to their poll loop', () => {
+        startGeneration('c1', 'job', 'background')
+        const released = vi.fn()
+        stopGeneration('c1', { graceMs: 1000, onForceReleased: released })
+        vi.advanceTimersByTime(1000)
+        expect(isChatGenerating('c1')).toBe(true)
+        expect(released).not.toHaveBeenCalled()
+    })
+
+    it('a force-released send waking up later cannot end the next send', () => {
+        const oldCtl = new AbortController()
+        registerAbort('c1', oldCtl)
+        startGeneration('c1', 'g1')
+        stopGeneration('c1', { graceMs: 1000 })
+        vi.advanceTimersByTime(1000)
+        const newCtl = new AbortController()
+        registerAbort('c1', newCtl)
+        startGeneration('c1', 'g2')
+        // The stuck pipeline finally returns and runs both of its ends.
+        expect(endGeneration('c1', { generationId: 'g1' })).toBe(false)
+        expect(endGeneration('c1', { controller: oldCtl })).toBe(false)
+        expect(get(generationStates).get('c1')?.generationId).toBe('g2')
+    })
+
+    it('does not restart a stopped generation before its force-release timer fires', () => {
+        const controller = new AbortController()
+        registerAbort('c1', controller)
+        startGeneration('c1', 'g1')
+        stopGeneration('c1', { graceMs: 1000 })
+
+        expect(prepareGenerationRestart('c1', 'g1', controller.signal)).toBe(false)
+        expect(get(generationStates).get('c1')?.generationId).toBe('g1')
+        expect(controller.signal.aborted).toBe(true)
+    })
+
+    it('does not replace a newer owner after the stopped generation is force-released', () => {
+        const oldController = new AbortController()
+        registerAbort('c1', oldController)
+        startGeneration('c1', 'g1')
+        stopGeneration('c1', { graceMs: 1000 })
+        vi.advanceTimersByTime(1000)
+
+        const newController = new AbortController()
+        registerAbort('c1', newController)
+        startGeneration('c1', 'g2')
+        expect(prepareGenerationRestart('c1', 'g1', oldController.signal)).toBe(false)
+        expect(get(generationStates).get('c1')?.generationId).toBe('g2')
+        expect(get(generationStates).get('c1')?.abortController).toBe(newController)
+    })
+
+    it('allows an active owner to restart while preserving its Stop controller', () => {
+        const controller = new AbortController()
+        registerAbort('c1', controller)
+        startGeneration('c1', 'g1')
+
+        expect(prepareGenerationRestart('c1', 'g1', controller.signal)).toBe(true)
+        expect(isChatGenerating('c1')).toBe(false)
+        startGeneration('c1', 'g2')
+        expect(get(generationStates).get('c1')?.abortController).toBe(controller)
+        expect(controller.signal.aborted).toBe(false)
     })
 })

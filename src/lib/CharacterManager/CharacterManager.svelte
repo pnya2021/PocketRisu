@@ -26,9 +26,9 @@
     } from "src/ts/stores.svelte";
     import { addCharacter, changeChar, getCharImage, removeChar } from "src/ts/characters";
     import { exportChar } from "src/ts/characterCards";
-    import { activateCharacter, archiveCharacter, deleteTrashedCharacter, promptActivateCharacter, restoreTrashedCharacter, trashDeactivatedCharacter } from "src/ts/characterArchive";
+    import { activateCharacter, archiveCharacter, archiveCharacters, deleteTrashedCharacter, promptActivateCharacter, restoreTrashedCharacter, trashDeactivatedCharacter, type BulkArchiveOutcome } from "src/ts/characterArchive";
     import { checkCharOrder } from "src/ts/globalApi.svelte";
-    import { alertConfirm, alertError, alertInput, alertSelect } from "src/ts/alert";
+    import { alertConfirm, alertError, alertInput, alertSelect, notifySuccess } from "src/ts/alert";
     import { findCharacterIndexbyId } from "src/ts/util";
     import {
         buildManagerEntries, matchesFilter, matchesSearch, sortEntries,
@@ -56,6 +56,8 @@
     let selectMode = $state(false);
     let gridCompact = $state(loadGridCompact());
     let selectedIds = $state<Set<string>>(new Set());
+    // A bulk trash / deactivation is running: its buttons stay disabled.
+    let bulkBusy = $state(false);
 
     let search = $derived(externalSearch ?? searchLocal);
     let entries = $derived(buildManagerEntries(DBState.db));
@@ -266,29 +268,70 @@
         clearSelection();
     }
 
+    function bulkList(items: { name: string }[], max = 8): string {
+        const lines = items.slice(0, max).map((it) => `• ${it.name}`);
+        if (items.length > max) lines.push(`• … +${items.length - max}`);
+        return lines.join('\n');
+    }
+
+    // One summary for the whole run: a toast when everything went through,
+    // otherwise an alert naming what was left behind.
+    function reportBulk(outcome: BulkArchiveOutcome, trash: boolean, extraDone = 0) {
+        const done = outcome.done + extraDone;
+        const failed = [...outcome.failed, ...outcome.lost.map((l) => ({ ...l, reason: '' }))];
+        if (outcome.stopped) alertError(language.bulkArchiveStopped);
+        else if (failed.length > 0) alertError(language.bulkArchiveFailed(done, failed.length, bulkList(failed)));
+        else if (done > 0) notifySuccess(language.bulkArchiveDone(done, trash));
+    }
+
     async function bulkDeactivate() {
+        if (bulkBusy) return;
         const targets = selectedEntries().filter((e) => !e.archived);
         if (targets.length === 0) return;
         if (!await alertConfirm(language.deactivateSelectedConfirm(targets.length))) return;
-        for (const e of targets) {
-            // Re-resolve every time: each deactivation shifts db.characters.
-            const idx = findCharacterIndexbyId(e.chaId);
-            if (idx === -1) continue;
-            const ok = await archiveCharacter(idx, { skipConfirm: true });
-            if (!ok) break;
+        bulkBusy = true;
+        try {
+            const first = await archiveCharacters(targets.map((e) => e.chaId));
+            let outcome = first;
+            // Characters with chats that have no content anywhere: one question
+            // for all of them, then one more run that keeps those as empty chats.
+            if (!first.stopped && first.lost.length > 0
+                && await alertConfirm(language.bulkDeactivateLostChats(first.lost.length, bulkList(first.lost)))) {
+                const second = await archiveCharacters(first.lost.map((l) => l.chaId), { acceptLostChats: true });
+                outcome = { done: first.done + second.done, failed: [...first.failed, ...second.failed], lost: second.lost, stopped: second.stopped };
+            }
+            reportBulk(outcome, false);
+        } catch (error) {
+            alertError(language.deactivateCharacterFailed + (error instanceof Error ? error.message : String(error)));
+        } finally {
+            bulkBusy = false;
+            clearSelection();
         }
-        clearSelection();
     }
 
     async function bulkTrash() {
+        if (bulkBusy) return;
         const targets = selectedEntries();
         if (targets.length === 0) return;
         if (!await alertConfirm(language.trashSelectedConfirm(targets.length))) return;
-        for (const e of targets) {
-            if (e.archived) trashDeactivatedCharacter(e.chaId);
-            else await removeChar(e.chaId, e.name, 'normal', { skipConfirm: true });
+        bulkBusy = true;
+        try {
+            // Already deactivated: the trash is only a marker on the stub.
+            let marked = 0;
+            for (const e of targets) {
+                if (e.archived && trashDeactivatedCharacter(e.chaId)) marked++;
+            }
+            const live = targets.filter((e) => !e.archived).map((e) => e.chaId);
+            const outcome = live.length > 0
+                ? await archiveCharacters(live, { trash: true })
+                : { done: 0, failed: [], lost: [], stopped: false };
+            reportBulk(outcome, true, marked);
+        } catch (error) {
+            alertError(language.deactivateCharacterFailed + (error instanceof Error ? error.message : String(error)));
+        } finally {
+            bulkBusy = false;
+            clearSelection();
         }
-        clearSelection();
     }
 </script>
 
@@ -397,8 +440,8 @@
                 <ShButton variant="ghost" size="xs" disabled={selectedIds.size === 0} onclick={() => bulkHidden(true)}><EyeOffIcon />{language.hideFromSidebar}</ShButton>
                 <ShButton variant="ghost" size="xs" disabled={selectedIds.size === 0} onclick={() => bulkHidden(false)}><EyeIcon />{language.showInSidebar}</ShButton>
                 <ShButton variant="ghost" size="xs" disabled={selectedIds.size === 0} onclick={bulkMove}><FolderIcon />{language.folderMoveTo}</ShButton>
-                <ShButton variant="ghost" size="xs" disabled={selectedIds.size === 0} onclick={bulkDeactivate}><ArchiveIcon />{language.deactivateCharacter}</ShButton>
-                <ShButton variant="destructive" size="xs" disabled={selectedIds.size === 0} onclick={bulkTrash}><TrashIcon />{language.trash}</ShButton>
+                <ShButton variant="ghost" size="xs" disabled={selectedIds.size === 0 || bulkBusy} onclick={bulkDeactivate}><ArchiveIcon />{language.deactivateCharacter}</ShButton>
+                <ShButton variant="destructive" size="xs" disabled={selectedIds.size === 0 || bulkBusy} onclick={bulkTrash}><TrashIcon />{language.trash}</ShButton>
                 <ShButton variant="outline" size="xs" onclick={clearSelection}>{language.clearSelection}</ShButton>
             </div>
         {/if}

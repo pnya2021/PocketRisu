@@ -163,3 +163,65 @@ describe('character cold storage migration', () => {
     expect(charA!.firstMessages).toEqual(charB!.firstMessages)
   })
 })
+
+describe('plugin storage cold storage migration (upstream cad8595a)', () => {
+
+  const ID_A = '0b6f7a52-5d1e-4c1b-9a2e-3f4d5c6b7a81'
+  const ID_B = '1c7e8b63-6e2f-4d2c-8b3f-4e5d6c7b8a92'
+  const ID_MISSING = '2d8f9c74-7f30-4e3d-9c40-5f6e7d8c9ba3'
+
+  test('folds _coldplugin values back into pluginCustomStorage', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+
+    const memory = { entries: [{ id: 1, text: 'remembered' }], version: 3 }
+    const seed = createSeedBackup({
+      pluginCustomStorage: {
+        _coldplugin: { 'ltm/memory': ID_A, 'ltm/config': ID_B },
+        // Inline key written before upstream migrated it: the cold copy wins.
+        'ltm/memory': 'stale inline copy',
+        // A key upstream never moved stays as is.
+        'other/flag': 'kept',
+      },
+      coldStorageEntries: {
+        [ID_A]: memory,
+        [ID_B]: 'config-string',
+      },
+    })
+
+    const result = await client.importBackup(seed)
+    expect(result.ok).toBe(true)
+
+    const { raw } = normalizeBackup(await client.exportBackup())
+    expect(raw.pluginCustomStorage).toEqual({
+      'ltm/memory': memory,
+      'ltm/config': 'config-string',
+      'other/flag': 'kept',
+    })
+  })
+
+  test('keeps unreadable keys under _coldplugin instead of dropping them', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+
+    const seed = createSeedBackup({
+      pluginCustomStorage: {
+        _coldplugin: { 'ltm/memory': ID_A, 'ltm/lost': ID_MISSING },
+      },
+      coldStorageEntries: {
+        [ID_A]: 'restored',
+      },
+    })
+
+    const result = await client.importBackup(seed)
+    expect(result.ok).toBe(true)
+
+    const { raw } = normalizeBackup(await client.exportBackup())
+    expect(raw.pluginCustomStorage).toEqual({
+      'ltm/memory': 'restored',
+      _coldplugin: { 'ltm/lost': ID_MISSING },
+    })
+  })
+})

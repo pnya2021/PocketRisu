@@ -11,18 +11,18 @@
     import { tick, untrack } from 'svelte';
     import Chat from "./Chat.svelte";
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
-    import { type Chat as ChatData, type Message } from "../../ts/storage/database.svelte";
+    import { type Chat as ChatData, type Message, loadTogglesFromChat } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
     import { resolveGroupMessageSpeaker, type GroupGenerationMode } from "../../ts/process/group";
-    import { abortGeneration, chatGenKey, endGeneration, generationStates, registerAbort } from "../../ts/process/generationState";
+    import { chatGenKey, endGeneration, generationStates, registerAbort, stopGeneration } from "../../ts/process/generationState";
     import { claimPendingSend, clearPendingSend, markResumable, resumableSends, takeResumable } from "../../ts/process/request/pendingSends";
-    import { ensureCurrentChatReady } from "../../ts/storage/chatStorage";
+    import { chatLoadFailures, ensureCurrentChatReady } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
-    import { alertError, alertWait, notifySuccess, notifyError, notifyInfo } from "../../ts/alert";
+    import { alertConfirm, alertError, alertWait, notifySuccess, notifyError, notifyInfo, notifyWarning } from "../../ts/alert";
     import { playNotificationSound } from '../../ts/notificationSound'
 import { isMobile } from 'src/ts/platform'
     import { processScript } from "src/ts/process/scripts";
@@ -76,6 +76,7 @@ import { isMobile } from 'src/ts/platform'
     let loadPages = $state(getInitialChatLoadPages(DBState.db))
     let doingChatInputTranslate = false
     let lastBlockedSendToastAt = 0
+    const BLOCKED_SEND_STOP_OFFER_MS = 180_000
     let toggleStickers:boolean = $state(false)
     let fileInput:string[] = $state([])
     let showNewMessageButton = $state(false)
@@ -167,6 +168,18 @@ import { isMobile } from 'src/ts/platform'
         if (!chat) return null
         if (!chat._placeholder) return chat
         return await ensureCurrentChatReady(char.chats, char.chatPage, char.chaId)
+    }
+
+    // The load that failed never applied this chat's saved toggles (the
+    // select/change paths do that only on success), so apply them here.
+    async function retryChatLoad() {
+        const char = DBState.db.characters[$selectedCharID]
+        const chatId = char?.chats[char.chatPage]?.id
+        const hydrated = await ensureActiveChatReady().catch(() => null)
+        const now = DBState.db.characters[$selectedCharID]
+        if (hydrated && now?.chaId === char?.chaId && now?.chats[now.chatPage]?.id === chatId) {
+            loadTogglesFromChat(hydrated)
+        }
     }
 
     function scrollToBottom() {
@@ -346,12 +359,25 @@ import { isMobile } from 'src/ts/platform'
             // skipped while a modal is up: notifyInfo clears transitional
             // alerts, which would dismiss an unrelated alertWait.
             const now = Date.now()
-            if($alertStore.type === 'none' && now - lastBlockedSendToastAt > 1000){
-                lastBlockedSendToastAt = now
-                notifyInfo($generationStates.has(currentChatGenKey())
-                    ? language.errors.chatStillGenerating
-                    : language.errors.otherChatGenerating)
+            if($alertStore.type !== 'none' || now - lastBlockedSendToastAt <= 1000){
+                return
             }
+            lastBlockedSendToastAt = now
+            if($generationStates.has(currentChatGenKey())){
+                notifyInfo(language.errors.chatStillGenerating)
+                return
+            }
+            // The lock is held by another chat, whose Stop button is not on
+            // screen. Once it has run for a while it may be stuck (#85):
+            // offer to stop it from here instead of forcing a reload.
+            const holder = [...$generationStates.entries()].find(([, entry]) => entry.kind === 'live')
+            if(holder && now - holder[1].startedAt > BLOCKED_SEND_STOP_OFFER_MS){
+                if(await alertConfirm(language.errors.otherChatGenerationStopConfirm)){
+                    stopGeneration(holder[0], { onForceReleased: onGenerationForceReleased })
+                }
+                return
+            }
+            notifyInfo(language.errors.otherChatGenerating)
             return
         }
 
@@ -645,7 +671,11 @@ import { isMobile } from 'src/ts/platform'
             console.error(error)
             alertError(error)
         }
-        endGeneration(genKey)
+        // Owner-scoped: after a forced release (stopGeneration) this send may
+        // conclude long after a newer send took the chat; leave that one alone.
+        if(!endGeneration(genKey, { controller: abortController })){
+            return generated
+        }
         // Send concluded on THIS client (success, failure or abort alike) —
         // drop the resumable-send tombstone so no later boot re-runs it.
         clearPendingSend(genKey)
@@ -689,8 +719,9 @@ import { isMobile } from 'src/ts/platform'
         } catch (error) {
             console.error(error)
         }
-        endGeneration(chatId)
-        clearPendingSend(chatId)
+        if(endGeneration(chatId, { controller: abortController })){
+            clearPendingSend(chatId)
+        }
     }
 
     // One-shot via takeResumable; the timeout escapes the effect before the
@@ -705,7 +736,15 @@ import { isMobile } from 'src/ts/platform'
     })
 
     function abortChat(){
-        abortGeneration(currentChatGenKey())
+        stopGeneration(currentChatGenKey(), { onForceReleased: onGenerationForceReleased })
+    }
+
+    // Stop was pressed but the generation never wound down (#85): its entry
+    // was dropped so sending works again. The stuck send is over for the
+    // user, so its resumable tombstone goes too.
+    function onGenerationForceReleased(chatKey: string){
+        clearPendingSend(chatKey)
+        notifyWarning(language.errors.generationForceReleased)
     }
 
     let { userIconPortrait, currentUsername, userIcon } = $derived.by(() => {
@@ -1364,9 +1403,19 @@ import { isMobile } from 'src/ts/platform'
             {/if}
 
             {#if !currentChatReady}
-                <div class="w-full flex justify-center text-textcolor2 italic mb-12">
-                    {language.loadingChatData}
-                </div>
+                {@const loadFailure = $chatLoadFailures.get(`${currentCharacter?.chaId}/${currentChatSlot?.id}`)}
+                {#if loadFailure}
+                    <div role="alert" class="w-full flex flex-col items-center gap-2 text-textcolor2 mb-12 px-4 text-center">
+                        <span>{loadFailure === 'missing' ? language.errors.chatBodyMissing : language.errors.chatLoadFailed}</span>
+                        <Button size="sm" onclick={() => { void retryChatLoad() }}>
+                            {language.errors.chatLoadRetry}
+                        </Button>
+                    </div>
+                {:else}
+                    <div class="w-full flex justify-center text-textcolor2 italic mb-12">
+                        {language.loadingChatData}
+                    </div>
+                {/if}
             {:else}
 
             {#if chatFoldedStateMessageIndex.index !== -1}

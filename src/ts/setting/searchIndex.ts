@@ -34,6 +34,7 @@ import {
     ModelPresetListTabIndex,
     SystemSubmenuIndex,
     AccessibilitySubmenuIndex,
+    AdvancedSubmenuIndex,
 } from '../stores.svelte';
 import type { Writable } from 'svelte/store';
 
@@ -50,9 +51,21 @@ import {
     accessibilityEditingItems,
     accessibilityScrollItems,
     accessibilitySidebarItems,
+    accessibilityCharacterItems,
     accessibilityOtherItems,
 } from './accessibilitySettingsData';
-import { advancedSettingsItems } from './advancedSettingsData';
+import {
+    advancedPromptLorebookItems,
+    advancedPromptTextItems,
+    advancedPromptResponseItems,
+    advancedPromptToolItems,
+    advancedRequestItems,
+    advancedAssetItems,
+    advancedDevVisibilityItems,
+    advancedDevToolItems,
+    advancedExperimentalItems,
+    advancedUnrecommendedItems,
+} from './advancedSettingsData';
 import { allBasicParameterItems } from './botSettingsParamsData';
 import { languageSettingsItems } from './languageSettingsData.svelte';
 import { inlayImageSettingsItems } from './inlayImageSettingsData';
@@ -92,7 +105,17 @@ const declarativeSources: DeclarativeSource[] = [
     { items: accessibilityScrollItems, route: SettingsRoute.Accessibility, subTab: 1, tabLabel: () => language.accTabScroll },
     { items: accessibilitySidebarItems, route: SettingsRoute.Accessibility, subTab: 2, tabLabel: () => language.accTabSidebar },
     { items: accessibilityOtherItems, route: SettingsRoute.Accessibility, subTab: 3, tabLabel: () => language.others },
-    { items: advancedSettingsItems, route: SettingsRoute.Advanced },
+    { items: accessibilityCharacterItems, route: SettingsRoute.Accessibility, subTab: 4, tabLabel: () => language.character },
+    { items: advancedPromptLorebookItems, route: SettingsRoute.Advanced, subTab: 0, tabLabel: () => language.advTabPrompt, sectionLabel: () => language.loreBook },
+    { items: advancedPromptTextItems, route: SettingsRoute.Advanced, subTab: 0, tabLabel: () => language.advTabPrompt, sectionLabel: () => language.prompt },
+    { items: advancedPromptResponseItems, route: SettingsRoute.Advanced, subTab: 0, tabLabel: () => language.advTabPrompt, sectionLabel: () => language.advSectionResponse },
+    { items: advancedPromptToolItems, route: SettingsRoute.Advanced, subTab: 0, tabLabel: () => language.advTabPrompt, sectionLabel: () => language.tools },
+    { items: advancedRequestItems, route: SettingsRoute.Advanced, subTab: 1, tabLabel: () => language.advTabRequest },
+    { items: advancedAssetItems, route: SettingsRoute.Advanced, subTab: 2, tabLabel: () => language.advTabAssets },
+    { items: advancedDevVisibilityItems, route: SettingsRoute.Advanced, subTab: 3, tabLabel: () => language.advTabDev },
+    { items: advancedDevToolItems, route: SettingsRoute.Advanced, subTab: 3, tabLabel: () => language.advTabDev, sectionLabel: () => language.advSectionDevTools },
+    { items: advancedExperimentalItems, route: SettingsRoute.Advanced, subTab: 3, tabLabel: () => language.advTabDev, sectionLabel: () => language.advSectionExperimental },
+    { items: advancedUnrecommendedItems, route: SettingsRoute.Advanced, subTab: 3, tabLabel: () => language.advTabDev, sectionLabel: () => language.unrecommended },
     { items: allBasicParameterItems, route: SettingsRoute.ChatBot, subTab: 1, tabLabel: () => language.parameters },
     { items: languageSettingsItems, route: SettingsRoute.Language },
     { items: inlayImageSettingsItems, route: SettingsRoute.InlayImageGallery, subTab: 1, tabLabel: () => language.settings },
@@ -259,6 +282,7 @@ const submenuStores: Partial<Record<SettingsRouteValue, Writable<number>>> = {
     [SettingsRoute.ModelPreset]: ModelPresetListTabIndex,
     [SettingsRoute.System]: SystemSubmenuIndex,
     [SettingsRoute.Accessibility]: AccessibilitySubmenuIndex,
+    [SettingsRoute.Advanced]: AdvancedSubmenuIndex,
 };
 
 /**

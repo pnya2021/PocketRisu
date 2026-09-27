@@ -22,6 +22,7 @@ export interface GenState {
     // for up to the job-poll deadline).
     kind: 'live' | 'background'
     abortController?: AbortController
+    startedAt: number
 }
 
 export const generationStates = writable<Map<string, GenState>>(new Map())
@@ -73,7 +74,7 @@ export function startGeneration(chatKey: string, generationId: string, kind: 'li
     const abortController = pendingAborts.get(chatKey)
     generationStates.update((m) => {
         const next = new Map(m)
-        next.set(chatKey, { generationId, kind, abortController })
+        next.set(chatKey, { generationId, kind, abortController, startedAt: Date.now() })
         return next
     })
     syncDoingChat()
@@ -89,7 +90,16 @@ export function setGenerationStage(_chatKey: string, stage: number): void {
 // restart the generation under the same key mid-send; they keep the pending
 // controller so the restarted entry re-adopts it. Terminal ends (the default)
 // drop it so it cannot be adopted by a later unrelated generation.
-export function endGeneration(chatKey: string, opts?: { keepPendingAbort?: boolean }): void {
+//
+// generationId / controller scope the end to its owner: a send that was
+// force-released (stopGeneration) and wakes up later must not tear down the
+// entry of a NEWER generation that took the same chat key meanwhile. Returns
+// false when the entry belongs to someone else (nothing was touched).
+export function endGeneration(chatKey: string, opts?: { keepPendingAbort?: boolean, generationId?: string, controller?: AbortController }): boolean {
+    const entry = get(generationStates).get(chatKey)
+    if (entry && opts?.generationId && entry.generationId !== opts.generationId) return false
+    if (entry && opts?.controller && entry.abortController && entry.abortController !== opts.controller) return false
+    if (!entry && opts?.controller && pendingAborts.has(chatKey) && pendingAborts.get(chatKey) !== opts.controller) return false
     if (!opts?.keepPendingAbort) {
         pendingAborts.delete(chatKey)
     }
@@ -101,6 +111,40 @@ export function endGeneration(chatKey: string, opts?: { keepPendingAbort?: boole
         return next
     })
     syncDoingChat()
+    return true
+}
+
+// A recursive auto-continue/resend may restart only while its original send
+// still owns the chat and Stop has not aborted its signal. The check and end
+// are synchronous, so a force release or newer owner cannot slip between them.
+export function prepareGenerationRestart(chatKey: string, generationId: string, signal: AbortSignal): boolean {
+    if (signal.aborted || get(generationStates).get(chatKey)?.generationId !== generationId) return false
+    return endGeneration(chatKey, { keepPendingAbort: true, generationId })
+}
+
+export const STOP_GRACE_MS = 8000
+
+// Stop that cannot be ignored. abortGeneration only signals the controller; a
+// pipeline stuck in an await that ignores the signal (a stalled plugin stream,
+// a half-open connection) never reaches its endGeneration, and the global send
+// lock then held until a reload (#85). If the SAME live generation is still
+// registered after graceMs, drop its entry so sending works again. The stale
+// pipeline, if it ever wakes, sees its aborted signal and skips its writes;
+// its own endGeneration is owner-scoped and cannot touch a newer entry.
+// Background entries are left alone: their job poll loop owns the release.
+// No inactivity timer on purpose: a long thinking response can stay silent
+// for minutes, so only an explicit Stop escalates.
+export function stopGeneration(chatKey: string, opts: { graceMs?: number, onForceReleased?: (chatKey: string) => void } = {}): void {
+    const target = get(generationStates).get(chatKey)
+    abortGeneration(chatKey)
+    if (!target || target.kind !== 'live') return
+    setTimeout(() => {
+        const current = get(generationStates).get(chatKey)
+        if (!current || current.generationId !== target.generationId) return
+        if (endGeneration(chatKey, { generationId: target.generationId })) {
+            opts.onForceReleased?.(chatKey)
+        }
+    }, opts.graceMs ?? STOP_GRACE_MS)
 }
 
 // Blanket reset — replaces the old external `doingChat.set(false)` cleanup

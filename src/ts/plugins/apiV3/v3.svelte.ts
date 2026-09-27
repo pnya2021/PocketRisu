@@ -6,7 +6,7 @@ import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import * as pluginStorageStore from "../pluginStorageStore";
 import DOMPurify from 'dompurify';
-import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, selIdState, type MenuDef } from "src/ts/stores.svelte";
+import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, alertStore as alertStateStore, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, selIdState, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
 import { alertConfirm, alertError, alertNormal, alertNormalWait } from "src/ts/alert";
@@ -17,9 +17,11 @@ import { get } from "svelte/store";
 import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
 import { getInlayAsset } from "src/ts/process/files/inlays";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
+import { risuChatParser, type CbsConditions } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { endAllGenerations } from "src/ts/process/generationState";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
+import { processScriptFull } from "src/ts/process/scripts";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
@@ -624,6 +626,27 @@ export const unloadV3Plugin = async (identifier: string) => {
     }
 }
 
+// A fullscreen plugin frame sits above the whole app (z-index 1000), which
+// also covered the app's own alerts — among them the permission prompt the
+// plugin itself is waiting on, so it could hang forever. While an alert is
+// open the frame drops below the alert layer (z-50).
+const fullscreenPluginFrames = new Set<HTMLIFrameElement>()
+let appAlertOpen = false
+let alertLayerWatched = false
+
+function applyFullscreenFrameLayer(iframe: HTMLIFrameElement) {
+    iframe.style.zIndex = appAlertOpen ? "40" : "1000"
+}
+
+function watchAlertLayer() {
+    if (alertLayerWatched) return
+    alertLayerWatched = true
+    alertStateStore.subscribe((alert) => {
+        appAlertOpen = alert.type !== 'none'
+        for (const frame of fullscreenPluginFrames) applyFullscreenFrameLayer(frame)
+    })
+}
+
 export async function resetAllPluginPermissions() {
     await pluginPermissionService.resetAll(() => pluginPermissionPersistence.clearAll())
 }
@@ -670,6 +693,7 @@ export const createPocketStudioCardResourceAdapterForV3 = () => createPocketStud
 })
 
 const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: PluginExecutionContext) => {
+    addPluginUnloadCallback(context.instanceId, () => { fullscreenPluginFrames.delete(iframe) })
 
     const isExecutionCurrent = () => isCurrentPluginRuntimeRecord(
         plugin, getDatabase().plugins ?? [], (principalId) => pluginDataLifecycle.isRetiring(principalId),
@@ -1133,6 +1157,49 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }
             return null;
         },
+        parseRisuChat: async (text:string, options?:{
+            messageIndex?: number
+            role?: string
+            processRegex?: boolean
+            runVar?: boolean
+            rmVar?: boolean
+            tokenizeAccurate?: boolean
+            cbsConditions?: CbsConditions
+        }) => {
+            const db = DBState.db
+            const char = db.characters[get(selectedCharID)];
+            if(!char){
+                throw new Error('No character selected');
+            }
+            const chat = char.chats?.[char.chatPage];
+            if(!chat){
+                throw new Error('No active chat found');
+            }
+            const chatID = options?.messageIndex ?? -1;
+            if(!Number.isInteger(chatID) || chatID < -1 || chatID >= chat.message.length){
+                throw new Error(`Invalid messageIndex: ${chatID}`);
+            }
+            const role = options?.role;
+            const cbsConditions:CbsConditions = {
+                ...(role ? { chatRole: role } : {}),
+                ...(options?.cbsConditions ?? {}),
+            };
+            const parsed = risuChatParser(text ?? '', {
+                chara: char,
+                chatID,
+                role,
+                runVar: options?.runVar,
+                rmVar: options?.rmVar,
+                tokenizeAccurate: options?.tokenizeAccurate,
+                cbsConditions,
+            });
+
+            if(!options?.processRegex){
+                return parsed;
+            }
+
+            return (await processScriptFull(char, parsed, 'editprocess', chatID, cbsConditions)).data;
+        },
         setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
             const db = DBState.db
             const charIds = Object.keys(db.characters);
@@ -1188,7 +1255,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     iframe.style.width = "100%";
                     iframe.style.height = "100%";
                     iframe.style.border = "none";
-                    iframe.style.zIndex = "1000";
+                    fullscreenPluginFrames.add(iframe);
+                    watchAlertLayer();
+                    applyFullscreenFrameLayer(iframe);
                     break;
                 }
                 default: {
@@ -1198,6 +1267,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         hideContainer: () => {
             iframe.style.display = "none";
+            fullscreenPluginFrames.delete(iframe);
         },
         getRootDocument: async () => {
             const conf = await getPluginPermission(context, 'mainDom');

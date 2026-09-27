@@ -1,5 +1,6 @@
 <script lang="ts">
-    import { ArrowLeft, PlusIcon, TrashIcon } from "@lucide/svelte";
+    import SettingFieldLabel from "src/lib/Setting/Wrappers/SettingFieldLabel.svelte";
+    import { ArrowLeft, PlusIcon, TrashIcon, TriangleAlertIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
     import PromptDataItem from "src/lib/UI/PromptDataItem.svelte";
@@ -7,14 +8,18 @@
     import { templateCheck } from "src/ts/process/templates/templateCheck";
     
     import { DBState } from 'src/ts/stores.svelte';
-    import Check from "src/lib/UI/GUI/CheckInput.svelte";
+    import ShSwitch from "src/lib/UI/GUI/ShSwitch.svelte";
+    import ShButton from "src/lib/UI/GUI/ShButton.svelte";
+    import ShAlert from "src/lib/UI/GUI/ShAlert.svelte";
+    import ShAccordion from "src/lib/UI/GUI/ShAccordion.svelte";
+    import SettingTabs from "src/lib/UI/GUI/SettingTabs.svelte";
+    import SettingRowLayout from "src/lib/Setting/Wrappers/SettingRowLayout.svelte";
+    import type { SettingItem } from "src/ts/setting/types";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
-    import Help from "src/lib/Others/Help.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
     import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
-    import Accordion from "src/lib/UI/Accordion.svelte";
     import ModelList from "src/lib/UI/ModelList.svelte";
     import { onDestroy, onMount } from "svelte";
     import {defaultAutoSuggestPrompt} from "../../../ts/storage/defaultPrompts";
@@ -125,29 +130,38 @@
   onDestroy(() => {
     document.removeEventListener('keydown', handleKeyDown)
   })
+
+    // Row-layout field descriptor for SettingRowLayout (label + inline help).
+    function field(id: string, label: string, helpKey?: string, helpUnrecommended = false): SettingItem {
+        return { id: `promptSettings.${id}`, type: 'custom', fallbackLabel: label, helpKey, helpUnrecommended }
+    }
 </script>
+
+{#snippet switchRow(id: string, label: string, get: () => boolean | undefined, set: (v: boolean) => void)}
+    <SettingRowLayout item={field(id, label)}>
+        {#snippet control()}<ShSwitch checked={!!get()} onCheckedChange={set} />{/snippet}
+    </SettingRowLayout>
+{/snippet}
+
 {#if mode === 'independent'}
-    <div class="flex w-full rounded-md border border-selected">
-        <button onclick={() => {
-            subMenu = 0
-        }} class="p-2 flex-1" class:bg-selected={subMenu === 0}>
-            <span>{language.template}</span>
-        </button>
-        <button onclick={() => {
-            subMenu = 1
-        }} class="p-2 flex-1" class:bg-selected={subMenu === 1}>
-            <span>{language.settings}</span>
-        </button>
-    </div>
+    <SettingTabs
+        tabs={[
+            { label: language.template, value: 0 },
+            { label: language.settings, value: 1 },
+        ]}
+        bind:selected={subMenu}
+    />
 {/if}
 {#if warns.length > 0 && subMenu === 0}
-    <div class="text-red-500 flex flex-col items-start p-2 rounded-md border-red-500 border mt-4">
-        <h2 class="text-xl font-bold">Warning</h2>
-        <div class="border-b border-b-red-500 mt-1 mb-2 w-full"></div>
-        {#each warns as warn}
-            <span class="ml-4">{warn}</span>
-        {/each}
-    </div>
+    <ShAlert variant="destructive" className="mt-4">
+        {#snippet icon()}<TriangleAlertIcon />{/snippet}
+        {#snippet title()}Warning{/snippet}
+        <ul class="list-disc pl-4">
+            {#each warns as warn}
+                <li>{warn}</li>
+            {/each}
+        </ul>
+    </ShAlert>
 {/if}
 
 {#if subMenu === 0}
@@ -235,7 +249,7 @@
         {/key}
     </div>
 
-    <button class="font-medium cursor-pointer hover:text-primary" onclick={() => {
+    <ShButton variant="outline" size="sm" className="self-start" aria-label="Add prompt item" onclick={() => {
         let value = DBState.db.promptTemplate ?? []
         value.push({
             type: "plain",
@@ -244,97 +258,121 @@
             type2: 'normal'
         })
         DBState.db.promptTemplate = value
-    }}><PlusIcon /></button>
+    }}><PlusIcon /></ShButton>
 
     <span class="text-textcolor2 text-sm mt-2">{tokens} {language.fixedTokens}</span>
     <span class="text-textcolor2 mb-6 text-sm mt-2">{extokens} {language.exactTokens}</span>
 {:else}
-    <span class="text-textcolor mt-4">{language.postEndInnerFormat} <Help key="postEndInnerFormat"/></span>
-    <TextInput className="mt-2" bind:value={DBState.db.promptSettings.postEndInnerFormat}/>
+<div class="flex flex-col [&>*:first-child]:border-t-0">
+    <SettingRowLayout item={field('postEndInnerFormat', language.postEndInnerFormat, 'postEndInnerFormat')} wideControl>
+        {#snippet control()}<TextInput className="sm:w-48 h-8" size="sm" padding fullwidth bind:value={DBState.db.promptSettings.postEndInnerFormat}/>{/snippet}
+    </SettingRowLayout>
 
-    <Check bind:check={DBState.db.promptSettings.sendChatAsSystem} name={language.sendChatAsSystem} className="mt-4"/>
-    <Check bind:check={DBState.db.promptSettings.sendName} name={language.formatGroupInSingle} className="mt-4"/>
-    <Check bind:check={DBState.db.promptSettings.trimStartNewChat} name={language.trimStartNewChat} className="mt-4"/>
-    <Check bind:check={DBState.db.promptSettings.utilOverride} name={language.utilOverride} className="mt-4"/>
-    <Check bind:check={DBState.db.jsonSchemaEnabled} name={language.enableJsonSchema} className="mt-4"/>
-    <Check bind:check={DBState.db.outputImageModal} name={language.outputImageModal} className="mt-4"/>
-
-    <Check bind:check={DBState.db.strictJsonSchema} name={language.strictJsonSchema} className="mt-4"/>
+    {@render switchRow('sendChatAsSystem', language.sendChatAsSystem, () => DBState.db.promptSettings.sendChatAsSystem, (v) => DBState.db.promptSettings.sendChatAsSystem = v)}
+    {@render switchRow('sendName', language.formatGroupInSingle, () => DBState.db.promptSettings.sendName, (v) => DBState.db.promptSettings.sendName = v)}
+    {@render switchRow('trimStartNewChat', language.trimStartNewChat, () => DBState.db.promptSettings.trimStartNewChat, (v) => DBState.db.promptSettings.trimStartNewChat = v)}
+    {@render switchRow('utilOverride', language.utilOverride, () => DBState.db.promptSettings.utilOverride, (v) => DBState.db.promptSettings.utilOverride = v)}
+    {@render switchRow('jsonSchemaEnabled', language.enableJsonSchema, () => DBState.db.jsonSchemaEnabled, (v) => DBState.db.jsonSchemaEnabled = v)}
+    {@render switchRow('outputImageModal', language.outputImageModal, () => DBState.db.outputImageModal, (v) => DBState.db.outputImageModal = v)}
+    {@render switchRow('strictJsonSchema', language.strictJsonSchema, () => DBState.db.strictJsonSchema, (v) => DBState.db.strictJsonSchema = v)}
 
     {#if DBState.db.showUnrecommended}
-        <Check bind:check={DBState.db.promptSettings.customChainOfThought} name={language.customChainOfThought} className="mt-4">
-            <Help unrecommended key='customChainOfThought' />
-        </Check>
+        <SettingRowLayout item={field('customChainOfThought', language.customChainOfThought, 'customChainOfThought', true)}>
+            {#snippet control()}<ShSwitch checked={!!DBState.db.promptSettings.customChainOfThought} onCheckedChange={(v) => DBState.db.promptSettings.customChainOfThought = v} />{/snippet}
+        </SettingRowLayout>
     {/if}
-    <div>
-        <span class="text-textcolor mt-4">{language.maxThoughtTagDepth} <Help key="maxThoughtTagDepth"/></span>
-        <NumberInput className="mt-2" bind:value={DBState.db.promptSettings.maxThoughtTagDepth}/>
+    <SettingRowLayout item={field('maxThoughtTagDepth', language.maxThoughtTagDepth, 'maxThoughtTagDepth')}>
+        {#snippet control()}<NumberInput className="w-24" size="sm" padding bind:value={DBState.db.promptSettings.maxThoughtTagDepth}/>{/snippet}
+    </SettingRowLayout>
+
+    <div class="py-3 border-t border-darkborderc">
+        <SettingFieldLabel label={language.customPromptTemplateToggle} helpKey="customPromptTemplateToggle" />
+        <TextAreaInput className="mt-2" bind:value={DBState.db.customPromptTemplateToggle}/>
     </div>
-    <span class="text-textcolor mt-4">{language.customPromptTemplateToggle} <Help key='customPromptTemplateToggle' /></span>
-    <TextAreaInput className="mt-2 mb-4" bind:value={DBState.db.customPromptTemplateToggle}/>
-    <span class="text-textcolor mt-4">{language.defaultVariables} <Help key='defaultVariables' /></span>
-    <TextAreaInput className="mt-2 mb-4" bind:value={DBState.db.templateDefaultVariables}/>
-    <span class="text-textcolor mt-4">{language.predictedOutput} <Help key="predictedOutput"/></span>
-    <TextAreaInput className="mt-2 mb-4" bind:value={DBState.db.OAIPrediction}/>
-    <span class="text-textcolor mt-4">{language.autoSuggest} <Help key='autoSuggest' /></span>
-    <TextAreaInput className="mt-2 mb-4" bind:value={DBState.db.autoSuggestPrompt} placeholder={defaultAutoSuggestPrompt}/>
-    <span class="text-textcolor mt-4">{language.groupInnerFormat} <Help key='groupInnerFormat' /></span>
-    <TextAreaInput className="mt-2 mb-4" placeholder={`<{{char}}\'s Message>\n{{slot}}\n</{{char}}\'s Message>`} bind:value={DBState.db.groupTemplate}/>
-    <span class="text-textcolor mt-4">{language.systemContentReplacement} <Help key="systemContentReplacement"/></span>
-    <TextAreaInput className="mt-2 mb-4" bind:value={DBState.db.systemContentReplacement}/>
-    <span class="text-textcolor mt-4">{language.systemRoleReplacement} <Help key="systemRoleReplacement"/></span>
-    <SelectInput className="mt-2 mb-4" bind:value={DBState.db.systemRoleReplacement}>
+    <div class="py-3 border-t border-darkborderc">
+        <SettingFieldLabel label={language.defaultVariables} helpKey="defaultVariables" />
+        <TextAreaInput className="mt-2" bind:value={DBState.db.templateDefaultVariables}/>
+    </div>
+    <div class="py-3 border-t border-darkborderc">
+        <SettingFieldLabel label={language.predictedOutput} helpKey="predictedOutput" />
+        <TextAreaInput className="mt-2" bind:value={DBState.db.OAIPrediction}/>
+    </div>
+    <div class="py-3 border-t border-darkborderc">
+        <SettingFieldLabel label={language.autoSuggest} helpKey="autoSuggest" />
+        <TextAreaInput className="mt-2" bind:value={DBState.db.autoSuggestPrompt} placeholder={defaultAutoSuggestPrompt}/>
+    </div>
+    <div class="py-3 border-t border-darkborderc">
+        <SettingFieldLabel label={language.groupInnerFormat} helpKey="groupInnerFormat" />
+        <TextAreaInput className="mt-2" placeholder={`<{{char}}\'s Message>\n{{slot}}\n</{{char}}\'s Message>`} bind:value={DBState.db.groupTemplate}/>
+    </div>
+    <div class="py-3 border-t border-darkborderc">
+        <SettingFieldLabel label={language.systemContentReplacement} helpKey="systemContentReplacement" />
+        <TextAreaInput className="mt-2" bind:value={DBState.db.systemContentReplacement}/>
+    </div>
+    <SettingRowLayout item={field('systemRoleReplacement', language.systemRoleReplacement, 'systemRoleReplacement')}>
+        {#snippet control()}
+    <SelectInput className="w-48" size="sm" bind:value={DBState.db.systemRoleReplacement}>
         <OptionInput value="user">User</OptionInput>
         <OptionInput value="assistant">assistant</OptionInput>
     </SelectInput>
+        {/snippet}
+    </SettingRowLayout>
     {#if DBState.db.jsonSchemaEnabled}
-        <span class="text-textcolor mt-4">{language.jsonSchema} <Help key='jsonSchema' /></span>
-        <TextAreaInput className="mt-2 mb-4" bind:value={DBState.db.jsonSchema}/>
-        <span class="text-textcolor mt-4">{language.extractJson} <Help key='extractJson' /></span>
-        <TextInput className="mt-2" bind:value={DBState.db.extractJson}/>
+        <div class="py-3 border-t border-darkborderc">
+            <SettingFieldLabel label={language.jsonSchema} helpKey="jsonSchema" />
+            <TextAreaInput className="mt-2" bind:value={DBState.db.jsonSchema}/>
+        </div>
+        <SettingRowLayout item={field('extractJson', language.extractJson, 'extractJson')} wideControl>
+            {#snippet control()}<TextInput className="sm:w-48 h-8" size="sm" padding fullwidth bind:value={DBState.db.extractJson}/>{/snippet}
+        </SettingRowLayout>
     {/if}
 
 
     {#snippet fallbackModelList(arg:'model'|'memory'|'translate'|'emotion'|'otherAx')}
         {#each DBState.db.fallbackModels[arg] as model, i}
-            <span class="text-textcolor mt-4">
+            <span class="text-sm text-textcolor mt-2">
                 {language.model} {i + 1}
             </span>
             <ModelList bind:value={DBState.db.fallbackModels[arg][i]} blankable />
         {/each}
-        <div class="flex gap-2">
-            <button class="bg-selected text-textcolor p-2 rounded-md" onclick={() => {
+        <div class="flex gap-2 mt-2">
+            <ShButton variant="outline" size="icon-sm" aria-label="Add fallback model" onclick={() => {
                 let value = DBState.db.fallbackModels[arg] ?? []
                 value.push('')
                 DBState.db.fallbackModels[arg] = value
-            }}><PlusIcon /></button>
-            <button class="bg-red-500 text-white p-2 rounded-md" onclick={() => {
+            }}><PlusIcon /></ShButton>
+            <ShButton variant="destructive" size="icon-sm" aria-label="Remove last fallback model" onclick={() => {
                 let value = DBState.db.fallbackModels[arg] ?? []
                 value.pop()
                 DBState.db.fallbackModels[arg] = value
-            }}><TrashIcon /></button>
+            }}><TrashIcon /></ShButton>
         </div>
     {/snippet}
 
-    <Accordion name={language.fallbackModel} styled>
-        <Check bind:check={DBState.db.fallbackWhenBlankResponse} name={language.fallbackWhenBlankResponse} className="mt-4"/>
-        <Check bind:check={DBState.db.doNotChangeFallbackModels} name={language.doNotChangeFallbackModels} className="mt-4"/>
-
-        <Accordion name={language.model} styled>
-            {@render fallbackModelList('model')}
-        </Accordion>
-        <Accordion name={"Memory"} styled>
-            {@render fallbackModelList('memory')}
-        </Accordion>
-        <Accordion name={"Translations"} styled>
-            {@render fallbackModelList('translate')}
-        </Accordion>
-        <Accordion name={"Emotion"} styled>
-            {@render fallbackModelList('emotion')}
-        </Accordion>
-        <Accordion name={"OtherAx"} styled>
-            {@render fallbackModelList('otherAx')}
-        </Accordion>
-    </Accordion>
-
+    <div class="pt-3 border-t border-darkborderc">
+    <ShAccordion name={language.fallbackModel} variant="card">
+        <div class="flex flex-col [&>*:first-child]:border-t-0">
+            {@render switchRow('fallbackWhenBlankResponse', language.fallbackWhenBlankResponse, () => DBState.db.fallbackWhenBlankResponse, (v) => DBState.db.fallbackWhenBlankResponse = v)}
+            {@render switchRow('doNotChangeFallbackModels', language.doNotChangeFallbackModels, () => DBState.db.doNotChangeFallbackModels, (v) => DBState.db.doNotChangeFallbackModels = v)}
+        </div>
+        <div class="flex flex-col gap-2 mt-2">
+            <ShAccordion name={language.model} variant="card">
+                <div class="flex flex-col">{@render fallbackModelList('model')}</div>
+            </ShAccordion>
+            <ShAccordion name={"Memory"} variant="card">
+                <div class="flex flex-col">{@render fallbackModelList('memory')}</div>
+            </ShAccordion>
+            <ShAccordion name={"Translations"} variant="card">
+                <div class="flex flex-col">{@render fallbackModelList('translate')}</div>
+            </ShAccordion>
+            <ShAccordion name={"Emotion"} variant="card">
+                <div class="flex flex-col">{@render fallbackModelList('emotion')}</div>
+            </ShAccordion>
+            <ShAccordion name={"OtherAx"} variant="card">
+                <div class="flex flex-col">{@render fallbackModelList('otherAx')}</div>
+            </ShAccordion>
+        </div>
+    </ShAccordion>
+    </div>
+</div>
 {/if}

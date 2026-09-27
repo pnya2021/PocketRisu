@@ -237,6 +237,26 @@ describe('/api/db/assets/auto-sweep', () => {
         expect(hasKey('remotes/orphan.local.bin.meta')).toBe(false)
     })
 
+    it('keeps a deactivated character\'s remote cache on a remote-only sweep', async () => {
+        await seedDb({
+            characters: [{ chaId: 'keep', image: 'assets/live.png', chats: [] }],
+            nodeOnlyArchivedCharacters: [{ chaId: 'resting', name: 'Resting', archivedAt: 1700000000000 }],
+        })
+        for (const chaId of ['keep', 'resting', 'gone']) {
+            await writeKey(`remotes/${chaId}.local.bin`, 'remote')
+            await writeKey(`remotes/${chaId}.local.bin.meta`, JSON.stringify({ lastUsed: Date.now() - 8 * DAY }))
+            setUpdatedAt(`remotes/${chaId}.local.bin`, Date.now() - 8 * DAY)
+        }
+
+        const res = await autoSweep(false)
+        expect(res.status).toBe(200)
+        const body = await res.json()
+        expect(body.remotesDeleted).toBe(2)
+        expect(hasKey('remotes/keep.local.bin')).toBe(true)
+        expect(hasKey('remotes/resting.local.bin')).toBe(true)
+        expect(hasKey('remotes/gone.local.bin')).toBe(false)
+    })
+
     it('refuses to purge when the reference scan returns no references', async () => {
         await seedDb({ characters: [] })
         await writeKey('assets/old.png', 'old')
@@ -294,6 +314,46 @@ describe('/api/db/assets/auto-sweep', () => {
         expect(hasKey('assets/avatar.png')).toBe(true)
         expect(hasKey('assets/manifest.png')).toBe(true)
         expect(hasKey('assets/orphan.png')).toBe(false)
+    })
+
+    // A module's asset list lives in a manifest whose live row outlives the
+    // module. Counting every live row kept a deleted module's pack referenced
+    // forever, so deleting it never produced a single orphan.
+    it('releases the assets of a deleted module', async () => {
+        await seedDb({
+            characters: [{ chaId: 'keep', image: 'assets/avatar.png', chats: [] }],
+            modules: [{ id: 'module-a', name: 'pack', assets: [['pic', 'assets/pack.png', 'png']] }],
+        })
+        await readKey('database/database.bin') // activates the module manifest
+        await seedDb({ characters: [{ chaId: 'keep', image: 'assets/avatar.png', chats: [] }], modules: [] })
+        await writeKey('assets/avatar.png', 'avatar')
+        await writeKey('assets/pack.png', 'pack')
+        for (const key of ['assets/avatar.png', 'assets/pack.png']) setUpdatedAt(key, Date.now() - 8 * DAY)
+
+        const res = await autoSweep(true)
+        expect(res.status).toBe(200)
+        expect(hasKey('assets/avatar.png')).toBe(true)
+        expect(hasKey('assets/pack.png')).toBe(false)
+    })
+
+    it('releases the assets a still-present module no longer lists', async () => {
+        await seedDb({
+            characters: [{ chaId: 'keep', image: 'assets/avatar.png', chats: [] }],
+            modules: [{ id: 'module-a', name: 'pack', assets: [['pic', 'assets/pack.png', 'png']] }],
+        })
+        await readKey('database/database.bin')
+        await seedDb({
+            characters: [{ chaId: 'keep', image: 'assets/avatar.png', chats: [] }],
+            modules: [{ id: 'module-a', name: 'pack', assets: [] }],
+        })
+        await writeKey('assets/avatar.png', 'avatar')
+        await writeKey('assets/pack.png', 'pack')
+        for (const key of ['assets/avatar.png', 'assets/pack.png']) setUpdatedAt(key, Date.now() - 8 * DAY)
+
+        const res = await autoSweep(true)
+        expect(res.status).toBe(200)
+        expect(hasKey('assets/avatar.png')).toBe(true)
+        expect(hasKey('assets/pack.png')).toBe(false)
     })
 
     it('fails closed without deleting assets when a live manifest is corrupt', async () => {

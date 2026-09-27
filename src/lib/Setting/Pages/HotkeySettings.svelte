@@ -2,77 +2,42 @@
     import { language } from "src/lang";
     import { DBState } from "src/ts/stores.svelte";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
+    import ShToggle from "src/lib/UI/GUI/ShToggle.svelte";
 
     
 </script>
 
 <SettingPage title={language.hotkey}>
 {#if window.innerWidth < 768}
-    <span class="text-red-500">
+    <p class="text-sm text-textcolor2">
         {language.screenTooSmall}
-    </span>
+    </p>
 
 {:else}
 
-    <table>
-        <thead>
-            <tr>
-                <th>{language.hotkey}</th>
-            </tr>
-        </thead>
-        <tbody>
-            {#each DBState.db.hotkeys as hotkey}
-                {#if language.hotkeyDesc[hotkey.action]}
-                    <tr>
-                        <td>{language.hotkeyDesc[hotkey.action]}</td>
-                        <td>
-
-                            <button
-                                class:text-textcolor={hotkey.ctrl}
-                                class:text-textcolor2={!hotkey.ctrl}
-                                onclick={() => {
-                                    hotkey.ctrl = !hotkey.ctrl;
-                                }}
-                            >
-                                Ctrl
-                            </button>
-                        </td>
-                        <td>
-                            <button
-                                class:text-textcolor={hotkey.shift}
-                                class:text-textcolor2={!hotkey.shift}
-                                onclick={() => {
-                                    hotkey.shift = !hotkey.shift;
-                                }}
-                            >
-                                Shift
-                            </button>
-                        </td>
-                        <td>
-                            <button
-                                class:text-textcolor={hotkey.alt}
-                                class:text-textcolor2={!hotkey.alt}
-                                onclick={() => {
-                                    hotkey.alt = !hotkey.alt;
-                                }}
-                            >
-                                Alt
-                            </button>
-                        </td>
-                        <td>
-                            <input
-                                value={hotkey.key === ' ' ? "SPACE" : hotkey.key?.toLocaleUpperCase()}
-                                class="bg-bgcolor border-none w-16"
-                                onkeydown={(e) => {
-                                    e.preventDefault();
-                                    hotkey.key = e.key;
-                                }}
-                            >
-                        </td>
-                    </tr>
-                {/if}
-            {/each}
-        </tbody>
-    </table>
+    <!-- Row per action: label left, modifier toggles + key capture right. -->
+    <div class="flex flex-col [&>*:first-child]:border-t-0">
+        {#each DBState.db.hotkeys as hotkey}
+            {#if language.hotkeyDesc[hotkey.action]}
+                <div class="flex items-center justify-between gap-3 py-2 border-t border-darkborderc">
+                    <span class="text-sm text-textcolor min-w-0">{language.hotkeyDesc[hotkey.action]}</span>
+                    <div class="flex items-center gap-1.5 shrink-0">
+                        <ShToggle size="sm" pressed={!!hotkey.ctrl} onPressedChange={() => { hotkey.ctrl = !hotkey.ctrl; }}>Ctrl</ShToggle>
+                        <ShToggle size="sm" pressed={!!hotkey.shift} onPressedChange={() => { hotkey.shift = !hotkey.shift; }}>Shift</ShToggle>
+                        <ShToggle size="sm" pressed={!!hotkey.alt} onPressedChange={() => { hotkey.alt = !hotkey.alt; }}>Alt</ShToggle>
+                        <input
+                            value={hotkey.key === ' ' ? "SPACE" : hotkey.key?.toLocaleUpperCase()}
+                            aria-label={`${language.hotkeyDesc[hotkey.action]} key`}
+                            class="h-8 w-20 rounded-md border border-darkborderc bg-transparent text-center text-sm text-textcolor outline-none focus-visible:border-borderc focus-visible:ring-2 focus-visible:ring-borderc/50"
+                            onkeydown={(e) => {
+                                e.preventDefault();
+                                hotkey.key = e.key;
+                            }}
+                        >
+                    </div>
+                </div>
+            {/if}
+        {/each}
+    </div>
 {/if}
 </SettingPage>

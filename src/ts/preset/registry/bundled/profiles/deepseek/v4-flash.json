@@ -1,7 +1,7 @@
 {
   "id": "deepseek:v4-flash",
-  "version": 1,
-  "updatedAt": 1780594300728,
+  "version": 2,
+  "updatedAt": 1790150564289,
   "displayName": "DeepSeek V4 Flash",
   "displayNameI18n": {
     "ko": "DeepSeek V4 Flash"
@@ -301,5 +301,5 @@
     ]
   },
   "recommendedTokenizer": "deepseek",
-  "profileStatus": "current"
+  "profileStatus": "outdated"
 }

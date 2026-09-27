@@ -12,6 +12,22 @@ const request = (instanceId: string, permission = 'contextAssets') => ({
 })
 
 describe('security confirmation queue', () => {
+    it('presents and resolves a permission without secure-context randomUUID', async () => {
+        const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+        vi.stubGlobal('crypto', { getRandomValues })
+        try {
+            const queue = new SecurityConfirmationQueue()
+            const result = queue.request(request('plain-http'))
+            await queue.whenPresented()
+            const view = queue.current()!
+            expect(view.presentationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+            expect(queue.decide(view.digest, view.presentationId, true)).toBe(true)
+            await expect(result).resolves.toBe(true)
+        } finally {
+            vi.unstubAllGlobals()
+        }
+    })
+
     it('serializes mixed trusted confirmations and binds decisions to exact digests', async () => {
         const queue = new SecurityConfirmationQueue()
         const first = queue.request(request('a'))

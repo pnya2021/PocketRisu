@@ -1,6 +1,6 @@
 <script lang="ts">
     import { language } from "src/lang";
-    import Button from "src/lib/UI/GUI/Button.svelte";
+    import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { alertMd, notifySuccess } from "src/ts/alert";
     import { downloadFile } from "src/ts/globalApi.svelte";
@@ -9,8 +9,16 @@
 
 </script>
 
-<Button
-    className="mt-4"
+<!-- Action rows (label + help left, button right) matching the row layout. -->
+<div class="flex items-center justify-between gap-3 py-3 border-t border-darkborderc">
+    <div class="flex flex-col min-w-0">
+        <span class="text-sm text-textcolor">{language.showStatistics}</span>
+        <p class="text-xs text-textcolor2 mt-0.5">{language.showStatisticsDesc}</p>
+    </div>
+<ShButton
+    variant="outline"
+    size="sm"
+    className="shrink-0"
     onclick={async () => {
         let mdTable = "| Type | Value |\n| --- | --- |\n"
         const s = DBState.db.statics
@@ -21,11 +29,19 @@
         alertMd(mdTable)
     }}
 >
-Show Statistics
-</Button>
+{language.settingActionView}
+</ShButton>
+</div>
 
-<Button
-    className="mt-4"
+<div class="flex items-center justify-between gap-3 py-3 border-t border-darkborderc">
+    <div class="flex flex-col min-w-0">
+        <span class="text-sm text-textcolor">{language.exportSettingsReport}</span>
+        <p class="text-xs text-textcolor2 mt-0.5">{language.exportSettingsReportDesc}</p>
+    </div>
+<ShButton
+    variant="outline"
+    size="sm"
+    className="shrink-0"
     onclick={async () => {
         const db = safeStructuredClone(getDatabase({
             snapshot: true
@@ -62,5 +78,6 @@ Show Statistics
 
     }}
 >
-Export Settings for Bug Report
-</Button>
+{language.settingActionExport}
+</ShButton>
+</div>

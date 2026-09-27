@@ -64,15 +64,19 @@
     }
 </script>
 
-<div class="mt-4">
+<!-- Action row (label + description left, button right) matching the row layout. -->
+<div class="flex items-center justify-between gap-3 py-3 border-t border-darkborderc">
+    <div class="flex flex-col min-w-0">
+        <span class="text-sm text-textcolor">{language.inlayCompressAll}</span>
+        <p class="text-xs text-textcolor2 mt-0.5">{progress || language.inlayCompressAllDesc}</p>
+    </div>
     <ShButton
-        className="w-full"
+        variant="outline"
+        size="sm"
+        className="shrink-0"
         onclick={compressAll}
         disabled={compressing}
     >
-        {compressing ? language.inlayCompressing : language.inlayCompressAll}
+        {compressing ? language.inlayCompressing : language.run}
     </ShButton>
-    {#if progress}
-        <p class="text-sm text-textcolor2 mt-2">{progress}</p>
-    {/if}
 </div>

@@ -143,7 +143,21 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
             console.warn('[ModelJob] job creation rejected (', created.status, '), falling back to direct request path')
             return opts.fallbackFetch(input, init)
         } else {
-            jobId = (await created.json()).jobId
+            try {
+                jobId = (await created.json()).jobId
+            } catch (err) {
+                // Aborted while the create response was read: the job runs,
+                // but its id never arrived. Find it by this generation's id.
+                if (signal?.aborted && opts.generationId) {
+                    void (async () => {
+                        const listed = await fetch('/api/model-jobs?active=1', { headers: await authHeader() })
+                        const { jobs } = await listed.json() as { jobs?: { id: string, chatId?: string, generationId?: string }[] }
+                        const own = jobs?.find((job) => job.generationId === opts.generationId && job.chatId === opts.realChatId)
+                        if (own) await fetch(`/api/model-jobs/${own.id}`, { method: 'DELETE', headers: await authHeader() })
+                    })().catch(() => {})
+                }
+                throw err
+            }
         }
 
         // Abort propagation: aborting the request DELETEs the job (server
@@ -155,6 +169,9 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
             })().catch(() => {})
         }
         signal?.addEventListener('abort', abortJob, { once: true })
+        // An abort that landed while the create response was being read has
+        // already fired; the listener above would never run for it.
+        if (signal?.aborted) abortJob()
         const detach = () => signal?.removeEventListener('abort', abortJob)
 
         // 2. Attach to the journal stream (replay from byte 0 + live tail).

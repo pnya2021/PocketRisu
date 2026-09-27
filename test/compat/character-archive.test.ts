@@ -68,7 +68,7 @@ let srv: ServerHandle
 let client: RisuClient
 
 beforeAll(async () => {
-  srv = await spawnServer({ env: { POCKETRISU_CHUNK_THRESHOLD: '4096' } })
+  srv = await spawnServer({ env: { POCKETRISU_CHUNK_THRESHOLD: '4096', POCKETRISU_ARCHIVE_ORPHAN_GRACE_MS: '0' } })
   client = await createClient(srv.port, srv.password)
   const imported = await client.importBackup(buildBackup())
   expect(imported.ok).toBe(true)

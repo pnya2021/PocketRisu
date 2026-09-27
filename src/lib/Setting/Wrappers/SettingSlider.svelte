@@ -89,9 +89,9 @@
 </script>
 
 {#if ctx.layout === 'row'}
-    <SettingRowLayout {item}>
+    <SettingRowLayout {item} wideControl>
         {#snippet control()}
-            <div class="w-48">
+            <div class="w-full sm:w-48">
                 <ShSlider
                     min={item.options?.min ?? 0}
                     max={item.options?.max ?? 100}

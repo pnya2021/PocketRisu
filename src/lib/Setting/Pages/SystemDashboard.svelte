@@ -18,6 +18,8 @@
         ShieldCheckIcon,
         SaveIcon,
         ImageOffIcon,
+        GaugeIcon,
+        CopyIcon,
     } from '@lucide/svelte'
     import { alertConfirm, alertMd, notifyError, notifySuccess } from 'src/ts/alert'
     import { forageStorage } from 'src/ts/globalApi.svelte'
@@ -27,6 +29,7 @@
     import { promptActivateCharacter } from 'src/ts/characterArchive'
     import { SystemTab } from 'src/ts/routing'
     import { dbTransferSizeStore, TRANSFER_SIZE_RECOMMENDED_BYTES } from 'src/ts/transferSize'
+    import { saveSamples, summarizeSaveSamples } from 'src/ts/storage/saveMetrics'
     import { language, getCurrentLocale } from 'src/lang'
 
     // ── Types ────────────────────────────────────────────────────────────────
@@ -109,6 +112,37 @@
         if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
         return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
     }
+    function fmtMs(ms: number | null | undefined): string {
+        if (ms == null) return '—'
+        return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`
+    }
+
+    const saveSummary = $derived(summarizeSaveSamples($saveSamples))
+
+    async function copySaveDiagnostics() {
+        const text = JSON.stringify({ summary: saveSummary, samples: $saveSamples }, null, 2)
+        try {
+            if (isSecureContext && navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text)
+            } else {
+                // Remote http access has no Clipboard API (same fallback as TextAreaInput).
+                const ta = document.createElement('textarea')
+                ta.value = text
+                ta.style.position = 'fixed'
+                ta.style.opacity = '0'
+                document.body.appendChild(ta)
+                ta.focus()
+                ta.select()
+                const copied = document.execCommand('copy')
+                document.body.removeChild(ta)
+                if (!copied) throw new Error('copy failed')
+            }
+            notifySuccess(language.clipboardSuccess)
+        } catch (err) {
+            notifyError(String(err), { source: 'storage-dashboard' })
+        }
+    }
+
     function fmtDate(ms: number | null | undefined): string {
         if (!ms) return '—'
         const d = new Date(ms)
@@ -628,6 +662,44 @@
             </label>
             <span class="text-textcolor2 text-xs hidden sm:inline">{language.storageInternalOnlyHint}</span>
         </div>
+    </div>
+
+    <!-- Save performance (this tab) ─────────────────────────────────────── -->
+    <div class="border border-darkborderc bg-darkbg/40 rounded-md p-4 mb-4">
+        <div class="flex items-baseline justify-between gap-2 mb-3 flex-wrap">
+            <div class="flex items-center gap-2 text-textcolor">
+                <GaugeIcon size={16} />
+                <span class="font-medium">{language.storageSaveMetrics}</span>
+            </div>
+            <span class="text-textcolor2 text-sm tabular-nums">
+                {language.storageSaveMetricsHeader(saveSummary.count)}
+            </span>
+        </div>
+        <p class="text-textcolor2 text-xs leading-relaxed mb-3">{language.storageSaveMetricsDesc}</p>
+        {#if saveSummary.count === 0}
+            <p class="text-textcolor2 text-sm">{language.storageSaveMetricsEmpty}</p>
+        {:else}
+            <div class="flex flex-col">
+                {#each [
+                    [language.storageSaveMetricsCounts, language.storageSaveMetricsCountsValue(saveSummary.patch, saveSummary.full, saveSummary.retry, saveSummary.error)],
+                    [language.storageSaveMetricsTime, `${fmtMs(saveSummary.medianMs)} / ${fmtMs(saveSummary.p90Ms)}`],
+                    [language.storageSaveMetricsServer, fmtMs(saveSummary.serverMedianMs)],
+                    [language.storageSaveMetricsQueue, fmtMs(saveSummary.queueMedianMs)],
+                    [language.storageSaveMetricsPersist, fmtMs(saveSummary.lastPersistMs)],
+                ] as [label, value] (label)}
+                    <div class="flex items-center gap-2 py-1.5 border-b border-darkborderc/30 last:border-b-0">
+                        <span class="text-textcolor text-sm flex-1 min-w-0 truncate">{label}</span>
+                        <span class="text-textcolor2 text-sm tabular-nums shrink-0 text-right">{value}</span>
+                    </div>
+                {/each}
+            </div>
+            <div class="flex justify-end mt-3">
+                <ShButton variant="outline" size="default" onclick={copySaveDiagnostics}>
+                    <CopyIcon size={16} />
+                    <span>{language.storageSaveMetricsCopy}</span>
+                </ShButton>
+            </div>
+        {/if}
     </div>
 
     <!-- ② Manual WAL cleanup ────────────────────────────────────────────── -->

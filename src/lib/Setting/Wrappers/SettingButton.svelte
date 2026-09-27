@@ -2,7 +2,10 @@
     import type { SettingItem, SettingContext } from 'src/ts/setting/types';
     import { getLabel, getSettingValue } from 'src/ts/setting/utils';
     import Button from 'src/lib/UI/GUI/Button.svelte';
+    import ShButton from 'src/lib/UI/GUI/ShButton.svelte';
     import Help from 'src/lib/Others/Help.svelte';
+    import SettingRowLayout from './SettingRowLayout.svelte';
+    import { language } from 'src/lang';
 
     interface Props {
         item: SettingItem;
@@ -22,9 +25,24 @@
             ? String(getSettingValue(item, ctx) ?? '')
             : getLabel(item),
     );
+    // Row layout: the item label sits on the left like any other row; the
+    // button shows `buttonLabelKey` text (or the resolved value / label).
+    let rowButtonText = $derived(
+        item.options?.buttonLabelKey
+            ? ((language as any)[item.options.buttonLabelKey] ?? buttonText)
+            : buttonText,
+    );
 </script>
 
-{#if withSectionLabel}
+{#if ctx.layout === 'row'}
+    <SettingRowLayout {item}>
+        {#snippet control()}
+            <ShButton variant={item.options?.buttonVariant ?? 'outline'} size="sm" onclick={item.options?.onClick}>
+                {rowButtonText}
+            </ShButton>
+        {/snippet}
+    </SettingRowLayout>
+{:else if withSectionLabel}
     <span class="text-textcolor {item.classes ?? 'mt-4'}">
         {getLabel(item)}
         {#if item.helpKey}<Help key={item.helpKey as any}/>{/if}

@@ -4,11 +4,11 @@
     // delete actions but no modal chrome — embedded directly in pages.
     //
     // Restore flow forces a full page reload because the in-memory db cache
-    // is replaced; download streams via streamsaver to avoid loading the
-    // backup into memory.
+    // is replaced; download is handed to the browser's download manager so
+    // the backup never passes through this tab's memory.
     import { language } from "src/lang";
-    import { alertConfirm, alertError, alertWait, alertStore, waitAlert, notifySuccess, notifyError } from "src/ts/alert";
-    import { forageStorage, downloadFile, restorePersistedDatabaseWithPluginRuntime } from "src/ts/globalApi.svelte";
+    import { alertConfirm, alertError, alertWait, alertStore, waitAlert, notifySuccess, notifyError, notifyInfo } from "src/ts/alert";
+    import { forageStorage, restorePersistedDatabaseWithPluginRuntime } from "src/ts/globalApi.svelte";
     import { RotateCcwIcon, DownloadIcon, TrashIcon } from "@lucide/svelte";
 
     interface Props {
@@ -70,30 +70,9 @@
     }
 
     async function downloadBackup(backup: BackupEntry) {
-        alertWait(language.serverBackupDownloading);
         try {
-            const response = await forageStorage.downloadServerBackup(backup.filename);
-            if (response.body) {
-                const streamSaver = await import('streamsaver');
-                const writableStream = streamSaver.createWriteStream(backup.filename);
-                const writer = writableStream.getWriter();
-                const reader = response.body.getReader();
-                const totalBytes = Number(response.headers.get('content-length') ?? '0');
-                let downloaded = 0;
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    downloaded += value.length;
-                    if (totalBytes > 0) {
-                        alertWait(`${language.serverBackupDownloading} (${((downloaded / totalBytes) * 100).toFixed(1)}%)`);
-                    }
-                    await writer.write(value);
-                }
-                await writer.close();
-            } else {
-                await downloadFile(backup.filename, new Uint8Array(await response.arrayBuffer()));
-            }
-            notifySuccess('Success');
+            await forageStorage.downloadServerBackup(backup.filename);
+            notifyInfo(language.backupBrowserDownloadStarted);
         } catch (error) {
             notifyError(error instanceof Error ? error.message : 'Download failed');
         }

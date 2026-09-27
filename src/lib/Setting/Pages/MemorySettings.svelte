@@ -1,19 +1,21 @@
 <script lang="ts">
+    import SettingFieldLabel from "src/lib/Setting/Wrappers/SettingFieldLabel.svelte";
     import { language } from "src/lang";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
     import SettingTabs from "src/lib/UI/GUI/SettingTabs.svelte";
     import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import ShBadge from "src/lib/UI/GUI/ShBadge.svelte";
     import ShDropdownMenuItem from "src/lib/UI/GUI/ShDropdownMenuItem.svelte";
-    import Check from "src/lib/UI/GUI/CheckInput.svelte";
-    import Help from "src/lib/Others/Help.svelte";
+    import ShSwitch from "src/lib/UI/GUI/ShSwitch.svelte";
+    import ShSlider from "src/lib/UI/GUI/ShSlider.svelte";
+    import ShAccordion from "src/lib/UI/GUI/ShAccordion.svelte";
+    import SettingRowLayout from "src/lib/Setting/Wrappers/SettingRowLayout.svelte";
+    import type { SettingItem } from "src/ts/setting/types";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
     import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
-    import SliderInput from "src/lib/UI/GUI/SliderInput.svelte";
-    import Accordion from "src/lib/UI/Accordion.svelte";
     import FolderedList, { type FolderedItemPlacement } from "src/lib/UI/FolderedList.svelte";
     import { ArrowLeftIcon, HardDriveUploadIcon, PlusIcon, StarIcon } from "@lucide/svelte";
     import { alertConfirm, alertError, notifyError, notifySuccess } from "src/ts/alert";
@@ -172,7 +174,21 @@
     onDestroy(() => {
         syncMemoryMirror(DBState.db)
     })
+
+    // Row-layout field descriptor for SettingRowLayout (label + inline help).
+    function field(id: string, label: string, helpKey?: string): SettingItem {
+        return { id: `memory.${id}`, type: 'custom', fallbackLabel: label, helpKey }
+    }
 </script>
+
+
+<!-- Ratios display at 2 decimals like the legacy SliderInput (fixed=2); the
+     ratio guards above can leave float noise such as 0.09999999999999998. -->
+{#snippet ratioSlider(value: number, max: number, onchange: (v: number) => void)}
+    <div class="w-full sm:w-48">
+        <ShSlider min={0} {max} step={0.01} inputWidth="w-16" bind:value={() => Math.round(value * 100) / 100, onchange} />
+    </div>
+{/snippet}
 
 {#if !editingPreset}
 <SettingPage title={language.longTermMemory}>
@@ -185,8 +201,10 @@
     />
 
 {#if tab === 1}
-    <span class="text-textcolor">{language.embedding} <Help key="embedding"/></span>
-    <SelectInput className="mt-2 mb-4" bind:value={DBState.db.hypaModel}>
+    <div class="[&>*:first-child]:border-t-0">
+    <SettingRowLayout item={field('embedding', language.embedding, 'embedding')}>
+        {#snippet control()}
+    <SelectInput className="w-48 sm:w-56" size="sm" bind:value={DBState.db.hypaModel}>
         {#if 'gpu' in navigator}
             <OptionInput value="MiniLMGPU">MiniLM L6 v2 (GPU)</OptionInput>
             <OptionInput value="nomicGPU">Nomic Embed Text v1.5 (GPU)</OptionInput>
@@ -208,34 +226,46 @@
         <OptionInput value="voyageContext3">Voyage Context 3</OptionInput>
         <OptionInput value="voyageContext4">Voyage Context 4</OptionInput>
     </SelectInput>
+        {/snippet}
+    </SettingRowLayout>
 
     {#if DBState.db.hypaModel === 'openai3small' || DBState.db.hypaModel === 'openai3large' || DBState.db.hypaModel === 'ada'}
-        <span class="text-textcolor">OpenAI API Key <Help key="embeddingOpenAIKey"/></span>
-        <TextInput className="mt-2" marginBottom bind:value={DBState.db.supaMemoryKey}/>
+        <SettingRowLayout item={field('openaiKey', 'OpenAI API Key', 'embeddingOpenAIKey')} wideControl>
+            {#snippet control()}<TextInput className="sm:w-48 h-8" size="sm" padding fullwidth bind:value={DBState.db.supaMemoryKey}/>{/snippet}
+        </SettingRowLayout>
     {/if}
 
     {#if DBState.db.hypaModel === 'custom'}
-        <span class="text-textcolor">URL <Help key="embeddingCustomURL"/></span>
-        <TextInput className="mt-2" marginBottom bind:value={DBState.db.hypaCustomSettings.url}/>
-        <span class="text-textcolor">Key/Password <Help key="embeddingCustomKey"/></span>
-        <TextInput className="mt-2" marginBottom bind:value={DBState.db.hypaCustomSettings.key}/>
-        <span class="text-textcolor">Request Model <Help key="embeddingCustomModel"/></span>
-        <TextInput className="mt-2" marginBottom bind:value={DBState.db.hypaCustomSettings.model}/>
+        <SettingRowLayout item={field('customUrl', 'URL', 'embeddingCustomURL')} wideControl>
+            {#snippet control()}<TextInput className="sm:w-48 h-8" size="sm" padding fullwidth bind:value={DBState.db.hypaCustomSettings.url}/>{/snippet}
+        </SettingRowLayout>
+        <SettingRowLayout item={field('customKey', 'Key/Password', 'embeddingCustomKey')} wideControl>
+            {#snippet control()}<TextInput className="sm:w-48 h-8" size="sm" padding fullwidth bind:value={DBState.db.hypaCustomSettings.key}/>{/snippet}
+        </SettingRowLayout>
+        <SettingRowLayout item={field('customModel', 'Request Model', 'embeddingCustomModel')} wideControl>
+            {#snippet control()}<TextInput className="sm:w-48 h-8" size="sm" padding fullwidth bind:value={DBState.db.hypaCustomSettings.model}/>{/snippet}
+        </SettingRowLayout>
     {/if}
 
     {#if DBState.db.hypaModel === 'voyageContext3' || DBState.db.hypaModel === 'voyageContext4'}
-        <span class="text-textcolor">Voyage API Key <Help key="embeddingVoyageKey"/></span>
-        <TextInput className="mt-2" marginBottom hideText={DBState.db.hideApiKey} bind:value={DBState.db.voyageApiKey}/>
+        <SettingRowLayout item={field('voyageKey', 'Voyage API Key', 'embeddingVoyageKey')} wideControl>
+            {#snippet control()}<TextInput className="sm:w-48 h-8" size="sm" padding fullwidth hideText={DBState.db.hideApiKey} bind:value={DBState.db.voyageApiKey}/>{/snippet}
+        </SettingRowLayout>
     {/if}
+    </div>
 {:else}
-    <span class="text-textcolor">{language.memoryPresetDefault} <Help key="memoryPresetDefault"/></span>
-    <SelectInput className="mt-2 mb-6" bind:value={DBState.db.memoryPresetId} onchange={() => save()}>
+    <div class="mb-4 [&>*:first-child]:border-t-0">
+    <SettingRowLayout item={field('default', language.memoryPresetDefault, 'memoryPresetDefault')}>
+        {#snippet control()}
+    <SelectInput className="w-48" size="sm" bind:value={DBState.db.memoryPresetId} onchange={() => save()}>
         <OptionInput value={MEMORY_PRESET_OFF}>{language.memoryPresetOff}</OptionInput>
         {#each presets as preset (preset.id)}
             <OptionInput value={preset.id}>{preset.name}</OptionInput>
         {/each}
     </SelectInput>
-
+        {/snippet}
+    </SettingRowLayout>
+    </div>
     <FolderedList
         {folders}
         itemFolderIds={presets.map(p => p.folderId)}
@@ -275,18 +305,21 @@
 {/if}
 </SettingPage>
 {:else}
-<div class="flex items-center gap-2 mt-2 mb-4">
+<div class="flex items-center gap-2 mt-2 mb-2">
     <ShButton size="sm" variant="ghost" onclick={() => { save(); editingId = null }}><ArrowLeftIcon />{language.backToList}</ShButton>
 </div>
-<div class="flex flex-col">
-    <span class="text-textcolor">{language.memoryPresetName}</span>
-    <TextInput className="mt-2" marginBottom bind:value={editingPreset.name} />
+<div class="flex flex-col [&>*:first-child]:border-t-0">
+    <SettingRowLayout item={field('name', language.memoryPresetName)} wideControl>
+        {#snippet control()}<TextInput className="sm:w-48 h-8" size="sm" padding fullwidth bind:value={editingPreset.name} />{/snippet}
+    </SettingRowLayout>
 
-    <div class="flex items-center gap-2 mb-6 flex-wrap">
-        <span class="text-textcolor">{language.memoryPresetMethod}</span>
-        {#if editingPreset.canon?.source === 'hypaV3'}
-            <ShBadge variant="secondary">Hypa V3</ShBadge>
-        {/if}
+    <div class="flex items-center justify-between gap-3 py-3 border-t border-darkborderc flex-wrap">
+        <div class="flex items-center gap-2 min-w-0">
+            <span class="text-sm text-textcolor">{language.memoryPresetMethod}</span>
+            {#if editingPreset.canon?.source === 'hypaV3'}
+                <ShBadge variant="secondary">Hypa V3</ShBadge>
+            {/if}
+        </div>
         {#if editingPreset.id === DBState.db.memoryPresetId}
             <ShBadge><StarIcon size={12} />{language.memoryPresetDefault}</ShBadge>
         {:else}
@@ -297,8 +330,9 @@
     {#if editingPreset.canon?.source === 'hypaV3'}
         {@const settings = editingPreset.canon.settings}
 
-            <span class="text-textcolor">{language.model} <Help key="hypaV3SummaryModel"/></span>
-            <SelectInput className="mt-2 mb-4" bind:value={settings.summarizationModel}>
+            <SettingRowLayout item={field('model', language.model, 'hypaV3SummaryModel')}>
+                {#snippet control()}
+            <SelectInput className="w-48" size="sm" bind:value={settings.summarizationModel}>
                 <OptionInput value="subModel">{language.submodel}</OptionInput>
                 {#if "gpu" in navigator}
                     <OptionInput value="Qwen3-1.7B-q4f32_1-MLC">Qwen3 1.7B (GPU)</OptionInput>
@@ -306,81 +340,86 @@
                     <OptionInput value="Qwen3-8B-q4f32_1-MLC">Qwen3 8B (GPU)</OptionInput>
                 {/if}
             </SelectInput>
-            <span class="text-textcolor">{language.summarizationPrompt} <Help key="summarizationPrompt"/></span>
-            <div class="mb-4">
-                <TextAreaInput className="mt-2 mb-4" placeholder={language.hypaV3Settings.supaMemoryPromptPlaceHolder} bind:value={settings.summarizationPrompt} />
+                {/snippet}
+            </SettingRowLayout>
+            <div class="py-3 border-t border-darkborderc">
+                <SettingFieldLabel label={language.summarizationPrompt} helpKey="summarizationPrompt" />
+                <TextAreaInput className="mt-2" placeholder={language.hypaV3Settings.supaMemoryPromptPlaceHolder} bind:value={settings.summarizationPrompt} />
             </div>
-            <span class="text-textcolor">{language.reSummarizationPrompt} <Help key="reSummarizationPrompt"/></span>
-            <div class="mb-4">
-                <TextAreaInput className="mt-2 mb-4" placeholder={language.hypaV3Settings.supaMemoryPromptPlaceHolder} bind:value={settings.reSummarizationPrompt} />
+            <div class="py-3 border-t border-darkborderc">
+                <SettingFieldLabel label={language.reSummarizationPrompt} helpKey="reSummarizationPrompt" />
+                <TextAreaInput className="mt-2" placeholder={language.hypaV3Settings.supaMemoryPromptPlaceHolder} bind:value={settings.reSummarizationPrompt} />
             </div>
             {#await getMaxMemoryRatio() then maxMemoryRatio}
-            <span class="text-textcolor">{language.hypaV3Settings.maxMemoryTokensRatioLabel}</span>
-            <NumberInput className="mt-2" marginBottom disabled value={maxMemoryRatio} />
+            <SettingRowLayout item={field('maxRatio', language.hypaV3Settings.maxMemoryTokensRatioLabel)}>
+                {#snippet control()}<NumberInput className="w-24" size="sm" padding disabled value={maxMemoryRatio} />{/snippet}
+            </SettingRowLayout>
             {:catch error}
-            <span class="mb-4 text-red-400">{language.hypaV3Settings.maxMemoryTokensRatioError}</span>
+            <div class="py-3 border-t border-darkborderc text-sm text-red-400">{language.hypaV3Settings.maxMemoryTokensRatioError}</div>
             {/await}
-            <span class="text-textcolor">{language.hypaV3Settings.memoryTokensRatioLabel} <Help key="hypaV3MemoryTokensRatio"/></span>
-            <SliderInput className="mt-2" marginBottom min={0} max={1} step={0.01} fixed={2} bind:value={settings.memoryTokensRatio} />
-            <span class="text-textcolor">{language.hypaV3Settings.extraSummarizationRatioLabel} <Help key="hypaV3ExtraSummarizationRatio"/></span>
-            <SliderInput className="mt-2" marginBottom min={0} max={1 - settings.memoryTokensRatio} step={0.01} fixed={2} bind:value={settings.extraSummarizationRatio} />
-            <span class="text-textcolor">{language.hypaV3Settings.maxChatsPerSummaryLabel} <Help key="hypaV3MaxChatsPerSummary"/></span>
-            <NumberInput className="mt-2" marginBottom min={1} bind:value={settings.maxChatsPerSummary} />
-            <span class="text-textcolor">{language.hypaV3Settings.queryChatCountLabel} <Help key="hypaV3QueryChatCount"/></span>
-            <NumberInput className="mt-2" marginBottom min={1} max={20} bind:value={settings.queryChatCount} />
-            <span class="text-textcolor">{language.hypaV3Settings.summaryChunkSeparatorLabel} <Help key="hypaV3SummaryChunkSeparator"/></span>
-            <TextInput className="mt-2" marginBottom bind:value={settings.summaryChunkSeparator} />
-            <span class="text-textcolor">{language.hypaV3Settings.recentMemoryRatioLabel} <Help key="hypaV3RecentMemoryRatio"/></span>
-            <SliderInput className="mt-2" marginBottom min={0} max={1} step={0.01} fixed={2} bind:value={settings.recentMemoryRatio} />
-            <span class="text-textcolor">{language.hypaV3Settings.similarMemoryRatioLabel} <Help key="hypaV3SimilarMemoryRatio"/></span>
-            <SliderInput className="mt-2" marginBottom min={0} max={1} step={0.01} fixed={2} bind:value={settings.similarMemoryRatio} />
-            <span class="text-textcolor">{language.hypaV3Settings.randomMemoryRatioLabel} <Help key="hypaV3RandomMemoryRatio"/></span>
-            <NumberInput className="mt-2" marginBottom disabled value={parseFloat((1 - settings.recentMemoryRatio - settings.similarMemoryRatio).toFixed(2))} />
-            <div class="mb-2 flex items-center">
-                <Check name={language.hypaV3Settings.preserveOrphanedMemoryLabel} bind:check={settings.preserveOrphanedMemory} />
-                <Help key="hypaV3PreserveOrphanedMemory"/>
-            </div>
-            <div class="mb-2 flex items-center">
-                <Check name={language.hypaV3Settings.applyRegexScriptWhenRerollingLabel} bind:check={settings.processRegexScript} />
-                <Help key="hypaV3ProcessRegexScript"/>
-            </div>
-            <div class="mb-2 flex items-center">
-                <Check name={language.hypaV3Settings.doNotSummarizeUserMessageLabel} bind:check={settings.doNotSummarizeUserMessage} />
-                <Help key="hypaV3DoNotSummarizeUserMessage"/>
-            </div>
-            <Accordion name="Advanced Settings" styled>
-                <div class="mb-2 flex items-center">
-                    <Check name="Use Experimental Implementation" bind:check={settings.useExperimentalImpl} />
-                    <Help key="hypaV3UseExperimentalImpl"/>
-                </div>
-                <div class="mb-2 flex items-center">
-                    <Check name="Always Toggle On" bind:check={settings.alwaysToggleOn} />
-                    <Help key="hypaV3AlwaysToggleOn"/>
-                </div>
+            <SettingRowLayout item={field('memoryRatio', language.hypaV3Settings.memoryTokensRatioLabel, 'hypaV3MemoryTokensRatio')} wideControl>
+                {#snippet control()}{@render ratioSlider(settings.memoryTokensRatio, 1, (v) => settings.memoryTokensRatio = v)}{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('extraRatio', language.hypaV3Settings.extraSummarizationRatioLabel, 'hypaV3ExtraSummarizationRatio')} wideControl>
+                {#snippet control()}{@render ratioSlider(settings.extraSummarizationRatio, 1 - settings.memoryTokensRatio, (v) => settings.extraSummarizationRatio = v)}{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('maxChats', language.hypaV3Settings.maxChatsPerSummaryLabel, 'hypaV3MaxChatsPerSummary')}>
+                {#snippet control()}<NumberInput className="w-24" size="sm" padding min={1} bind:value={settings.maxChatsPerSummary} />{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('queryCount', language.hypaV3Settings.queryChatCountLabel, 'hypaV3QueryChatCount')}>
+                {#snippet control()}<NumberInput className="w-24" size="sm" padding min={1} max={20} bind:value={settings.queryChatCount} />{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('separator', language.hypaV3Settings.summaryChunkSeparatorLabel, 'hypaV3SummaryChunkSeparator')} wideControl>
+                {#snippet control()}<TextInput className="sm:w-48 h-8" size="sm" padding fullwidth bind:value={settings.summaryChunkSeparator} />{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('recentRatio', language.hypaV3Settings.recentMemoryRatioLabel, 'hypaV3RecentMemoryRatio')} wideControl>
+                {#snippet control()}{@render ratioSlider(settings.recentMemoryRatio, 1, (v) => settings.recentMemoryRatio = v)}{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('similarRatio', language.hypaV3Settings.similarMemoryRatioLabel, 'hypaV3SimilarMemoryRatio')} wideControl>
+                {#snippet control()}{@render ratioSlider(settings.similarMemoryRatio, 1, (v) => settings.similarMemoryRatio = v)}{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('randomRatio', language.hypaV3Settings.randomMemoryRatioLabel, 'hypaV3RandomMemoryRatio')}>
+                {#snippet control()}<NumberInput className="w-24" size="sm" padding disabled value={parseFloat((1 - settings.recentMemoryRatio - settings.similarMemoryRatio).toFixed(2))} />{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('preserveOrphaned', language.hypaV3Settings.preserveOrphanedMemoryLabel, 'hypaV3PreserveOrphanedMemory')}>
+                {#snippet control()}<ShSwitch checked={!!settings.preserveOrphanedMemory} onCheckedChange={(v) => settings.preserveOrphanedMemory = v} />{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('processRegex', language.hypaV3Settings.applyRegexScriptWhenRerollingLabel, 'hypaV3ProcessRegexScript')}>
+                {#snippet control()}<ShSwitch checked={!!settings.processRegexScript} onCheckedChange={(v) => settings.processRegexScript = v} />{/snippet}
+            </SettingRowLayout>
+            <SettingRowLayout item={field('noUserSummary', language.hypaV3Settings.doNotSummarizeUserMessageLabel, 'hypaV3DoNotSummarizeUserMessage')}>
+                {#snippet control()}<ShSwitch checked={!!settings.doNotSummarizeUserMessage} onCheckedChange={(v) => settings.doNotSummarizeUserMessage = v} />{/snippet}
+            </SettingRowLayout>
+            <div class="pt-3 border-t border-darkborderc">
+            <ShAccordion name="Advanced Settings" variant="card">
+                <div class="flex flex-col [&>*:first-child]:border-t-0">
+                <SettingRowLayout item={field('experimental', 'Use Experimental Implementation', 'hypaV3UseExperimentalImpl')}>
+                    {#snippet control()}<ShSwitch checked={!!settings.useExperimentalImpl} onCheckedChange={(v) => settings.useExperimentalImpl = v} />{/snippet}
+                </SettingRowLayout>
+                <SettingRowLayout item={field('alwaysOn', 'Always Toggle On', 'hypaV3AlwaysToggleOn')}>
+                    {#snippet control()}<ShSwitch checked={!!settings.alwaysToggleOn} onCheckedChange={(v) => settings.alwaysToggleOn = v} />{/snippet}
+                </SettingRowLayout>
                 {#if settings.useExperimentalImpl}
-                    <div>
-                        <span class="text-textcolor">Summarization Requests Per Minute <Help key="hypaV3SummarizationRequestsPerMinute"/></span>
-                        <NumberInput className="mt-2" marginBottom min={1} bind:value={settings.summarizationRequestsPerMinute} />
-                    </div>
-                    <div>
-                        <span class="text-textcolor">Summarization Max Concurrent <Help key="hypaV3SummarizationMaxConcurrent"/></span>
-                        <NumberInput className="mt-2" marginBottom min={1} max={10} bind:value={settings.summarizationMaxConcurrent} />
-                    </div>
-                    <div>
-                        <span class="text-textcolor">Embedding Requests Per Minute <Help key="hypaV3EmbeddingRequestsPerMinute"/></span>
-                        <NumberInput className="mt-2" marginBottom min={1} bind:value={settings.embeddingRequestsPerMinute} />
-                    </div>
-                    <div>
-                        <span class="text-textcolor">Embedding Max Concurrent <Help key="hypaV3EmbeddingMaxConcurrent"/></span>
-                        <NumberInput className="mt-2" marginBottom min={1} max={10} bind:value={settings.embeddingMaxConcurrent} />
-                    </div>
+                    <SettingRowLayout item={field('sumRpm', 'Summarization Requests Per Minute', 'hypaV3SummarizationRequestsPerMinute')}>
+                        {#snippet control()}<NumberInput className="w-24" size="sm" padding min={1} bind:value={settings.summarizationRequestsPerMinute} />{/snippet}
+                    </SettingRowLayout>
+                    <SettingRowLayout item={field('sumConcurrent', 'Summarization Max Concurrent', 'hypaV3SummarizationMaxConcurrent')}>
+                        {#snippet control()}<NumberInput className="w-24" size="sm" padding min={1} max={10} bind:value={settings.summarizationMaxConcurrent} />{/snippet}
+                    </SettingRowLayout>
+                    <SettingRowLayout item={field('embRpm', 'Embedding Requests Per Minute', 'hypaV3EmbeddingRequestsPerMinute')}>
+                        {#snippet control()}<NumberInput className="w-24" size="sm" padding min={1} bind:value={settings.embeddingRequestsPerMinute} />{/snippet}
+                    </SettingRowLayout>
+                    <SettingRowLayout item={field('embConcurrent', 'Embedding Max Concurrent', 'hypaV3EmbeddingMaxConcurrent')}>
+                        {#snippet control()}<NumberInput className="w-24" size="sm" padding min={1} max={10} bind:value={settings.embeddingMaxConcurrent} />{/snippet}
+                    </SettingRowLayout>
                 {:else}
-                    <div class="mb-2 flex items-center">
-                        <Check name={language.hypaV3Settings.enableSimilarityCorrectionLabel} bind:check={settings.enableSimilarityCorrection} />
-                        <Help key="hypaV3EnableSimilarityCorrection"/>
-                    </div>
+                    <SettingRowLayout item={field('similarityCorrection', language.hypaV3Settings.enableSimilarityCorrectionLabel, 'hypaV3EnableSimilarityCorrection')}>
+                        {#snippet control()}<ShSwitch checked={!!settings.enableSimilarityCorrection} onCheckedChange={(v) => settings.enableSimilarityCorrection = v} />{/snippet}
+                    </SettingRowLayout>
                 {/if}
-            </Accordion>
+                </div>
+            </ShAccordion>
+            </div>
     {/if}
 </div>
 {/if}

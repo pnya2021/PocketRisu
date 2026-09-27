@@ -11,6 +11,8 @@
 </script>
 
 <h2 class="mb-4 text-2xl font-bold mt-2">{title}</h2>
-<div class="flex flex-col">
+<!-- A row-layout field right under a notice banner (ShAlert, role=alert)
+     skips its top divider — otherwise the line hugs the banner's edge. -->
+<div class="flex flex-col [&>[role=alert]+*]:border-t-0">
     {@render children?.()}
 </div>

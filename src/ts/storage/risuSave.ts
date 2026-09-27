@@ -857,6 +857,57 @@ export type HashMismatchReport = {
     compositionOnly: boolean
 }
 
+/** UTF-8 byte length of a string without encoding it. */
+export function utf8ByteLength(str: string): number {
+    let bytes = str.length
+    for (let i = 0; i < str.length; i++) {
+        const code = str.charCodeAt(i)
+        if (code < 0x80) continue
+        if (code < 0x800) { bytes += 1; continue }
+        if (code >= 0xD800 && code <= 0xDBFF && i + 1 < str.length) {
+            const next = str.charCodeAt(i + 1)
+            if (next >= 0xDC00 && next <= 0xDFFF) {
+                // Surrogate pair: 2 UTF-16 units, 4 UTF-8 bytes.
+                bytes += 2
+                i++
+                continue
+            }
+        }
+        bytes += 2
+    }
+    return bytes
+}
+
+/**
+ * String map that keeps the UTF-8 byte total of its values. Sizes are counted
+ * once per stored string, so the patcher's running payload estimate costs
+ * only as much as the entries that changed.
+ */
+class JsonSizeMap extends Map<string, string> {
+    private sizes = new Map<string, number>()
+    totalBytes = 0
+
+    override set(key: string, value: string): this {
+        this.totalBytes -= this.sizes.get(key) ?? 0
+        const bytes = utf8ByteLength(value)
+        this.sizes.set(key, bytes)
+        this.totalBytes += bytes
+        return super.set(key, value)
+    }
+
+    override delete(key: string): boolean {
+        this.totalBytes -= this.sizes.get(key) ?? 0
+        this.sizes.delete(key)
+        return super.delete(key)
+    }
+
+    override clear(): void {
+        this.sizes.clear()
+        this.totalBytes = 0
+        super.clear()
+    }
+}
+
 export class RisuSavePatcher {
     private lastSyncedDb: any;
     private hashBlocks: { [key: string]: number } = {};
@@ -874,9 +925,12 @@ export class RisuSavePatcher {
     // like "__proto__" on a plain object would silently hit the prototype
     // setter instead of storing — corrupting the skip checks and, worse, the
     // modules hash fold. Map keys are also type-strict (1 !== "1").
-    private lastRootKeyJsons = new Map<string, string>();
-    private lastCharJsons = new Map<string, string>();
-    private lastModuleJsons = new Map<string, string>();
+    private lastRootKeyJsons = new JsonSizeMap();
+    private lastCharJsons = new JsonSizeMap();
+    private lastModuleJsons = new JsonSizeMap();
+    // UTF-8 size of the baseline presets block (presets have no per-item
+    // string cache); refreshed only when presets are diffed.
+    private presetBytes = 0;
     private moduleItemHashes = new Map<string, number>();
     // chaIds whose stubbed body hashed differently from the baseline in the
     // last set(): the characters the client actually changed, whether or not
@@ -917,6 +971,19 @@ export class RisuSavePatcher {
     /** chaIds whose body changed against the baseline in the last set(). */
     changedCharacterIdsOfLastSet(): string[] {
         return [...this.lastChangedCharacterIds]
+    }
+
+    /**
+     * Approximate size of the payload a full write of the synced state would
+     * send (RisuSaveEncoder output), summed from the per-entry JSON this
+     * patcher already keeps. Leaves out only block headers and root key
+     * names, a few KB, so it stands in for a real encode between full writes.
+     */
+    estimatePayloadBytes(): number {
+        return this.lastRootKeyJsons.totalBytes
+            + this.lastCharJsons.totalBytes
+            + this.lastModuleJsons.totalBytes
+            + this.presetBytes
     }
 
     /**
@@ -1015,15 +1082,16 @@ export class RisuSavePatcher {
         // from the normalized form means any normalize-affecting value (shared
         // ref, Date, non-finite) makes raw≠baseline and falls safely to full path.
         const { characters: _c, botPresets: _b, modules: _m, ...normRootOnly } = this.lastSyncedDb
-        this.lastRootKeyJsons = new Map();
+        this.presetBytes = utf8ByteLength(JSON.stringify(this.lastSyncedDb.botPresets ?? []))
+        this.lastRootKeyJsons = new JsonSizeMap();
         for (const key of Object.keys(normRootOnly)) {
             this.lastRootKeyJsons.set(key, JSON.stringify(normRootOnly[key]))
         }
-        this.lastCharJsons = new Map();
+        this.lastCharJsons = new JsonSizeMap();
         for (const character of this.lastSyncedDb.characters) {
             if (character?.chaId) this.lastCharJsons.set(character.chaId, JSON.stringify(character))
         }
-        this.lastModuleJsons = new Map();
+        this.lastModuleJsons = new JsonSizeMap();
         this.moduleItemHashes = new Map();
         const normModulesInit = Array.isArray(this.lastSyncedDb.modules) ? this.lastSyncedDb.modules : []
         for (const m of normModulesInit) {
@@ -1197,6 +1265,7 @@ export class RisuSavePatcher {
             for (const op of ops) patch.push(op)
             this.hashBlocks['botPresets'] = calculateHash(normBotPresets);
             this.lastSyncedDb.botPresets = normBotPresets;
+            this.presetBytes = utf8ByteLength(JSON.stringify(normBotPresets));
         }
 
         if (toSave.modules) {
@@ -1225,7 +1294,7 @@ export class RisuSavePatcher {
                 patch.push({ op: 'replace', path: '/modules', value: normModules })
                 this.hashBlocks['modules'] = calculateHash(normModules);
                 this.lastSyncedDb.modules = normModules;
-                this.lastModuleJsons = new Map();
+                this.lastModuleJsons = new JsonSizeMap();
                 this.moduleItemHashes = new Map();
                 for (const m of normModules) {
                     if (typeof m?.id === 'string' && m.id) {
@@ -1298,7 +1367,7 @@ export class RisuSavePatcher {
             this.lastSyncedDb.characters = normChars;
             // Rebuild the cheap baselines from the NORMALIZED chars (the server's
             // state), not the raw input — see init().
-            this.lastCharJsons = new Map();
+            this.lastCharJsons = new JsonSizeMap();
             for (const char of normChars) {
                 if (char?.chaId) this.lastCharJsons.set(char.chaId, JSON.stringify(char))
             }

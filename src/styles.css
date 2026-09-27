@@ -361,9 +361,12 @@ body {
   white-space: pre-wrap;
 }
 
+/* Drags on non-scrolling areas (header, composer, short chats) chain to the
+   root and trigger mobile pull-to-refresh, reloading the app mid-chat. */
 html,
 body {
   height: var(--risu-height-size);
+  overscroll-behavior-y: none;
 }
 
 .chattext p {
@@ -444,7 +447,19 @@ body {
    changes and cannot animate scrollbar parts itself. Verified on macOS Chrome
    151 (classic scrollbars). A fully hidden 3px thumb (v1.11.0) could not be
    located or dragged on long lists. */
+/* Registered as NOT inherited: the alpha is rewritten on every scroll event and
+   fade frame, and as an inherited property each write restyled the scroller's
+   whole subtree (every rendered chat message — ~50x the style cost of v1.10 on
+   a long chat). The thumb takes the scroller's value with an explicit
+   `inherit`, which works for non-inherited properties. */
+@property --risu-scrollbar-alpha {
+  syntax: '<number>';
+  inherits: false;
+  initial-value: 0.22;
+}
+
 ::-webkit-scrollbar-thumb {
+  --risu-scrollbar-alpha: inherit;
   background-color: color-mix(in srgb, var(--color-textcolor2) calc(var(--risu-scrollbar-alpha, 0.22) * 100%), transparent);
   border-radius: 9999px;
 }

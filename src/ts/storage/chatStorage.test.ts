@@ -4,9 +4,12 @@ import { describe, test, expect, vi } from 'vitest'
 // unrelated $effect chains that fail in a stripped-down test environment.
 // Mirror the production isChatStub semantics including the hybrid guard so
 // the chat-data-loss tests below exercise the real intent.
-const fetchChatContent = vi.hoisted(() => vi.fn())
+const fetchChatContentDelta = vi.hoisted(() => vi.fn())
 vi.mock('../globalApi.svelte', () => ({
-    forageStorage: { realStorage: { fetchChatContent, saveChatContent: vi.fn() } },
+    forageStorage: { realStorage: {
+        fetchChatContent: vi.fn(), saveChatContent: vi.fn(),
+        fetchChatContentDelta, saveChatContentDelta: vi.fn(),
+    } },
 }))
 vi.mock('./database.svelte', () => ({
     isChatStub: (chat: any) => chat
@@ -232,11 +235,11 @@ describe('group chat lazy hydration', () => {
             pluginState: { owner: 'plugin' }, unknownChatField: ['kept'],
             message: [{ role: 'char', data: 'hello', saying: 'member-a', chatId: 'message-a' }],
         }
-        fetchChatContent.mockResolvedValueOnce(full)
+        fetchChatContentDelta.mockResolvedValueOnce({ chat: full, deltaBase: null })
 
         const hydrated = await ensureChatHydrated(chats, 0, 'group-parent')
 
-        expect(fetchChatContent).toHaveBeenCalledWith('group-parent', 0, 'group-chat')
+        expect(fetchChatContentDelta).toHaveBeenCalledWith('group-parent', 0, 'group-chat', null)
         expect(hydrated).toBe(full)
         expect(chats[0]).toBe(full)
         expect(chats[0]).toMatchObject({

@@ -408,8 +408,8 @@
   </div>
 
   {#if $InlayGallerySubmenuIndex === 1}
-    <div class="flex-1 min-h-0 overflow-y-auto">
-      <SettingRenderer items={inlayImageSettingsItems} />
+    <div class="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+      <SettingRenderer items={inlayImageSettingsItems} layout="row" />
     </div>
   {:else}
     <header class="shrink-0 flex flex-col gap-3 bg-bgcolor pb-4">

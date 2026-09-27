@@ -22,7 +22,49 @@ afterEach(() => {
 })
 
 describe('pendingSends', () => {
+    test('late cleanup from a stopped send preserves the replacement recovery marker', async () => {
+        mocks.db = { nodeOnlyServerSideRequests: true }
+        let serverGeneration: string | undefined
+        const requests: string[] = []
+        vi.stubGlobal('fetch', vi.fn(async (_: RequestInfo | URL, init?: RequestInit) => {
+            requests.push(init?.method ?? 'GET')
+            if (init?.method === 'POST') serverGeneration = JSON.parse(String(init.body)).generationId
+            if (init?.method === 'DELETE') serverGeneration = undefined
+            return new Response('{}', { status: 200 })
+        }))
+        const pending = await loadModule()
+        pending.registerPendingSend('chat-1', 'stopped-send')
+        pending.registerPendingSend('chat-1', 'replacement-send')
+        pending.markResumable('chat-1', 'replacement-send')
+        pending.clearPendingSend('chat-1', 'stopped-send')
+        // All HTTP doubles resolve immediately; drain their queued operations.
+        await new Promise((resolve) => setTimeout(resolve, 0))
+
+        expect(serverGeneration).toBe('replacement-send')
+        expect(requests).toEqual(['POST', 'POST'])
+        expect(get(pending.resumableSends).get('chat-1')?.generationId).toBe('replacement-send')
+
+        pending.clearPendingSend('chat-1', 'replacement-send')
+        await vi.waitFor(() => expect(serverGeneration).toBeUndefined())
+        expect(get(pending.resumableSends).has('chat-1')).toBe(false)
+    })
+
+    test('owned completion clears an existing marker even after server requests are disabled', async () => {
+        mocks.db = { nodeOnlyServerSideRequests: true }
+        const requests: string[] = []
+        vi.stubGlobal('fetch', vi.fn(async (_: RequestInfo | URL, init?: RequestInit) => {
+            requests.push(init?.method ?? 'GET')
+            return new Response('{}', { status: 200 })
+        }))
+        const pending = await loadModule()
+        pending.registerPendingSend('chat-1', 'gen-1')
+        mocks.db.nodeOnlyServerSideRequests = false
+        pending.clearPendingSend('chat-1', 'gen-1')
+        await vi.waitFor(() => expect(requests).toEqual(['POST', 'DELETE']))
+    })
+
     test('per-chat chain keeps register → clear in call order even when register is slow', async () => {
+        mocks.db = { nodeOnlyServerSideRequests: true }
         const order: string[] = []
         let releaseRegister: () => void = () => {}
         vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

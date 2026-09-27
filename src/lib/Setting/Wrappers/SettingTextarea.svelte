@@ -4,7 +4,7 @@
     import { untrack } from 'svelte';
     import TextAreaInput from 'src/lib/UI/GUI/TextAreaInput.svelte';
     import Help from 'src/lib/Others/Help.svelte';
-    import { language } from 'src/lang';
+    import SettingFieldLabel from './SettingFieldLabel.svelte';
 
     interface Props {
         item: SettingItem;
@@ -36,10 +36,9 @@
     <!-- Multiline stays stacked (input below), but the label matches row styling:
          14px label + inline help text, consistent with select/slider rows. -->
     <div class="py-3 border-t border-darkborderc" data-setting-id={item.id}>
-        <span class="text-sm text-textcolor">{getLabel(item)}</span>
-        {#if item.helpKey && (language.help as any)[item.helpKey]}
-            <p class="text-xs text-textcolor2 mt-0.5">{(language.help as any)[item.helpKey]}</p>
-        {/if}
+        <div class="flex flex-col">
+            <SettingFieldLabel label={getLabel(item)} helpKey={item.helpKey} helpUnrecommended={item.helpUnrecommended} showExperimental={item.showExperimental} />
+        </div>
         <TextAreaInput
             className="mt-2"
             bind:value={localValue}

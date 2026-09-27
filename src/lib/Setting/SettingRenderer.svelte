@@ -52,8 +52,9 @@
          editors) don't, so they attach to the option above with no divider.
          Drop the very first row's leading border. The nested first-child rule
          reaches through SettingCustom's data-setting-id anchor wrapper, whose
-         inner component may carry the border instead. -->
-    <div class="[&>*:first-child]:border-t-0 [&>*:first-child>*:first-child]:border-t-0">
+         inner component may carry the border instead. A row right under a
+         notice banner (SettingHeader → ShAlert) drops its divider too. -->
+    <div class="[&>*:first-child]:border-t-0 [&>*:first-child>*:first-child]:border-t-0 [&>[role=alert]+*]:border-t-0">
         {@render itemList()}
     </div>
 {:else if layout === 'block'}

@@ -1,4 +1,4 @@
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 import { MEMORY_PRESET_DEFAULT, MEMORY_PRESET_OFF, getMemoryPreset, resolveMemoryPresetId, setChatMemoryPreset } from './process/memory/memoryPresets'
 import type { character, Database, groupChat } from "./storage/database.svelte";
 import { type simpleCharacterArgument } from "./parser/parser.svelte";
@@ -91,6 +91,7 @@ export const SystemSubmenuIndex = writable(0)
 // mode gear button can deep-link to the Sidebar tab — see src/ts/routing
 // (AccessibilityTab) and Setting/Pages/AccessibilitySettings.svelte.
 export const AccessibilitySubmenuIndex = writable(0)
+export const AdvancedSubmenuIndex = writable(0)
 // Sub-tab indices for the remaining tabbed settings pages. Stores (instead of
 // page-local $state) so the settings search can deep-link to a specific tab —
 // see src/ts/setting/searchIndex.ts (navigateToSearchResult).
@@ -192,11 +193,27 @@ export const loadingOverlayStore = writable<{
     active: boolean,
     text: string,
     onCancel?: (() => void) | null,
+    owner?: symbol,
 }>({
     active: false,
     text: '',
     onCancel: null,
 })
+
+/**
+ * Show the overlay for one operation. The returned function hides it only
+ * while that operation still owns it, so a slow earlier load finishing late
+ * cannot hide the overlay of the load that replaced it.
+ */
+export function claimLoadingOverlay(text: string, onCancel: (() => void) | null = null): () => void {
+    const owner = Symbol('loading-overlay')
+    loadingOverlayStore.set({ active: true, text, onCancel, owner })
+    return () => {
+        if (get(loadingOverlayStore).owner === owner) {
+            loadingOverlayStore.set({ active: false, text: '', onCancel: null })
+        }
+    }
+}
 
 export const QuickSettings = $state({
     open: false,

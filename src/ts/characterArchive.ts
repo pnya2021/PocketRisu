@@ -15,15 +15,16 @@
  */
 import { get } from "svelte/store"
 import { language } from "src/lang"
-import { alertConfirm, alertError, notifySuccess } from "./alert"
+import { alertConfirm, alertError, notifyError, notifySuccess } from "./alert"
 import { changeChar, deselectCharacter } from "./characters"
-import { checkCharOrder, forageStorage, persistLiveDatabaseUnderLease, requestImmediateSave, requiresFullEncoderReload } from "./globalApi.svelte"
+import { checkCharOrder, flushSaves, forageStorage, persistLiveDatabaseUnderLease, requestImmediateSave, requiresFullEncoderReload, trackCharacterForSave } from "./globalApi.svelte"
 import { generationStates } from "./process/generationState"
 import { DBState, loadingOverlayStore, selectedCharID } from "./stores.svelte"
 import { convertStubsToPlaceholders } from "./storage/chatStorage"
 import { getDatabase, type ArchivedCharacterStub, type character, type Database } from "./storage/database.svelte"
 import { databasePersistenceCoordinator } from "./storage/databasePersistenceCoordinator"
-import { CharacterArchiveError, type NodeStorage } from "./storage/nodeStorage"
+import { CharacterArchiveError, type ArchiveBatchResult, type NodeStorage } from "./storage/nodeStorage"
+import { v4 } from "uuid"
 
 export { CharacterArchiveError }
 
@@ -39,6 +40,15 @@ export function findArchivedStub(chaId: string): ArchivedCharacterStub | undefin
     return getArchivedStubs().find((s) => s?.chaId === chaId)
 }
 
+// The trash takes a character out of characterOrder (checkCharOrder), folder
+// included. Remember the folder so restoring can put it back.
+function markTrashed(stub: ArchivedCharacterStub, trashedAt: number) {
+    stub.trashedAt = trashedAt
+    const folder = DBState.db.characterOrder?.find((e) => typeof e !== 'string' && e?.data?.includes(stub.chaId))
+    if (folder && typeof folder !== 'string') stub.trashedFromFolder = folder.id
+    else delete stub.trashedFromFolder
+}
+
 export function isArchivedCharacter(chaId: string): boolean {
     return !!findArchivedStub(chaId)
 }
@@ -48,6 +58,12 @@ function withOverlay<T>(fn: () => Promise<T>): Promise<T> {
     return fn().finally(() => {
         loadingOverlayStore.set({ active: false, text: '', onCancel: null })
     })
+}
+
+function bulletList(names: string[], max = 5): string {
+    const lines = names.slice(0, max).map((n) => `• ${n || '—'}`)
+    if (names.length > max) lines.push(`• … +${names.length - max}`)
+    return lines.join('\n')
 }
 
 /**
@@ -66,23 +82,21 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
     // the stub just carries the marker (exported as upstream's trashTime).
     if (!arg.skipConfirm && !await alertConfirm(language.deactivateCharacterConfirm(name))) return false
 
-    const run = async () => {
+    // A missing server chat body can be accepted for trash, but ordinary
+    // deactivation asks before archiving the empty chat the user can see.
+    const run = async (acceptLostChats: boolean) => {
         const archived = await databasePersistenceCoordinator.runExclusiveMutation(async () => {
             // Resolve only after obtaining ownership: a preceding save/rebase
             // may have replaced the database while the confirmation was open.
             assertArchiveGenerationIdle()
-            const databaseSnapshot = getDatabase({ snapshot: true })
-            const snapshotMatches = (databaseSnapshot.characters ?? [])
-                .filter((candidate) => candidate?.chaId === chaId)
-            if (snapshotMatches.length === 0) return false
-            if (snapshotMatches.length !== 1) {
+            const liveMatches = (DBState.db.characters ?? []).filter((candidate) => candidate?.chaId === chaId)
+            if (liveMatches.length === 0) return false
+            if (liveMatches.length !== 1) {
                 throw new CharacterArchiveError(
                     'ARCHIVE_CHARACTER_CHANGED',
                     'The character identity is ambiguous. Reload before retrying deactivation.',
                 )
             }
-            const targetSignature = archiveTargetSignature(snapshotMatches[0])
-
             // Archive must not turn an initial, unbound write into a blind
             // overwrite of a foreign database revision.
             if (!forageStorage.getDbEtag()) {
@@ -92,6 +106,22 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
                 )
             }
 
+            // Id-less loaded chats are invisible to the normal split save path.
+            // Give them stable identities while ownership is held, then include
+            // their bodies in the acknowledged full snapshot below.
+            let assignedIds = false
+            for (const chat of liveMatches[0].chats ?? []) {
+                if (chat && !chat._placeholder && !chat.id) {
+                    chat.id = v4()
+                    assignedIds = true
+                }
+            }
+            if (assignedIds) trackCharacterForSave(chaId)
+            const databaseSnapshot = getDatabase({ snapshot: true })
+            const snapshotMatches = (databaseSnapshot.characters ?? [])
+                .filter((candidate) => candidate?.chaId === chaId)
+            const targetSignature = archiveTargetSignature(snapshotMatches[0])
+
             // The debounce save can coalesce or absorb failures. Use an
             // acknowledged, ETag-bound full write of the exact snapshot instead.
             await persistLiveDatabaseUnderLease(databaseSnapshot)
@@ -99,7 +129,7 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
 
             // Generations are checked separately because their incremental
             // writes can occur outside the coordinator.
-            const stub = await storage().archiveCharacter(chaId)
+            const stub = await storage().archiveCharacter(chaId, { acceptLostChats })
             assertArchiveTargetUnchanged(chaId, targetSignature)
 
             const db = DBState.db
@@ -111,7 +141,7 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
                 )
             }
             if (!Array.isArray(db.nodeOnlyArchivedCharacters)) db.nodeOnlyArchivedCharacters = []
-            if (arg.trash) stub.trashedAt = arg.trashedAt ?? Date.now()
+            if (arg.trash) markTrashed(stub, arg.trashedAt ?? Date.now())
             db.nodeOnlyArchivedCharacters.push(stub)
             const selectedIndex = get(selectedCharID)
             db.characters.splice(idx, 1)
@@ -124,25 +154,180 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
             else if (selectedIndex > idx) selectedCharID.set(selectedIndex - 1)
             return true
         })
-        // Normal saves acquire the same coordinator; schedule this only after
-        // releasing the exclusive lease to avoid self-deadlock.
+        // Normal saves acquire the same coordinator; do not wait for one while
+        // this mutation owns the exclusive lease.
         if (archived) {
-            void requestImmediateSave()
-            if (!arg.silent) notifySuccess(arg.trash ? language.trashCharacterDone : language.deactivateCharacterDone)
+            if (arg.silent) {
+                void requestImmediateSave()
+            } else if (await flushSaves()) {
+                notifySuccess(arg.trash ? language.trashCharacterDone : language.deactivateCharacterDone)
+            } else {
+                notifyError(language.archiveSavePending)
+            }
         }
         return archived
     }
+    // silent: no overlay, no dialogs — the caller reports (migration logs).
+    const attempt = (acceptLostChats: boolean) => arg.silent ? run(acceptLostChats) : withOverlay(() => run(acceptLostChats))
+    const fail = (error: unknown) => {
+        alertError(language.deactivateCharacterFailed + (error instanceof Error ? error.message : String(error)))
+        return false
+    }
     try {
-        // silent: no overlay, no dialogs — the caller reports (migration logs).
-        return arg.silent ? await run() : await withOverlay(run)
+        return await attempt(!!arg.trash)
     } catch (error) {
         if (arg.silent) throw error
-        if (error instanceof CharacterArchiveError && error.code === 'ARCHIVE_CHATS_UNAVAILABLE') {
-            alertError(language.deactivateCharacterUnsaved)
-        } else {
-            alertError(language.deactivateCharacterFailed + (error instanceof Error ? error.message : String(error)))
-        }
-        return false
+        if (!(error instanceof CharacterArchiveError && error.code === 'ARCHIVE_CHATS_UNAVAILABLE')) return fail(error)
+        if (!await alertConfirm(language.deactivateCharacterLostChats(name, error.chats.length, bulletList(error.chats)))) return false
+        return await attempt(true).catch(fail)
+    }
+}
+
+const BULK_ARCHIVE_CHUNK = 20
+let bulkArchiveRunning = false
+
+export interface BulkArchiveOutcome {
+    /** Characters moved to the stub list. */
+    done: number
+    /** Characters left active, with the reason. */
+    failed: { chaId: string; name: string; reason: string }[]
+    /** Refused because some chats have no content anywhere (only without acceptLostChats). */
+    lost: { chaId: string; name: string; chats: string[] }[]
+    /** A save did not land; later chunks were not attempted. */
+    stopped: boolean
+}
+
+export function isBulkArchiveRunning(): boolean {
+    return bulkArchiveRunning
+}
+
+// The chunk's successes, applied in one synchronous step to the database
+// current after the request: the characters leave `characters`, their stubs
+// join the stub list, the order is normalised once and the selection follows
+// its character by id.
+function applyArchived(successes: { chaId: string; stub: any }[], trash: boolean): number {
+    const db = DBState.db
+    const selectedChaId = db.characters[get(selectedCharID)]?.chaId
+    if (!Array.isArray(db.nodeOnlyArchivedCharacters)) db.nodeOnlyArchivedCharacters = []
+    const moved = new Set<string>()
+    const now = Date.now()
+    for (const { chaId, stub } of successes) {
+        if (!db.characters.some((c) => c?.chaId === chaId)) continue
+        if (trash) markTrashed(stub, now)
+        if (!db.nodeOnlyArchivedCharacters.some((s) => s?.chaId === chaId)) db.nodeOnlyArchivedCharacters.push(stub)
+        moved.add(chaId)
+    }
+    if (moved.size === 0) return 0
+    for (let i = db.characters.length - 1; i >= 0; i--) {
+        if (moved.has(db.characters[i]?.chaId)) db.characters.splice(i, 1)
+    }
+    checkCharOrder()
+    requiresFullEncoderReload.state = true
+    if (selectedChaId && moved.has(selectedChaId)) {
+        deselectCharacter()
+    } else if (selectedChaId) {
+        const idx = db.characters.findIndex((c) => c?.chaId === selectedChaId)
+        if (idx !== get(selectedCharID)) selectedCharID.set(idx)
+    }
+    return moved.size
+}
+
+/**
+ * Deactivate (or trash) many characters in 20-ID server batches. Each batch
+ * starts from an acknowledged full snapshot, then its successful list moves
+ * are acknowledged before the next batch. The exclusive lease fences normal
+ * saves for the whole run; a progress overlay remains visible throughout.
+ */
+export async function archiveCharacters(chaIds: string[], arg: { trash?: boolean; acceptLostChats?: boolean } = {}): Promise<BulkArchiveOutcome> {
+    if (bulkArchiveRunning) throw new Error(language.bulkArchiveBusy)
+    bulkArchiveRunning = true
+    const outcome: BulkArchiveOutcome = { done: 0, failed: [], lost: [], stopped: false }
+    const trash = !!arg.trash
+    const progress = (done: number, total: number) =>
+        loadingOverlayStore.set({ active: true, text: language.bulkArchiveProgress(done, total, trash), onCancel: null })
+    try {
+        await databasePersistenceCoordinator.runExclusiveMutation(async () => {
+            // A queued save/rebase may have replaced the database. Resolve IDs
+            // only after taking ownership, and never trust an old array index.
+            const names = new Map<string, string>()
+            const targets: string[] = []
+            for (const chaId of new Set(chaIds)) {
+                const matches = DBState.db.characters.filter((c) => c?.chaId === chaId)
+                if (matches.length === 0) continue
+                if (matches.length !== 1) {
+                    throw new CharacterArchiveError('ARCHIVE_CHARACTER_CHANGED', 'The character identity is ambiguous. Reload before retrying deactivation.')
+                }
+                names.set(chaId, matches[0].name || 'Unnamed')
+                targets.push(chaId)
+            }
+            if (targets.length === 0) return
+            progress(0, targets.length)
+
+            for (let i = 0; i < targets.length; i += BULK_ARCHIVE_CHUNK) {
+                const chunk = targets.slice(i, i + BULK_ARCHIVE_CHUNK)
+                assertArchiveGenerationIdle()
+                if (!forageStorage.getDbEtag()) {
+                    throw new CharacterArchiveError('ARCHIVE_SAVE_UNAVAILABLE', 'The saved database revision is unavailable. Reload before deactivating a character.')
+                }
+                // Assign IDs to loaded chats before the full write; unresolved
+                // placeholders retain their stable IDs and server-side bodies.
+                for (const chaId of chunk) {
+                    const matches = DBState.db.characters.filter((c) => c?.chaId === chaId)
+                    if (matches.length !== 1) {
+                        throw new CharacterArchiveError('ARCHIVE_CHARACTER_CHANGED', 'The character changed while preparing deactivation. Retry the operation.')
+                    }
+                    let assigned = false
+                    for (const chat of matches[0].chats ?? []) {
+                        if (chat && !chat._placeholder && !chat.id) {
+                            chat.id = v4()
+                            assigned = true
+                        }
+                    }
+                    if (assigned) trackCharacterForSave(chaId)
+                }
+                const snapshot = getDatabase({ snapshot: true })
+                const signatures = new Map(chunk.map((chaId) => {
+                    const target = snapshot.characters.find((c) => c?.chaId === chaId)
+                    return [chaId, archiveTargetSignature(target)] as const
+                }))
+                await persistLiveDatabaseUnderLease(snapshot)
+                for (const chaId of chunk) assertArchiveTargetUnchanged(chaId, signatures.get(chaId)!)
+
+                const results: ArchiveBatchResult[] = await storage().archiveCharacters(chunk, { acceptLostChats: arg.acceptLostChats ?? trash })
+                // A generation or live edit during the server request leaves
+                // only recoverable orphan rows; no changed body is removed.
+                for (const chaId of chunk) assertArchiveTargetUnchanged(chaId, signatures.get(chaId)!)
+                const successes: { chaId: string; stub: any }[] = []
+                for (const r of results) {
+                    const name = names.get(r.chaId) ?? r.chaId
+                    if (r.ok) {
+                        successes.push({ chaId: r.chaId, stub: (r as Extract<ArchiveBatchResult, { ok: true }>).stub })
+                        continue
+                    }
+                    const f = r as Extract<ArchiveBatchResult, { ok: false }>
+                    if (f.code === 'ARCHIVE_CHATS_UNAVAILABLE') outcome.lost.push({ chaId: f.chaId, name, chats: f.chats ?? [] })
+                    else outcome.failed.push({ chaId: f.chaId, name, reason: f.error })
+                }
+                const moved = applyArchived(successes, trash)
+                outcome.done += moved
+                if (moved > 0) {
+                    try {
+                        await persistLiveDatabaseUnderLease(getDatabase({ snapshot: true }))
+                    } catch {
+                        // Keep the local stubs and queued save intact; do not
+                        // archive a later chunk against an unacknowledged view.
+                        outcome.stopped = true
+                        break
+                    }
+                }
+                progress(Math.min(i + chunk.length, targets.length), targets.length)
+            }
+        })
+        if (outcome.stopped) void requestImmediateSave()
+        return outcome
+    } finally {
+        loadingOverlayStore.set({ active: false, text: '', onCancel: null })
+        bulkArchiveRunning = false
     }
 }
 
@@ -154,7 +339,7 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
  */
 export async function activateCharacter(chaId: string): Promise<number> {
     let shouldSave = false
-    const result = await databasePersistenceCoordinator.runExclusiveMutation(async () => {
+    const attempt = () => databasePersistenceCoordinator.runExclusiveMutation(async () => {
         // Re-read after obtaining ownership: an acknowledged save/rebase may
         // have activated or replaced this character while this call was queued.
         const db = DBState.db
@@ -173,12 +358,19 @@ export async function activateCharacter(chaId: string): Promise<number> {
             // Name the exact row this stub was made with (rows are versioned).
             restored = await storage().activateCharacter(chaId, list[stubIndex]?.archivedAt)
         } catch (error) {
-            if (error instanceof CharacterArchiveError && error.code === 'ARCHIVE_ALREADY_ACTIVE') {
-                // Server has it active but our view does not — rebase will bring it; drop the stub.
-                list.splice(stubIndex, 1)
-                return -1
-            }
+            // A just-deactivated character may still appear active to the
+            // server until its normal transition save lands. Keep the stub,
+            // release ownership, flush, and retry against current state.
             throw error
+        }
+        // A rebase or other live mutation can replace the object during the
+        // server request even while normal writes are fenced by the lease.
+        const current = DBState.db
+        const existingNow = current.characters.findIndex((c) => c?.chaId === chaId)
+        if (existingNow !== -1) {
+            const staleStub = (current.nodeOnlyArchivedCharacters ?? []).findIndex((s) => s?.chaId === chaId)
+            if (staleStub !== -1) current.nodeOnlyArchivedCharacters!.splice(staleStub, 1)
+            return existingNow
         }
         // The server sends chats as stubs; the client works with placeholders
         // (same conversion bootstrap applies to the whole database).
@@ -186,14 +378,31 @@ export async function activateCharacter(chaId: string): Promise<number> {
         // The trash marker lives on the stub, never on the body (a body archived
         // by the legacy-trash migration may still carry the old flag).
         delete restored.trashTime
-        db.characters.push(restored)
-        const stubIdxNow = (db.nodeOnlyArchivedCharacters ?? []).findIndex((s) => s?.chaId === chaId)
-        if (stubIdxNow !== -1) db.nodeOnlyArchivedCharacters!.splice(stubIdxNow, 1)
+        current.characters.push(restored)
+        const stubIdxNow = (current.nodeOnlyArchivedCharacters ?? []).findIndex((s) => s?.chaId === chaId)
+        if (stubIdxNow !== -1) current.nodeOnlyArchivedCharacters!.splice(stubIdxNow, 1)
         checkCharOrder()
         requiresFullEncoderReload.state = true
         shouldSave = true
-        return db.characters.length - 1
+        return current.characters.length - 1
     })
+    let result: number
+    try {
+        result = await attempt()
+    } catch (error) {
+        if (!(error instanceof CharacterArchiveError && error.code === 'ARCHIVE_ALREADY_ACTIVE')) throw error
+        // The coordinator must be released before flushSaves takes its normal
+        // write lease. A failed flush leaves the stub untouched.
+        if (!await flushSaves()) throw new CharacterArchiveError(error.code, language.archiveSaveFailed)
+        try {
+            result = await attempt()
+        } catch (retryError) {
+            if (retryError instanceof CharacterArchiveError && retryError.code === 'ARCHIVE_ALREADY_ACTIVE') {
+                throw new CharacterArchiveError(retryError.code, language.activateCharacterAlreadyActive)
+            }
+            throw retryError
+        }
+    }
     // requestImmediateSave takes a normal-write lease itself.
     if (shouldSave) void requestImmediateSave()
     return result
@@ -231,7 +440,7 @@ function assertArchiveTargetUnchanged(chaId: string, expectedSignature: string):
 export function trashDeactivatedCharacter(chaId: string): boolean {
     const stub = findArchivedStub(chaId)
     if (!stub || stub.trashedAt) return false
-    stub.trashedAt = Date.now()
+    markTrashed(stub, Date.now())
     checkCharOrder()
     void requestImmediateSave()
     return true
@@ -242,6 +451,10 @@ export function restoreTrashedCharacter(chaId: string): boolean {
     const stub = findArchivedStub(chaId)
     if (!stub || !stub.trashedAt) return false
     delete stub.trashedAt
+    const folderId = stub.trashedFromFolder
+    delete stub.trashedFromFolder
+    const folder = folderId && DBState.db.characterOrder?.find((e) => typeof e !== 'string' && e?.id === folderId)
+    if (folder && typeof folder !== 'string' && !folder.data.includes(chaId)) folder.data.push(chaId)
     checkCharOrder()
     void requestImmediateSave()
     return true
@@ -258,8 +471,8 @@ export async function deleteTrashedCharacter(chaId: string): Promise<boolean> {
 /**
  * Legacy trash (a live character carrying `trashTime`, written by older
  * builds, upstream imports or .bin restores) → deactivated + trashedAt.
- * Best effort at boot: a character whose chats are not on the server yet
- * stays legacy and is retried next boot. The lists render both shapes.
+ * Best effort at boot: a character that fails to archive stays legacy and is
+ * retried next boot. The lists render both shapes.
  */
 export async function migrateLegacyTrash(): Promise<void> {
     const db = DBState.db

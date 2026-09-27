@@ -1,6 +1,6 @@
 <script lang="ts">
     import { DownloadIcon, HardDriveUploadIcon, PencilIcon, PlusIcon, TrashIcon } from "@lucide/svelte";
-    import Help from "src/lib/Others/Help.svelte";
+    import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import ShSelect from "src/lib/UI/GUI/ShSelect.svelte";
@@ -30,9 +30,17 @@
     }
 </script>
 
-<span class="text-textcolor mt-4">{language.presets} <Help key="translatorPreset" /></span>
+<!-- Row-layout block: preset picker row + icon toolbar, then the preset's
+     own fields (response size row, prompt textarea). -->
+<div class="py-3 border-t border-darkborderc">
+<div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col min-w-0">
+        <span class="text-sm text-textcolor">{language.presets}</span>
+        <p class="text-xs text-textcolor2 mt-0.5">{language.help.translatorPreset}</p>
+    </div>
 <ShSelect
-    className="mt-2 mb-1"
+    className="w-48 shrink-0"
+    size="sm"
     value={DBState.db.translatorPresetId}
     onchange={(e) => {
         DBState.db.translatorPresetId = Number((e.target as HTMLSelectElement).value);
@@ -43,10 +51,13 @@
         <OptionInput value={i}>{preset.name}</OptionInput>
     {/each}
 </ShSelect>
+</div>
 
-<div class="flex items-center mb-4">
-    <button
-        class="mr-2 text-textcolor2 hover:text-primary cursor-pointer"
+<div class="flex items-center justify-end gap-1 mt-2">
+    <ShButton
+        variant="ghost"
+        size="icon-sm"
+        className="hover:text-primary"
         onclick={() => {
             const newPreset = createTranslatorPreset();
             const presets = DBState.db.translatorPresets;
@@ -56,11 +67,13 @@
             normalizeTranslatorPresets();
         }}
     >
-        <PlusIcon size={24} />
-    </button>
+        <PlusIcon size={16} />
+    </ShButton>
 
-    <button
-        class="mr-2 text-textcolor2 hover:text-primary cursor-pointer"
+    <ShButton
+        variant="ghost"
+        size="icon-sm"
+        className="hover:text-primary"
         onclick={async () => {
             const presets = DBState.db.translatorPresets;
 
@@ -80,11 +93,13 @@
             syncCurrentTranslatorPreset();
         }}
     >
-        <PencilIcon size={24} />
-    </button>
+        <PencilIcon size={16} />
+    </ShButton>
 
-    <button
-        class="mr-2 text-textcolor2 hover:text-red-400 cursor-pointer"
+    <ShButton
+        variant="ghost"
+        size="icon-sm"
+        className="hover:text-red-400"
         onclick={async () => {
             const presets = DBState.db.translatorPresets;
 
@@ -105,13 +120,15 @@
             normalizeTranslatorPresets();
         }}
     >
-        <TrashIcon size={24} />
-    </button>
+        <TrashIcon size={16} />
+    </ShButton>
 
-    <div class="ml-2 mr-4 w-px h-full bg-darkborderc"></div>
+    <div class="mx-1 w-px h-5 bg-darkborderc"></div>
 
-    <button
-        class="mr-2 text-textcolor2 hover:text-primary cursor-pointer"
+    <ShButton
+        variant="ghost"
+        size="icon-sm"
+        className="hover:text-primary"
         onclick={async () => {
             try {
                 const presets = DBState.db.translatorPresets;
@@ -132,11 +149,13 @@
             }
         }}
     >
-        <DownloadIcon size={24} />
-    </button>
+        <DownloadIcon size={16} />
+    </ShButton>
 
-    <button
-        class="mr-2 text-textcolor2 hover:text-primary cursor-pointer"
+    <ShButton
+        variant="ghost"
+        size="icon-sm"
+        className="hover:text-primary"
         onclick={async () => {
             try {
                 const selectedFile = await selectSingleFile(translatorPresetImportExtensions);
@@ -157,24 +176,33 @@
             }
         }}
     >
-        <HardDriveUploadIcon size={24} />
-    </button>
+        <HardDriveUploadIcon size={16} />
+    </ShButton>
+</div>
 </div>
 
 {#if DBState.db.translatorPresets?.[DBState.db.translatorPresetId]}
     {@const preset = DBState.db.translatorPresets[DBState.db.translatorPresetId]}
-    <span class="text-textcolor mt-4">{language.translationResponseSize} <Help key="translationResponseSize" /></span>
+    <div class="flex items-center justify-between gap-3 py-3 border-t border-darkborderc">
+        <div class="flex flex-col min-w-0">
+            <span class="text-sm text-textcolor">{language.translationResponseSize}</span>
+            <p class="text-xs text-textcolor2 mt-0.5">{language.help.translationResponseSize}</p>
+        </div>
     <NumberInput
-        className="mt-2"
+        className="w-24 shrink-0"
+        size="sm"
+        padding={true}
         min={0}
         max={2048}
-        marginBottom={true}
         bind:value={() => preset.maxResponse, (value) => {
             preset.maxResponse = value;
             syncCurrentTranslatorPreset();
         }}
     />
-    <span class="text-textcolor mt-4">{language.translatorPrompt} <Help key="translatorPrompt" /></span>
+    </div>
+    <div class="py-3 border-t border-darkborderc">
+    <span class="text-sm text-textcolor">{language.translatorPrompt}</span>
+    <p class="text-xs text-textcolor2 mt-0.5">{language.help.translatorPrompt}</p>
     <TextAreaInput
         className="mt-2"
         bind:value={() => preset.prompt, (value) => {
@@ -183,4 +211,5 @@
         }}
         placeholder={defaultTranslatorPrompt}
     />
+    </div>
 {/if}

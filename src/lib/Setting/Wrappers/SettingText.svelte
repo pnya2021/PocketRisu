@@ -33,10 +33,13 @@
 </script>
 
 {#if ctx.layout === 'row'}
-    <SettingRowLayout {item}>
+    <SettingRowLayout {item} wideControl>
         {#snippet control()}
             <TextInput
-                className="w-48 text-sm"
+                className="sm:w-48 h-8"
+                fullwidth={true}
+                size="sm"
+                padding={true}
                 bind:value={localValue}
                 placeholder={item.options?.placeholder}
                 hideText={item.options?.hideText}

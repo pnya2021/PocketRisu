@@ -295,35 +295,53 @@ function createPluginStorageStore(deps) {
         return total;
     }
 
+    // Both sizes of every snapshot in one pass: id → { bytes, logicalBytes }.
+    // bytes is the marginal cost (see the size definition above), logicalBytes
+    // counts every referenced blob, as if nothing were shared. Every map row
+    // is decoded once here; sizing snapshots one by one decoded all of them
+    // per snapshot, which took seconds with a large plugin set.
+    function snapshotSizes() {
+        const out = new Map();
+        const maps = listSnapshotMaps();
+        const sizes = blobSizes();
+        // How many snapshots reference each blob (a snapshot counts once).
+        const referrers = new Map();
+        const shasOf = new Map();
+        for (const { id, map } of maps) {
+            const shas = new Set(map.entries.map(([, sha]) => sha));
+            shasOf.set(id, shas);
+            for (const sha of shas) referrers.set(sha, (referrers.get(sha) || 0) + 1);
+        }
+        for (const { id, size, map } of maps) {
+            let bytes = size;
+            for (const sha of shasOf.get(id)) {
+                if (referrers.get(sha) === 1) bytes += sizes.get(sha) || 0;
+            }
+            let logicalBytes = size;
+            for (const [, sha] of map.entries) logicalBytes += sizes.get(sha) || 0;
+            out.set(id, { bytes, logicalBytes });
+        }
+        return out;
+    }
+
     // Marginal cost — see the size definition above.
     function snapshotBytes(snapshotId) {
-        const maps = listSnapshotMaps();
-        const self = maps.find(m => m.id === snapshotId);
-        if (!self) return legacySnapshotBytes(snapshotId);
-        const shared = new Set();
-        for (const other of maps) {
-            if (other.id === snapshotId) continue;
-            for (const [, sha] of other.map.entries) shared.add(sha);
-        }
-        const sizes = blobSizes();
-        let total = self.size;
-        const counted = new Set();
-        for (const [, sha] of self.map.entries) {
-            if (shared.has(sha) || counted.has(sha)) continue;
-            counted.add(sha);
-            total += sizes.get(sha) || 0;
-        }
-        return total;
+        const own = snapshotSizes().get(snapshotId);
+        return own ? own.bytes : legacySnapshotBytes(snapshotId);
     }
 
     // Full size — every referenced blob, as if nothing were shared.
     function snapshotLogicalBytes(snapshotId) {
-        const self = listSnapshotMaps().find(m => m.id === snapshotId);
-        if (!self) return legacySnapshotBytes(snapshotId);
-        const sizes = blobSizes();
-        let total = self.size;
-        for (const [, sha] of self.map.entries) total += sizes.get(sha) || 0;
-        return total;
+        const own = snapshotSizes().get(snapshotId);
+        return own ? own.logicalBytes : legacySnapshotBytes(snapshotId);
+    }
+
+    // Sizes a list of snapshots with one snapshotSizes() pass; legacy-layout
+    // snapshots (no map row) are sized by their copied rows.
+    function snapshotSizer() {
+        const all = snapshotSizes();
+        return (snapshotId) => all.get(snapshotId)
+            ?? { bytes: legacySnapshotBytes(snapshotId), logicalBytes: legacySnapshotBytes(snapshotId) };
     }
 
     /**
@@ -415,7 +433,7 @@ function createPluginStorageStore(deps) {
         PREFIX, MIGRATED_MARKER_KEY, SNAPSHOT_PREFIX, BLOB_PREFIX, encodeKey, decodeKey,
         snapshotPrefixFor, snapshotMapKeyFor, blobKeyFor,
         list, get, set, remove, removeAll, readAll, entriesRaw, isMigrated, migrateFromDb,
-        snapshotTo, restoreFrom, dropSnapshot, gcBlobs, snapshotBytes, snapshotLogicalBytes,
+        snapshotTo, restoreFrom, dropSnapshot, gcBlobs, snapshotBytes, snapshotLogicalBytes, snapshotSizer,
     };
 }
 
@@ -452,6 +470,7 @@ module.exports = {
     gcBlobs: (...a) => getDefaultStore().gcBlobs(...a),
     snapshotBytes: (...a) => getDefaultStore().snapshotBytes(...a),
     snapshotLogicalBytes: (...a) => getDefaultStore().snapshotLogicalBytes(...a),
+    snapshotSizer: (...a) => getDefaultStore().snapshotSizer(...a),
     list: (...a) => getDefaultStore().list(...a),
     get: (...a) => getDefaultStore().get(...a),
     set: (...a) => getDefaultStore().set(...a),

@@ -3,7 +3,7 @@ import { saveImage, setDatabase, type character, type Chat, defaultSdDataFunc, t
 import { ensureChatHydrated } from "./storage/chatStorage";
 import { alertAddCharacter, alertConfirm, alertError, alertSelect, alertStore, alertWait, notifySuccess, notifyInfo } from "./alert";
 import { archiveCharacter } from "./characterArchive";
-import { loadingOverlayStore, chatDeselected } from "./stores.svelte";
+import { claimLoadingOverlay, chatDeselected } from "./stores.svelte";
 import { language } from "../lang";
 import { checkNullish, findCharacterbyId, findCharacterIndexbyId, getUserName, selectMultipleFile, selectSingleFile } from "./util";
 import { v4 as uuidv4, v4 } from 'uuid';
@@ -437,9 +437,10 @@ export async function importChat(){
                 const chats = json.data
                 if(Array.isArray(chats) && chats.length > 0){
                     db.characters[selectedID].chats.unshift(...(chats.map((v) => {
-                        if(!v.id){
-                            v.id = uuidv4()
-                        }
+                        // Always a fresh id, like the other chat imports: the
+                        // export's ids still belong to the chats it came from,
+                        // and a duplicate makes two chats share one body.
+                        v.id = uuidv4()
                         if(!v.localLore){
                             v.localLore = []
                         }
@@ -477,6 +478,8 @@ export async function importChat(){
             const chat = doc.querySelector('.idat').textContent
             const json = JSON.parse(chat)
             if(json.message && json.note && json.name && json.localLore){
+                // Fresh id: the exported one still belongs to the original chat.
+                json.id = uuidv4()
                 db.characters[selectedID].chats.unshift(normalizeChat(json))
                 notifySuccess(language.successImport)
             }
@@ -662,6 +665,8 @@ export function createBlankChar():character{
             note: '',
             name: 'Chat 1',
             localLore: [],
+            // An id from the start: the save path uploads only chats that have one.
+            id: v4(),
             ...newChatModelDefaults()
         }],
         chatFolders: [],
@@ -826,11 +831,11 @@ export function changeChar(index: number, arg:{
             const capturedChatId = chat.id
             if(char){
                 let cancelled = false
-                loadingOverlayStore.set({ active: true, text: language.loading ?? '', onCancel: () => {
+                const releaseOverlay = claimLoadingOverlay(language.loading ?? '', () => {
                     cancelled = true
                     chatDeselected.set(true)
-                    loadingOverlayStore.set({ active: false, text: '', onCancel: null })
-                }})
+                    releaseOverlay()
+                })
                 void ensureChatHydrated(char.chats, char.chatPage, char.chaId).then((hydrated) => {
                     if(cancelled) return
                     const currentChar = getDatabase().characters[capturedIndex]
@@ -841,7 +846,7 @@ export function changeChar(index: number, arg:{
                 }).catch((e) => {
                     console.error('[selectCharacter] hydration failed:', e)
                 }).finally(() => {
-                    if(!cancelled) loadingOverlayStore.set({ active: false, text: '', onCancel: null })
+                    if(!cancelled) releaseOverlay()
                 })
             }
         } else {

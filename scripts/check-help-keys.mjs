@@ -92,6 +92,14 @@ const REFERENCE_PATTERNS = [
     /\bhelpKey\s*:\s*['"]([^'"]+)['"]/g,
     // help="foo" — Accordion `help` attribute (used in OpenrouterSettings)
     /\bhelp\s*=\s*['"]([^'"]+)['"]/g,
+    // Row-layout helpers in hand-written settings pages: the help key is the
+    // trailing string literal, e.g. f('id', `Label`, 'fooHelp'),
+    // field('id', language.x, 'fooHelp', true), fieldLabel(language.x, 'fooHelp')
+    /\b(?:f|field|fieldLabel|textareaField)\(.*?,\s*['"]([A-Za-z0-9_]+)['"]\s*(?:,\s*(?:true|false)\s*)?\)/g,
+    // helpKey="foo" / helpKey={'foo'} — SettingFieldLabel prop
+    /\bhelpKey\s*=\s*\{?\s*['"]([A-Za-z0-9_]+)['"]/g,
+    // language.help.foo — help text rendered inline as a description
+    /\blanguage\.help\.([A-Za-z0-9_]+)\b/g,
 ]
 
 async function* walkSource(dir) {

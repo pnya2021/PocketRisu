@@ -22,6 +22,7 @@ import katex from 'katex'
 import { getModelInfo } from '../model/modellist';
 import { registerCBS, type matcherArg, type RegisterCallback } from '../cbs';
 import cssSelectorParser from 'postcss-selector-parser'
+import { Sha256 } from '@aws-crypto/sha256-js'
 
 const markdownItOptions = {
     html: true,
@@ -1092,6 +1093,9 @@ const trimCache = new Map<string, string>()
 const TRIM_CACHE_MAX = 200
 
 export function trimMarkdown(data:string){
+    if(!data){
+        return ''
+    }
     // Include hideAllImages in cache key — DOMPurify hook rewrites <img> based on this flag
     const cacheKey = (DBState.db?.hideAllImages ? '1|' : '0|') + data
     let cached = trimCache.get(cacheKey)
@@ -1324,7 +1328,15 @@ function decodeStyleContent(hexText:string):{css?:string, fallback?:string}{
 }
 
 export async function hasher(data:Uint8Array){
-    return Buffer.from(await crypto.subtle.digest("SHA-256", data as any)).toString('hex');
+    // crypto.subtle exists only in a secure context. Over plain-HTTP remote
+    // access it is undefined, which broke every caller (plugin permission
+    // checks among them); the JS implementation gives the same digest.
+    if (globalThis.crypto?.subtle) {
+        return Buffer.from(await crypto.subtle.digest("SHA-256", data as any)).toString('hex');
+    }
+    const hash = new Sha256()
+    hash.update(data)
+    return Buffer.from(await hash.digest()).toString('hex');
 }
 
 export type CbsConditions = {

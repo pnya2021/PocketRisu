@@ -44,3 +44,27 @@ describe('searchSettings — module binding tab', () => {
         expect(moduleTabHits('persona')).toEqual([])
     })
 })
+
+/** Route + sub-tab of every hit for a setting id. */
+function hitsFor(query: string, itemId: string) {
+    return searchSettings(query, ctx)
+        .filter((r) => r.itemId === itemId)
+        .map((r) => ({ route: r.route, subTab: r.subTab }))
+}
+
+describe('searchSettings — advanced settings tabs and moved items', () => {
+    test('advanced items land on their tab', () => {
+        expect(hitsFor('lorebook', 'adv.lbDepth')).toEqual([{ route: SettingsRoute.Advanced, subTab: 0 }])
+        expect(hitsFor('retr', 'adv.retries')).toEqual([{ route: SettingsRoute.Advanced, subTab: 1 }])
+        expect(hitsFor('dynamic asset', 'adv.dynAssets')).toEqual([{ route: SettingsRoute.Advanced, subTab: 2 }])
+        expect(hitsFor('developer', 'adv.devTools')).toEqual([{ route: SettingsRoute.Advanced, subTab: 3 }])
+    })
+
+    test('items moved out of Advanced point at their new page', () => {
+        expect(hitsFor('bookmark', 'adv.bookmark')).toEqual([{ route: SettingsRoute.Accessibility, subTab: 0 }])
+        expect(hitsFor('scroll', 'adv.scrollToActive')).toEqual([{ route: SettingsRoute.Accessibility, subTab: 2 }])
+        expect(hitsFor('height', 'adv.heightMode')).toEqual([{ route: SettingsRoute.Display, subTab: 1 }])
+        expect(hitsFor('css', 'adv.cssErr')).toEqual([{ route: SettingsRoute.Display, subTab: 0 }])
+        expect(hitsFor('image', 'adv.newImgBeta')).toEqual([{ route: SettingsRoute.InlayImageGallery, subTab: 1 }])
+    })
+})

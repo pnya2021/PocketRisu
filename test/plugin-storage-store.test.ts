@@ -287,6 +287,25 @@ describe('content-addressed snapshots (unit)', () => {
         expect(store.snapshotBytes('missing')).toBe(0)
     })
 
+    test('snapshotSizer matches per-snapshot sizing, legacy layout included', () => {
+        const { store, db } = memoryKv()
+        const big = 'x'.repeat(10_000)
+        store.migrateFromDb({ pluginCustomStorage: { big, small: 's', dup: 's' } })
+        store.snapshotTo('1')
+        store.set('small', 's2')
+        store.snapshotTo('2')
+        store.remove('big')
+        store.snapshotTo('3')
+        db.prepare(`INSERT INTO kv (key, value, updated_at)
+                    SELECT ? || substr(key, ?), value, updated_at FROM kv WHERE key LIKE 'plugin-storage/%'`)
+            .run(store.snapshotPrefixFor('old'), PREFIX.length + 1)
+
+        const sizeOf = store.snapshotSizer()
+        for (const id of ['1', '2', '3', 'old', 'missing']) {
+            expect(sizeOf(id)).toEqual({ bytes: store.snapshotBytes(id), logicalBytes: store.snapshotLogicalBytes(id) })
+        }
+    })
+
     test('dropSnapshot garbage-collects only blobs unique to it', () => {
         const { store, deps } = memoryKv()
         store.migrateFromDb({ pluginCustomStorage: { shared: 'S', only1: 'one' } })

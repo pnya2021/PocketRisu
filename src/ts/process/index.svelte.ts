@@ -40,7 +40,7 @@ import {
     correctRerollMessageIdentity,
     pocketMessageRevisionKey,
 } from "../plugins/apiV3/illustration/messageEvents.pocket";
-import { abortGeneration, chatGenKey, chatProcessStage, endGeneration, isChatGenerating, onDatabaseRebased, registerAbort, setGenerationStage, startGeneration } from "./generationState";
+import { abortGeneration, chatGenKey, chatProcessStage, endGeneration, isChatGenerating, onDatabaseRebased, prepareGenerationRestart, registerAbort, setGenerationStage, startGeneration } from "./generationState";
 import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
 
 export interface OpenAIChat{
@@ -461,8 +461,8 @@ export async function generateResolvedSpeaker(
     // Block send if chat is still a placeholder (hydration not complete)
     if (nowChatroom.chats[nowChatroom.chatPage]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
-        endGeneration(genKey)
-        if (realChatId) clearPendingSend(realChatId)
+        endGeneration(genKey, { generationId })
+        if (realChatId) clearPendingSend(realChatId, generationId)
         return false
     }
     nowChatroom.chats[nowChatroom.chatPage].message = nowChatroom.chats[nowChatroom.chatPage].message.map((v) => {
@@ -1102,8 +1102,8 @@ export async function generateResolvedSpeaker(
         ms = makeMs(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            endGeneration(genKey)
-            if (realChatId) clearPendingSend(realChatId)
+            endGeneration(genKey, { generationId })
+            if (realChatId) clearPendingSend(realChatId, generationId)
             return false
         }
     }
@@ -1309,7 +1309,7 @@ export async function generateResolvedSpeaker(
             }
             console.log(sp)
             throwError(sp.error + "\n\nMax context source: " + maxContextSource)
-            if (realChatId) clearPendingSend(realChatId)
+            if (realChatId) clearPendingSend(realChatId, generationId)
             return false
         }
         chats = sp.chats
@@ -1331,7 +1331,7 @@ export async function generateResolvedSpeaker(
                 // a max-context far below the prompt, which the user can fix.
                 throwError(language.errors.toomuchtoken + "\n\nRequired Tokens: " + currentTokens + " / Max Context: " + maxContextTokens + " / Reserved Output: " + maxResponseTokens + "\nMax context source: " + maxContextSource)
 
-                if (realChatId) clearPendingSend(realChatId)
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 return false
             }
 
@@ -1696,7 +1696,7 @@ export async function generateResolvedSpeaker(
         while(inputTokens > maxContextTokens){
             if(pointer >= formated.length){
                 throwError(language.errors.toomuchtoken + "\n\nAt token rechecking. Required Tokens: " + inputTokens + " / Max Context: " + maxContextTokens + " / Reserved Output: " + maxResponseTokens + "\nMax context source: " + maxContextSource)
-                if (realChatId) clearPendingSend(realChatId)
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 return false
             }
             if(formated[pointer].removable){
@@ -1750,6 +1750,14 @@ export async function generateResolvedSpeaker(
         return true
     }
 
+    // Stopped while an earlier stage was still running (possibly force-released
+    // by stopGeneration): do not fire the main request for a dead send.
+    // (Cast keeps TS from narrowing the post-request check below to `false`.)
+    if((abortSignal as AbortSignal).aborted){
+        if (realChatId) clearPendingSend(realChatId, generationId)
+        return false
+    }
+
     const req = await requestChatData({
         formated: formated,
         biasString: biases,
@@ -1786,12 +1794,12 @@ export async function generateResolvedSpeaker(
     let resendChat = false
     
     if(abortSignal.aborted === true){
-        if (realChatId) clearPendingSend(realChatId)
+        if (realChatId) clearPendingSend(realChatId, generationId)
         return false
     }
     if(req.type === 'fail'){
         throwError(req.result)
-        if (realChatId) clearPendingSend(realChatId)
+        if (realChatId) clearPendingSend(realChatId, generationId)
         return false
     }
     else if(req.type === 'streaming'){
@@ -1970,7 +1978,7 @@ export async function generateResolvedSpeaker(
         }
 
         if(streamAborted || abortSignal.aborted){
-            if (realChatId) clearPendingSend(realChatId)
+            if (realChatId) clearPendingSend(realChatId, generationId)
             return false
         }
 
@@ -2143,7 +2151,11 @@ export async function generateResolvedSpeaker(
     }
 
     if(needsAutoContinue){
-        endGeneration(genKey, { keepPendingAbort: true })
+        if (!prepareGenerationRestart(genKey, generationId, abortSignal)) {
+            endGeneration(genKey, { generationId })
+            if (realChatId) clearPendingSend(realChatId, generationId)
+            return false
+        }
         return await generateResolvedSpeaker(nowChatroom, currentChar, chatProcessIndex, {
             responseStartedAt,
             chatAdditonalTokens: arg.chatAdditonalTokens,
@@ -2158,16 +2170,19 @@ export async function generateResolvedSpeaker(
 
     const igp = risuChatParser(DBState.db.igpPrompt ?? "")
 
-    if(igp){
+    // Stop can land while the output triggers above were still running.
+    if(igp && !abortSignal.aborted){
         const igpFormated = parseChatML(igp)
         const rq = await requestChatData({
             formated: igpFormated,
             bias: {}
         },'emotion', abortSignal)
 
-        const responseIndex = arg.continueMessageIndex
-            ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
-        DBState.db.characters[selectedChar].chats[selectedChat].message[responseIndex].data += rq
+        if(!abortSignal.aborted){
+            const responseIndex = arg.continueMessageIndex
+                ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
+            DBState.db.characters[selectedChar].chats[selectedChat].message[responseIndex].data += rq
+        }
     }
 
     stageTimings.stage3Duration = Date.now() - stageTimings.stage3Start
@@ -2192,7 +2207,11 @@ export async function generateResolvedSpeaker(
             ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
         setFinalGenerationInfo(lastMessageIndex)
         
-        endGeneration(genKey, { keepPendingAbort: true })
+        if (!prepareGenerationRestart(genKey, generationId, abortSignal)) {
+            endGeneration(genKey, { generationId })
+            if (realChatId) clearPendingSend(realChatId, generationId)
+            return false
+        }
         return await generateResolvedSpeaker(nowChatroom, currentChar, chatProcessIndex, {
             signal: abortSignal,
             messageEventTriggerIds: arg.messageEventTriggerIds,
@@ -2331,7 +2350,7 @@ export async function generateResolvedSpeaker(
 
                 
 
-                if (realChatId) clearPendingSend(realChatId)
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 return true
             }
 
@@ -2393,7 +2412,7 @@ export async function generateResolvedSpeaker(
             }, 'emotion', abortSignal)
 
             if(rq.type === 'fail'){
-                if (realChatId) clearPendingSend(realChatId)
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 if(abortSignal.aborted){
                     return true
                 }
@@ -2401,7 +2420,7 @@ export async function generateResolvedSpeaker(
                 return true
             }
             if(rq.type === 'streaming' || rq.type === 'multiline'){
-                if (realChatId) clearPendingSend(realChatId)
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 if(abortSignal.aborted){
                     return true
                 }
@@ -2447,12 +2466,12 @@ export async function generateResolvedSpeaker(
                     }
                 } catch (error) {
                     throwError(language.errors.httpError + `${error}`)
-                    if (realChatId) clearPendingSend(realChatId)
+                    if (realChatId) clearPendingSend(realChatId, generationId)
                     return true
                 }
             }
             
-            if (realChatId) clearPendingSend(realChatId)
+            if (realChatId) clearPendingSend(realChatId, generationId)
             return true
 
 
@@ -2488,7 +2507,7 @@ export async function generateResolvedSpeaker(
         ?? (DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1)
     setFinalGenerationInfo(lastMessageIndex)
 
-    if (realChatId) clearPendingSend(realChatId)
+    if (realChatId) clearPendingSend(realChatId, generationId)
     return true
 }
 

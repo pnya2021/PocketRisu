@@ -1,8 +1,9 @@
 <script lang="ts">
+    import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import { ChevronDownIcon, ChevronRightIcon, DownloadIcon, SearchIcon, TrashIcon, UploadIcon, XIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { DBState, modelProfileReplaceTarget, openModelPresetEditId } from "src/ts/stores.svelte";
-    import { alertConfirm, alertError, notifySuccess } from "src/ts/alert";
+    import { alertConfirm, alertError, doingAlert, notifySuccess } from "src/ts/alert";
     import { downloadFile } from "src/ts/globalApi.svelte";
     import { selectSingleFile } from "src/ts/util";
     import {
@@ -31,6 +32,7 @@
     }
 
     let { close = () => {} }: Props = $props();
+    let panel: HTMLDivElement | undefined = $state();
 
     // Official = remote registry if synced, else bundled (reactive on the cache).
     const officialRegistry = $derived(getOfficialRegistry());
@@ -279,15 +281,25 @@
     }
 </script>
 
+<!-- Escape closes the picker unless focus sits in a dialog stacked above it
+     (e.g. a delete confirm), which handles its own Escape. aria-modal +
+     data-state="open" makes the global hotkey Escape (hotkey.ts) leave the
+     settings drawer open, so only the picker closes. -->
+<svelte:window onkeydown={(e) => {
+    if (e.key !== 'Escape' || !panel) return
+    if (doingAlert()) return
+    const modals = document.querySelectorAll('[aria-modal="true"][data-state="open"]')
+    if (modals.length && modals[modals.length - 1] !== panel) return
+    close()
+}} />
+
 <div class="absolute w-full h-full z-40 bg-black/50 flex justify-center items-center">
-    <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl w-124 max-h-full overflow-hidden">
-        <div class="flex items-center text-textcolor mb-4 shrink-0">
-            <h2 class="mt-0 mb-0">{language.selectProfile}</h2>
-            <div class="grow flex justify-end">
-                <button class="text-textcolor2 hover:text-primary mr-2 cursor-pointer items-center" onclick={close}>
-                    <XIcon size={24}/>
-                </button>
-            </div>
+    <div bind:this={panel} role="dialog" aria-modal="true" data-state="open" aria-labelledby="model-profile-browser-title" class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl w-124 max-h-full overflow-hidden">
+        <div class="flex items-center justify-between text-textcolor mb-3 shrink-0">
+            <h2 id="model-profile-browser-title" class="mt-0 mb-0 text-lg font-semibold">{language.selectProfile}</h2>
+            <ShButton variant="ghost" size="icon-sm" aria-label="Close" onclick={close}>
+                <XIcon />
+            </ShButton>
         </div>
 
         <div class="shrink-0 flex w-full rounded-md border border-selected mb-3">

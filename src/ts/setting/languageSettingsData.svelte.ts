@@ -202,6 +202,11 @@ export const languageSettingsItems: SettingItem[] = [
             ],
         },
     },
+    // moved from Advanced (Google translator only)
+    {
+        id: 'adv.exp.googleTrans', type: 'check', fallbackLabel: 'New Google Translate Experimental', bindKey: 'useExperimentalGoogleTranslator',
+        condition: (ctx) => ctx.db.useExperimental && !!ctx.db.translator && ctx.db.translatorType === 'google', helpKey: 'unrecommendedNewGoogleTrans', helpUnrecommended: true, classes: 'mt-4'
+    },
 
     {
         id: 'lang.bergamotHtml',
@@ -223,6 +228,8 @@ export const languageSettingsItems: SettingItem[] = [
         classes: 'mt-2',
         condition: (ctx) => !!ctx.db.translator,
     },
+    // moved from Advanced
+    { id: 'adv.noWaitTrans', type: 'check', labelKey: 'noWaitForTranslate', bindKey: 'noWaitForTranslate', helpKey: 'noWaitForTranslate', classes: 'mt-4', condition: (ctx) => !!ctx.db.translator },
 
     {
         id: 'lang.combineTranslation',
@@ -271,6 +278,7 @@ export const languageSettingsItems: SettingItem[] = [
         classes: 'mt-4',
         condition: (ctx) => !!ctx.db.translator && ctx.db.translatorType === 'llm',
         options: {
+            buttonLabelKey: 'settingActionExport',
             onClick: async () => {
                 alertWait(language.loading);
                 try {
@@ -297,6 +305,7 @@ export const languageSettingsItems: SettingItem[] = [
         classes: 'mt-2',
         condition: (ctx) => !!ctx.db.translator && ctx.db.translatorType === 'llm',
         options: {
+            buttonLabelKey: 'settingActionImport',
             onClick: async () => {
                 try {
                     const files = await selectFileByDom(['json']);
@@ -348,6 +357,8 @@ export const languageSettingsItems: SettingItem[] = [
         classes: 'mt-2',
         condition: (ctx) => !!ctx.db.translator && ctx.db.translatorType === 'llm',
         options: {
+            buttonLabelKey: 'settingActionClear',
+            buttonVariant: 'destructive',
             onClick: async () => {
                 try {
                     const confirmed = await alertConfirm(language.clearTranslationCacheConfirm);
