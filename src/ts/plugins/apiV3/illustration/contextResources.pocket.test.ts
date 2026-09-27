@@ -126,6 +126,163 @@ function dependencies(overrides: Partial<PocketContextAdapterDependencies> = {})
 }
 
 describe('Pocket context resource adapter', () => {
+    // The public list/read round trip must not depend on inline DB arrays.
+    // In particular, Studio reissues saved references through the legacy list.
+    describe.each(['character', 'active-module', 'installed-module'] as const)('%s lazy asset reads', (owner) => {
+        it.each([
+            ['legacy', 'original'], ['legacy', 'thumbnail'],
+            ['query', 'original'], ['query', 'thumbnail'],
+        ] as const)('opens a %s-listed %s without materializing the database', async (listing, variant) => {
+            const card = makeCharacter({ image: undefined, emotionImages: [], ccAssets: [],
+                additionalAssets: undefined,
+                additionalAssetManifest: { id: 'card', version: 1, count: 1, sha256: 'card' } })
+            const module = makeModule('lazy-module', { assets: undefined,
+                assetManifest: { id: 'module', version: 1, count: 1, sha256: 'module' } })
+            const unrelated = makeCharacter({ chaId: 'unrelated', additionalAssets: undefined,
+                additionalAssetManifest: { id: 'offline', version: 1, count: 1, sha256: 'offline' } })
+            const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])
+            const granted = new Set<string>()
+            const adapter = createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [card, unrelated], modules: [module] }),
+                getCurrentCharacter: () => card,
+                getActiveModulesWithReasons: () => owner === 'active-module'
+                    ? [{ module, activatedBy: ['global'] }] : [],
+                loadAssetManifestItems: async (manifest) => {
+                    if (!granted.has('contextAssets')
+                        || owner === 'installed-module' && !granted.has('installedModulesRead')) {
+                        throw new Error('Manifest access before permission')
+                    }
+                    if (manifest.id !== (owner === 'character' ? 'card' : 'module')) {
+                        throw new Error('An unrelated manifest must not be loaded')
+                    }
+                    return [['reference', 'assets/reference.png', 'png']]
+                },
+                readImage: async () => bytes,
+            }))
+            const service = new ContextResourceService({ principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: `lazy-${owner}-${listing}-${variant}`, displayName: 'test',
+                signal: new AbortController().signal }, adapter, {
+                requirePermission: async (permission) => { granted.add(permission) },
+                cursorRegistry: new CursorRegistry(), queryCaptureCache: new QueryCaptureCache(),
+            })
+            try {
+                const page = await service.listContextAssets({
+                    include: owner === 'character' ? ['additional'] : ['module'],
+                    moduleScope: owner === 'character' ? 'none' : owner === 'active-module' ? 'active' : 'installed',
+                    ...(listing === 'query' ? { captureScope: 'query' as const } : {}),
+                })
+                expect(page.assets).toHaveLength(1)
+                const asset = page.assets[0]
+                const result = await service.readContextAsset(asset.assetId, { ifRevision: asset.revision, variant })
+                expect(result.name).toBe('reference')
+                expect(result.mediaType).toBe(variant === 'original' ? 'image/png' : 'image/webp')
+                expect(result.data).toEqual(variant === 'original' ? bytes : new Uint8Array([1, 2, 3]))
+                expect(card.additionalAssets).toBeUndefined()
+                expect(module.assets).toBeUndefined()
+                expect(unrelated.additionalAssets).toBeUndefined()
+            } finally { service.dispose() }
+        })
+    })
+
+    it.each(['abort', 'descriptor-change', 'record-replacement', 'context-switch'] as const)(
+        'does not publish a lazy legacy list after %s during hydration', async (change) => {
+            let card: Record<string, any> = makeCharacter({ additionalAssets: undefined,
+                additionalAssetManifest: { id: 'card', version: 1, count: 1, sha256: 'card' } })
+            const original = card
+            const load = deferred<[string, string, string][]>()
+            let loading = false
+            const controller = new AbortController()
+            const readImage = vi.fn(async () => new Uint8Array([1]))
+            const adapter = createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [card], modules: [] }),
+                getCurrentCharacter: () => card,
+                getActiveModulesWithReasons: () => [],
+                loadAssetManifestItems: async () => { loading = true; return load.promise }, readImage,
+            }))
+            const service = new ContextResourceService({ principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: `lazy-list-${change}`, displayName: 'test', signal: new AbortController().signal },
+            adapter, { requirePermission: async () => undefined })
+            try {
+                const pending = service.listContextAssets({ include: ['additional'], moduleScope: 'none', signal: controller.signal })
+                const assertion = expect(pending).rejects.toMatchObject({ code: change === 'abort' ? 'ABORTED' : 'CONFLICT' })
+                await waitFor(() => loading)
+                if (change === 'abort') controller.abort()
+                if (change === 'descriptor-change') original.additionalAssetManifest.sha256 = 'changed'
+                if (change === 'record-replacement') card = { ...card }
+                if (change === 'context-switch') card = makeCharacter({ chaId: 'other' })
+                load.resolve([['reference', 'assets/reference.png', 'png']])
+                await assertion
+                expect(readImage).not.toHaveBeenCalled()
+                expect(original.additionalAssets).toBeUndefined()
+            } finally { service.dispose() }
+        },
+    )
+
+    it.each(['permission-revoked', 'removed-during-read', 'replaced-record'] as const)(
+        'revalidates a lazy asset when %s', async (change) => {
+            let card = makeCharacter({ additionalAssets: undefined,
+                additionalAssetManifest: { id: 'card', version: 1, count: 1, sha256: 'card' } })
+            let reading = false
+            let revoked = false
+            const adapter = createPocketContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [card], modules: [] }),
+                getCurrentCharacter: () => card,
+                getActiveModulesWithReasons: () => [],
+                loadAssetManifestItems: async () => [['reference', 'assets/reference.png', 'png']],
+                readImage: async () => {
+                    if (reading && change === 'removed-during-read') card.additionalAssets = []
+                    return new Uint8Array([1, 2, 3])
+                },
+            }))
+            const service = new ContextResourceService({ principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: `lazy-read-${change}`, displayName: 'test', signal: new AbortController().signal },
+            adapter, { requirePermission: async () => {
+                if (revoked) throw Object.assign(new Error('revoked'), { code: 'PERMISSION_DENIED' })
+            } })
+            try {
+                const page = await service.listContextAssets({ include: ['additional'], moduleScope: 'none', captureScope: 'query' })
+                const asset = page.assets[0]
+                reading = true
+                revoked = change === 'permission-revoked'
+                if (change === 'replaced-record') card = { ...card }
+                const result = service.readContextAsset(asset.assetId, { ifRevision: asset.revision })
+                if (change === 'replaced-record') {
+                    await expect(result).resolves.toMatchObject({ name: 'reference', data: new Uint8Array([1, 2, 3]) })
+                    expect(card.additionalAssets).toBeUndefined()
+                } else {
+                    await expect(result).rejects.toMatchObject({ code: revoked ? 'PERMISSION_DENIED' : 'NOT_FOUND' })
+                }
+            } finally { service.dispose() }
+        },
+    )
+
+    it('requires installed-module permission before rehydrating a formerly active module', async () => {
+        const card = makeCharacter()
+        let module = makeModule('lazy-module', { assets: undefined,
+            assetManifest: { id: 'module', version: 1, count: 1, sha256: 'module' } })
+        let active = true
+        let loads = 0
+        const adapter = createPocketContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [card], modules: [module] }),
+            getCurrentCharacter: () => card,
+            getActiveModulesWithReasons: () => active ? [{ module, activatedBy: ['global'] }] : [],
+            loadAssetManifestItems: async () => { loads++; return [['reference', 'assets/reference.png', 'png']] },
+        }))
+        const service = new ContextResourceService({ principalId: '11111111-1111-4111-8111-111111111111',
+            instanceId: 'lazy-module-deactivated', displayName: 'test', signal: new AbortController().signal },
+        adapter, { requirePermission: async (permission) => {
+            if (permission === 'installedModulesRead') throw Object.assign(new Error('denied'), { code: 'PERMISSION_DENIED' })
+        } })
+        try {
+            const page = await service.listContextAssets({ include: ['module'], moduleScope: 'active', captureScope: 'query' })
+            expect(loads).toBe(1)
+            active = false
+            module = { ...module }
+            await expect(service.readContextAsset(page.assets[0].assetId)).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+            expect(loads).toBe(1)
+        } finally { service.dispose() }
+    })
+
     it('keeps portrait-only reads available when additional manifest storage is offline', async () => {
         const card = makeCharacter({ additionalAssets: undefined,
             additionalAssetManifest: { id: 'card', version: 1, count: 1, sha256: 'card' } })
@@ -142,6 +299,14 @@ describe('Pocket context resource adapter', () => {
             .resolves.toMatchObject({ storageKey: 'assets/alice.png' })
         await expect(adapter.revalidateAssetCollection!({ input, selectors: capture.selectors, sources: capture.assets }))
             .resolves.toBeUndefined()
+        const service = new ContextResourceService({ principalId: '11111111-1111-4111-8111-111111111111',
+            instanceId: 'portrait-offline-manifest', displayName: 'test', signal: new AbortController().signal },
+        adapter, { requirePermission: async () => undefined })
+        try {
+            const page = await service.listContextAssets({ include: ['portrait'], moduleScope: 'none' })
+            expect(page.assets).toHaveLength(1)
+            await expect(service.readContextAsset(page.assets[0].assetId)).resolves.toMatchObject({ name: 'Alice.png' })
+        } finally { service.dispose() }
     })
 
     it('loads lazy module counts only after permission and keeps metadata-only enumeration lazy', async () => {

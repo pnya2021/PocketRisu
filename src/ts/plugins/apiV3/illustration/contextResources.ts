@@ -171,8 +171,18 @@ export interface BoundedThumbnailResult {
     decodedPixels: number
 }
 
+/** Internal, permission-checked projection request; never materializes the live database. */
+export interface ContextAssetStateScope {
+    characterId?: CharacterId
+    conversationId: ConversationId
+    include: readonly ContextAssetRole[]
+    moduleScope: 'active' | 'installed' | 'none'
+    moduleId?: string
+    signal?: AbortSignal
+}
+
 export interface ContextResourceAdapter {
-    getState(): Promise<ContextHostState>
+    getState(assetScope?: ContextAssetStateScope): Promise<ContextHostState>
     prepareModuleAssets?(input: ContextModuleCollectionInput): Promise<void>
     resolveCollectionSelectors?(input: {
         characterId?: CharacterId
@@ -606,9 +616,9 @@ export class ContextResourceService {
         this.assertActive(generation, signal)
     }
 
-    private async state(generation = this.generation, signal?: AbortSignal) {
+    private async state(generation = this.generation, signal?: AbortSignal, assetScope?: ContextAssetStateScope) {
         this.assertActive(generation, signal)
-        const state = await this.adapter.getState()
+        const state = await this.adapter.getState(assetScope)
         this.assertActive(generation, signal)
         return state
     }
@@ -1592,13 +1602,14 @@ export class ContextResourceService {
         selectorOptions: { characterId?: CharacterId; conversationId?: ConversationId },
         generation: number,
         signal?: AbortSignal,
+        assetScope?: ContextAssetStateScope,
     ) {
         await this.permission('contextAssets', generation, signal)
         if (moduleScope === 'installed') {
             await this.permission('installedModulesRead', generation, signal)
             await this.permission('contextAssets', generation, signal)
         }
-        const state = await this.state(generation, signal)
+        const state = await this.state(generation, signal, assetScope)
         const currentSelectors = this.resolveSelectors(state, selectorOptions)
         if (!this.sameSelectors(selectors, currentSelectors)) throw this.contextChanged()
         return this.currentListSource(state, located, moduleScope)
@@ -2024,8 +2035,12 @@ export class ContextResourceService {
             await this.permission('installedModulesRead', generation, signal)
             await this.permission('contextAssets', generation, signal)
         }
-        const state = await this.state(generation, signal)
-        const selectors = this.resolveSelectors(state, options)
+        const authorized = await this.state(generation, signal)
+        const selectors = this.resolveSelectors(authorized, options)
+        const assetScope: ContextAssetStateScope = { ...selectors,
+            include, moduleScope: moduleScope as ContextAssetStateScope['moduleScope'], signal }
+        const state = await this.state(generation, signal, assetScope)
+        if (!this.sameSelectors(selectors, this.resolveSelectors(state, options))) throw this.contextChanged()
         const query = {
             kind: 'assets',
             ...selectors,
@@ -2062,7 +2077,7 @@ export class ContextResourceService {
                         source,
                         origin,
                         () => this.validateListSource(
-                            { source, origin }, moduleScope, selectors, options, generation, signal,
+                            { source, origin }, moduleScope, selectors, options, generation, signal, assetScope,
                         ),
                         generation,
                         signal,
@@ -2090,7 +2105,7 @@ export class ContextResourceService {
                 await this.permission('installedModulesRead', generation, signal)
                 await this.permission('contextAssets', generation, signal)
             }
-            const fresh = await this.state(generation, signal)
+            const fresh = await this.state(generation, signal, assetScope)
             const refreshed = this.resolveSelectors(fresh, options)
             if (!this.sameSelectors(selectors, refreshed)
                 || authorizedPageSources.some((source) => !this.sourceStillAuthorized(fresh, source, moduleScope))) {
@@ -2195,6 +2210,48 @@ export class ContextResourceService {
             source: { ...candidate.source },
             origin: { ...candidate.origin },
         } : undefined
+    }
+
+    private async assetReadState(
+        issued: IssuedAssetHandle,
+        expectedSelectors: { characterId: string; conversationId: string },
+        generation: number,
+        signal?: AbortSignal,
+    ) {
+        let installedModulesAuthorized = false
+        while (true) {
+            const raw = await this.state(generation, signal)
+            // This lookup enforces current-card/group membership before any lazy I/O.
+            const inline = this.findIssuedAsset(raw, issued)
+            if (!this.sameSelectors(expectedSelectors, this.resolveSelectors(raw, {}))) throw this.contextChanged()
+            // Preserve the existing inline authorization path and avoid unrelated manifest I/O.
+            if (inline) return raw
+            const origin = issued.origin
+            const active = origin.kind === 'module'
+                && raw.activeModules.some((module) => module.id === origin.moduleId)
+            if (origin.kind === 'module' && !active
+                && !raw.installedModules.some((module) => module.id === origin.moduleId)) return raw
+            if (origin.kind === 'module' && !active && !installedModulesAuthorized) {
+                await this.permission('installedModulesRead', generation, signal)
+                await this.permission('contextAssets', generation, signal)
+                installedModulesAuthorized = true
+                continue
+            }
+            const scope: ContextAssetStateScope = {
+                characterId: origin.kind === 'character' ? origin.characterId : expectedSelectors.characterId,
+                conversationId: expectedSelectors.conversationId,
+                include: origin.kind === 'character' ? ['additional'] : ['module'],
+                moduleScope: origin.kind === 'character' ? 'none' : active ? 'active' : 'installed',
+                ...(origin.kind === 'module' ? { moduleId: origin.moduleId } : {}),
+                signal,
+            }
+            const projected = await this.state(generation, signal, scope)
+            if (!this.sameSelectors(expectedSelectors, this.resolveSelectors(projected, {}))) throw this.contextChanged()
+            // Hydration may yield while an active module becomes installed-only.
+            if (origin.kind === 'module' && !installedModulesAuthorized
+                && !projected.activeModules.some((module) => module.id === origin.moduleId)) continue
+            return projected
+        }
     }
 
     private async locateAsset(
@@ -2315,7 +2372,8 @@ export class ContextResourceService {
         let installedModulesAuthorized = false
         while (true) {
             await this.permission('contextAssets', generation, signal)
-            const state = await this.state(generation, signal)
+            const state = await this.assetReadState({ identity: located.source.identity, origin: located.origin },
+                expectedSelectors, generation, signal)
             const current = this.findIssuedAsset(state, {
                 identity: located.source.identity,
                 origin: located.origin,
@@ -2364,8 +2422,9 @@ export class ContextResourceService {
         const preflight = await this.state(generation, signal)
         this.current(preflight)
         await this.permission('contextAssets', generation, signal)
-        const state = await this.state(generation, signal)
-        const selectors = this.resolveSelectors(state, {})
+        const authorized = await this.state(generation, signal)
+        const selectors = this.resolveSelectors(authorized, {})
+        const state = await this.assetReadState(currentAuthority, selectors, generation, signal)
         const located = await this.locateAsset(
             state, currentAuthority, selectors, options.ifRevision, generation, signal,
         )
