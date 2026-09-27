@@ -7,6 +7,7 @@ import type {
     ContextAssetCollectionInput,
     ContextAssetCollectionProbe,
     ContextAssetPageProbe,
+    ContextAssetStateScope,
     ContextAssetSourceProbe,
     ContextCharacterSource,
     ContextHostState,
@@ -802,9 +803,35 @@ export function createPocketContextResourceAdapter(
             assertNotAborted(input.signal)
             return selectors
         },
-        async getState(): Promise<ContextHostState> {
-            const { currentCharacter, currentChat } = await hydrateStableCurrent()
-            const database = dependencies.getDatabase()
+        async getState(assetScope?: ContextAssetStateScope): Promise<ContextHostState> {
+            const { currentCharacter, currentChat } = await hydrateStableCurrent(assetScope?.signal)
+            let database = dependencies.getDatabase()
+            const prepared = new Set<UnknownRecord>()
+            if (assetScope) {
+                const selectors = selectorsFrom(currentCharacter, currentChat,
+                    assetScope.characterId, assetScope.conversationId, false)
+                const prepare = async (raw: UnknownRecord, kind: 'character' | 'module') => {
+                    await manifests.prepare(raw, kind)
+                    prepared.add(raw)
+                }
+                if (assetScope.include.includes('additional')) {
+                    const raw = database.characters?.find((character) => character?.chaId === selectors.characterId)
+                        ?? (currentCharacter?.chaId === selectors.characterId ? currentCharacter : undefined)
+                    if (raw) await prepare(raw, 'character')
+                }
+                if (assetScope.include.includes('module') && assetScope.moduleScope !== 'none') {
+                    const records = currentModuleRecords(assetScope.moduleScope)
+                        .filter(({ module }) => assetScope.moduleId === undefined || module?.id === assetScope.moduleId)
+                    await Promise.all(records.map(({ module }) => prepare(module, 'module')))
+                }
+                assertNotAborted(assetScope.signal)
+                if (!sameSelectors(selectors, selectorsForSynchronously(
+                    assetScope.characterId, assetScope.conversationId, false,
+                ))) throw changed()
+                database = dependencies.getDatabase()
+            }
+            const project = (raw: UnknownRecord, kind: 'character' | 'module') =>
+                prepared.has(raw) ? manifests.project(raw, kind) : raw
             let current: ContextHostState['current']
             if (currentCharacter && currentChat) {
                 if (!nonEmptyString(currentCharacter.chaId) || !nonEmptyString(currentChat.id)) {
@@ -828,10 +855,10 @@ export function createPocketContextResourceAdapter(
             }
 
             const characters = (database.characters ?? [])
-                .map((character, index) => mapCharacter(character, index, projectionContext))
+                .map((character, index) => mapCharacter(project(character, 'character'), index, projectionContext))
                 .filter((value): value is ContextCharacterSource => value !== null)
             if (currentCharacter && current && !characters.some((character) => character.id === current.characterId)) {
-                const projected = mapCharacter(currentCharacter, -1, projectionContext)
+                const projected = mapCharacter(project(currentCharacter, 'character'), -1, projectionContext)
                 if (projected) characters.unshift(projected)
             }
             const validCharacterIds = new Set(characters
@@ -849,11 +876,11 @@ export function createPocketContextResourceAdapter(
 
             const activeRecords = dependencies.getActiveModulesWithReasons()
             const activeModules = activeRecords
-                .map(({ module, activatedBy }, index) => mapModule(module, activatedBy, index, projectionContext))
+                .map(({ module, activatedBy }, index) => mapModule(project(module, 'module'), activatedBy, index, projectionContext))
                 .filter((value): value is ContextModuleSource => value !== null)
             const activeById = new Map(activeModules.map((module) => [module.id, module.activatedBy]))
             const installedModules = (database.modules ?? [])
-                .map((module, index) => mapModule(module, activeById.get(module.id) ?? [], index, projectionContext))
+                .map((module, index) => mapModule(project(module, 'module'), activeById.get(module.id) ?? [], index, projectionContext))
                 .filter((value): value is ContextModuleSource => value !== null)
             return {
                 ...(current ? { current } : {}),
